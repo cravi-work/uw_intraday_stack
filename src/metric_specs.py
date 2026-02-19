@@ -21,6 +21,8 @@ class MetricSpec:
     name: str
     required_endpoints: List[EndpointRef]
     required_keys_by_endpoint: Dict[EndpointRef, KeyRule]
+    # [Fix: Pattern B] Explicitly label presence-only endpoints to prevent silent unsafe passes
+    presence_only_endpoints: Set[EndpointRef] = field(default_factory=set)
 
 
 # Institutional seed set: explicitly curated, minimal dependencies based on actual extractors
@@ -57,7 +59,13 @@ INSTITUTIONAL_METRICS: List[MetricSpec] = [
             EndpointRef("GET", "/api/stock/{ticker}/option-contracts"),
             EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew")
         ],
-        required_keys_by_endpoint={}
+        required_keys_by_endpoint={},
+        # [Fix] Enforce presence-only explicitly since we lack strict key rules for these
+        presence_only_endpoints={
+            EndpointRef("GET", "/api/stock/{ticker}/option-chains"),
+            EndpointRef("GET", "/api/stock/{ticker}/option-contracts"),
+            EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew")
+        }
     ),
     MetricSpec(
         name="Market Context",
@@ -65,6 +73,10 @@ INSTITUTIONAL_METRICS: List[MetricSpec] = [
             EndpointRef("GET", "/api/market/top-net-impact"),
             EndpointRef("GET", "/api/market/total-options-volume")
         ],
-        required_keys_by_endpoint={}
+        required_keys_by_endpoint={},
+        presence_only_endpoints={
+            EndpointRef("GET", "/api/market/top-net-impact"),
+            EndpointRef("GET", "/api/market/total-options-volume")
+        }
     )
 ]

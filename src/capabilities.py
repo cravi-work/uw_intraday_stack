@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -12,6 +13,17 @@ from .config_loader import load_endpoint_plan
 from .metric_specs import INSTITUTIONAL_METRICS, EndpointRef, MetricSpec
 
 UTC = timezone.utc
+
+# [Fix: Schema Typing Strictness]
+@dataclass
+class EndpointTruth:
+    has_success: bool
+    last_status: Optional[int]
+    last_error: Optional[str]
+    last_success_age: Optional[int]
+    last_change_age: Optional[int]
+    observed_keys: List[str]
+    schema_source: str
 
 
 def flatten_keys(obj: Any, prefix: str, list_cap: int, out: Set[str]) -> None:
@@ -66,53 +78,69 @@ class CapabilitiesChecker:
         return cls(catalog, plan_yaml, db_path)
 
     def _validate_db_schema(self) -> None:
+        # [Fix: Step 2] Validate schema structure (columns), not just table presence.
         try:
             with duckdb.connect(self.db_path, read_only=True) as con:
-                tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+                tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
                 required = {"dim_endpoints", "endpoint_state", "raw_http_events"}
-                if not required.issubset(set(tables)):
-                    print(f"DB not initialized. Missing tables: {required - set(tables)}")
+                if not required.issubset(tables):
+                    print(f"DB not initialized. Missing tables: {required - tables}")
                     sys.exit(1)
+                
+                def check_columns(table: str, required_cols: Set[str]):
+                    cols = {r[1] for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+                    missing = required_cols - cols
+                    if missing:
+                        print(f"Schema mismatch in table '{table}'. Missing required columns: {missing}")
+                        sys.exit(1)
+
+                check_columns("endpoint_state", {"ticker", "endpoint_id", "last_success_event_id", "last_success_ts_utc", "last_change_ts_utc"})
+                check_columns("raw_http_events", {"endpoint_id", "event_id", "received_at_utc", "http_status", "error_type", "payload_json"})
+
         except duckdb.Error as e:
             print(f"Failed to connect to DuckDB at {self.db_path}: {e}")
             sys.exit(1)
 
-    def extract_db_truth(self, con: duckdb.DuckDBPyConnection, method: str, path: str) -> Dict[str, Any]:
+    def extract_db_truth(self, con: duckdb.DuckDBPyConnection, method: str, path: str) -> EndpointTruth:
         """
-        Fetch ground truth for an endpoint.
-        Prioritizes variants with recent success.
-        Reports status/error from the most recent attempt (even if failure).
+        Fetch ground truth for an endpoint deterministically.
+        Prioritizes variants with recent success across ALL tickers.
         """
         now_utc = datetime.now(UTC)
         
-        # 1. Select top 3 variants by recency of success (or change if no success)
+        # [Fix: Step 1] Derived aggregate to avoid non-deterministic multi-ticker JOIN duplications
         variant_rows = con.execute("""
+            WITH agg AS (
+                SELECT endpoint_id, 
+                       MAX(last_success_ts_utc) AS max_succ, 
+                       MAX(last_change_ts_utc) AS max_chg 
+                FROM endpoint_state 
+                GROUP BY endpoint_id
+            )
             SELECT t1.endpoint_id 
             FROM dim_endpoints t1
-            LEFT JOIN endpoint_state t2 ON t1.endpoint_id = t2.endpoint_id
+            LEFT JOIN agg ON t1.endpoint_id = agg.endpoint_id
             WHERE t1.method = ? AND t1.path = ?
-            ORDER BY COALESCE(t2.last_success_ts_utc, t2.last_change_ts_utc) DESC NULLS LAST
+            ORDER BY COALESCE(agg.max_succ, agg.max_chg) DESC NULLS LAST
             LIMIT 3
         """, [method.upper(), path]).fetchall()
 
         observed_keys: Set[str] = set()
-        
-        # Track best success (for keys/computability)
         best_success_ts: Optional[datetime] = None
-        
-        # Track latest attempt (for status/error visibility)
         latest_attempt_ts: Optional[datetime] = None
         latest_status = None
         latest_error = None
-        
         found_success = False
+        schema_source = "none"
 
         for (eid,) in variant_rows:
-            # A. Check for success in endpoint_state
+            # A. Check for success in endpoint_state deterministically across ALL tickers
             state_row = con.execute("""
                 SELECT last_success_event_id, last_success_ts_utc
                 FROM endpoint_state
                 WHERE endpoint_id = ? AND last_success_event_id IS NOT NULL
+                ORDER BY last_success_ts_utc DESC NULLS LAST
+                LIMIT 1
             """, [eid]).fetchone()
 
             if state_row:
@@ -120,11 +148,9 @@ class CapabilitiesChecker:
                 succ_ts = ensure_utc(succ_ts)
                 
                 if succ_ts:
-                    # Update best success if this one is newer
                     if best_success_ts is None or succ_ts > best_success_ts:
                         best_success_ts = succ_ts
                         
-                        # Fetch payload for keys
                         payload_row = con.execute(
                             "SELECT payload_json FROM raw_http_events WHERE event_id = ?",
                             [evt_id]
@@ -134,13 +160,13 @@ class CapabilitiesChecker:
                             found_success = True
                             try:
                                 pj = json.loads(payload_row[0]) if isinstance(payload_row[0], str) else payload_row[0]
-                                # Reset keys for the better variant
                                 observed_keys = set()
                                 flatten_keys(pj, "", 5, observed_keys)
+                                schema_source = "latest_success_event"
                             except Exception:
                                 pass
 
-            # B. Check for latest raw event (success or failure) to get current status
+            # B. Latest raw event for status/error across ALL tickers (ticker is part of raw_events naturally)
             latest_evt_row = con.execute("""
                 SELECT http_status, error_type, received_at_utc
                 FROM raw_http_events
@@ -159,30 +185,25 @@ class CapabilitiesChecker:
                         latest_status = status
                         latest_error = error
 
-        # Calculate ages
-        last_success_age = None
-        if best_success_ts:
-            last_success_age = int((now_utc - best_success_ts).total_seconds())
+        last_success_age = int((now_utc - best_success_ts).total_seconds()) if best_success_ts else None
+        last_change_age = int((now_utc - latest_attempt_ts).total_seconds()) if latest_attempt_ts else None
 
-        last_change_age = None
-        if latest_attempt_ts:
-            last_change_age = int((now_utc - latest_attempt_ts).total_seconds())
+        return EndpointTruth(
+            has_success=found_success,
+            last_status=latest_status,
+            last_error=latest_error,
+            last_success_age=last_success_age,
+            last_change_age=last_change_age,
+            observed_keys=sorted(list(observed_keys)),
+            schema_source=schema_source
+        )
 
-        return {
-            "has_success": found_success,
-            "last_status": latest_status,
-            "last_error": latest_error,
-            "last_success_age": last_success_age,
-            "last_change_age": last_change_age,
-            "observed_keys": sorted(list(observed_keys))
-        }
-
-    def evaluate_metric(self, spec: MetricSpec, db_states: Dict[EndpointRef, Dict[str, Any]]) -> Dict[str, Any]:
+    def evaluate_metric(self, spec: MetricSpec, db_states: Dict[EndpointRef, EndpointTruth]) -> Dict[str, Any]:
         missing_endpoints = []
         missing_keys_reasons = []
         
-        # Handle optional presence-only escape hatch if defined on spec
-        presence_only = getattr(spec, "presence_only_endpoints", set())
+        # [Fix: Step 3] Handle explicit presence-only endpoints securely
+        used_presence_only = False
 
         for ep in spec.required_endpoints:
             if not self.catalog.has(ep.method, ep.path):
@@ -190,19 +211,21 @@ class CapabilitiesChecker:
                 continue
 
             state = db_states.get(ep)
-            if not state or not state["has_success"]:
+            if not state or not state.has_success:
                 missing_endpoints.append(f"{ep.method} {ep.path} (never seen successful payload)")
                 continue
 
             rule = spec.required_keys_by_endpoint.get(ep)
             
-            # STRICT validation: If no rule and not explicitly presence-only, fail.
+            # STRICT validation: If no rule, it MUST be in presence_only_endpoints
             if not rule:
-                if ep not in presence_only:
+                if ep in spec.presence_only_endpoints:
+                    used_presence_only = True
+                else:
                     missing_keys_reasons.append(f"{ep.method} {ep.path} (no key rules defined for required endpoint)")
                 continue
 
-            obs_keys = set(state["observed_keys"])
+            obs_keys = set(state.observed_keys)
             if rule.all_of and not rule.all_of.issubset(obs_keys):
                 missing = rule.all_of - obs_keys
                 missing_keys_reasons.append(f"{ep.method} {ep.path} missing required keys: {sorted(missing)}")
@@ -221,29 +244,28 @@ class CapabilitiesChecker:
             status = "N/A"
             reasons.extend(missing_keys_reasons)
 
+        if status == "COMPUTABLE" and used_presence_only:
+            status = "COMPUTABLE (presence-only; key rules not defined)"
+
         return {"name": spec.name, "status": status, "reasons": reasons}
 
     def run(self, output_format: str) -> None:
-        # 1. Identify Critical Endpoints from Metrics
         critical_eps: Set[EndpointRef] = set()
         for m in INSTITUTIONAL_METRICS:
             critical_eps.update(m.required_endpoints)
 
         sorted_eps = sorted(list(critical_eps), key=lambda x: (x.method, x.path))
         
-        db_states: Dict[EndpointRef, Dict[str, Any]] = {}
+        db_states: Dict[EndpointRef, EndpointTruth] = {}
         with duckdb.connect(self.db_path, read_only=True) as con:
             for ep in sorted_eps:
                 db_states[ep] = self.extract_db_truth(con, ep.method, ep.path)
 
-        # 2. Evaluate Metrics
         metric_results = []
         for m in INSTITUTIONAL_METRICS:
             metric_results.append(self.evaluate_metric(m, db_states))
 
-        # 3. Print Desk-Grade Output
         if output_format == "json":
-            # Build endpoint details list for JSON
             endpoint_details = []
             for ep in sorted_eps:
                 state = db_states[ep]
@@ -254,13 +276,14 @@ class CapabilitiesChecker:
                     "path": ep.path,
                     "operation_id": op_id,
                     "in_plan": in_plan,
-                    "has_success": state["has_success"],
-                    "last_status": state["last_status"],
-                    "last_error": state["last_error"],
-                    "last_success_age": state["last_success_age"],
-                    "last_change_age": state["last_change_age"],
-                    "observed_keys_count": len(state["observed_keys"]),
-                    "observed_keys_preview": state["observed_keys"][:20]
+                    "has_success": state.has_success,
+                    "last_status": state.last_status,
+                    "last_error": state.last_error,
+                    "last_success_age": state.last_success_age,
+                    "last_change_age": state.last_change_age,
+                    "observed_keys_count": len(state.observed_keys),
+                    "observed_keys_preview": state.observed_keys[:20],
+                    "schema_source": state.schema_source
                 })
 
             out = {
@@ -288,22 +311,21 @@ class CapabilitiesChecker:
                 op_id = self.catalog.get(ep.method, ep.path).operation_id if self.catalog.has(ep.method, ep.path) else "UNKNOWN"
                 
                 print(f"{ep.method} {ep.path} [opId: {op_id}] (in_plan: {in_plan})")
-                if not state["has_success"]:
-                    # Show failure status if available
-                    if state["last_status"] or state["last_error"]:
-                        age_str = f"{state['last_change_age']}s ago" if state['last_change_age'] is not None else "N/A"
-                        print(f"  -> N/A: Never seen successful payload. Last attempt: {state['last_status']} ({state['last_error'] or 'no error'}) {age_str}")
+                if not state.has_success:
+                    if state.last_status or state.last_error:
+                        age_str = f"{state.last_change_age}s ago" if state.last_change_age is not None else "N/A"
+                        print(f"  -> N/A: Never seen successful payload. Last attempt: {state.last_status} ({state.last_error or 'no error'}) {age_str}")
                     else:
                         print("  -> N/A: Never seen successful payload (no attempts found)")
                 else:
-                    sa = f"{state['last_success_age']}s ago" if state['last_success_age'] is not None else "N/A"
-                    ca = f"{state['last_change_age']}s ago" if state['last_change_age'] is not None else "N/A"
-                    print(f"  Last Success: {sa} | Last Change: {ca} | Status: {state['last_status']}")
+                    sa = f"{state.last_success_age}s ago" if state.last_success_age is not None else "N/A"
+                    ca = f"{state.last_change_age}s ago" if state.last_change_age is not None else "N/A"
+                    print(f"  Last Success: {sa} | Last Change: {ca} | Status: {state.last_status}")
                     
-                    keys = state["observed_keys"]
+                    keys = state.observed_keys
                     preview = keys[:10]
                     suffix = "..." if len(keys) > 10 else ""
-                    print(f"  Keys ({len(keys)} observed): {preview} {suffix}")
+                    print(f"  Keys ({len(keys)} observed): {preview} {suffix} ")
                 print()
 
             print("=" * 80)
@@ -312,7 +334,7 @@ class CapabilitiesChecker:
             for mr in metric_results:
                 status_str = f"[{mr['status']}]".ljust(12)
                 print(f"{status_str} {mr['name']}")
-                if mr['status'] == "COMPUTABLE":
+                if "COMPUTABLE" in mr['status']:
                     print("  All required endpoints and keys are present.")
                 else:
                     for reason in mr["reasons"]:

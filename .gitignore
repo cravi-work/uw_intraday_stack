@@ -1,1 +1,6 @@
-.aider*
+# Local Database
+uw_stack.duckdb
+
+# API Keys and Secrets
+.env
+config.json
