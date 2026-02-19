@@ -149,6 +149,31 @@ plans:
       path_params: {}
       query_params:
         date: "{date}"
+    
+    - name: greek-exposure-strike
+      method: GET
+      path: /api/stock/{ticker}/greek-exposure/strike
+    - name: greek-exposure-expiry
+      method: GET
+      path: /api/stock/{ticker}/greek-exposure/expiry
+    - name: spot-exposures-expiry-strike
+      method: GET
+      path: /api/stock/{ticker}/spot-exposures/expiry-strike
+    - name: flow-per-strike
+      method: GET
+      path: /api/stock/{ticker}/flow-per-strike
+    - name: flow-alerts
+      method: GET
+      path: /api/stock/{ticker}/flow-alerts
+    - name: option-chains
+      method: GET
+      path: /api/stock/{ticker}/option-chains
+    - name: option-contracts
+      method: GET
+      path: /api/stock/{ticker}/option-contracts
+    - name: historical-risk-reversal-skew
+      method: GET
+      path: /api/stock/{ticker}/historical-risk-reversal-skew
 
   market_context:
     - name: market_tide
@@ -164,3 +189,9 @@ plans:
       path: /api/market/economic-calendar
       path_params: {}
       query_params: {}
+    - name: market-top-net-impact
+      method: GET
+      path: /api/market/top-net-impact
+    - name: market-total-options-volume
+      method: GET
+      path: /api/market/total-options-volume

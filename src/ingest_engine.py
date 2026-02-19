@@ -231,7 +231,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         events_by_ticker[tkr].append((endpoint_id, event_id, res))
 
                     # endpoint_state is per ticker+endpoint; only advance on SUCCESS payloads.
-                    if tkr != "__MARKET__" and getattr(res, "ok", False) and res.payload_hash:
+                    if getattr(res, "ok", False) and getattr(res, "payload_hash", None):
                         prev = con.execute(
                             "SELECT last_payload_hash FROM endpoint_state WHERE ticker=? AND endpoint_id=?",
                             [tkr, endpoint_id],
