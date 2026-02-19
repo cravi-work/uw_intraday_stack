@@ -13,6 +13,7 @@ from .file_lock import FileLock, FileLockError
 from .scheduler import ET, UTC, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
+from .endpoint_truth import EndpointPayloadClass, FreshnessState, classify_payload, resolve_effective_payload
 
 logger = logging.getLogger(__name__)
 
@@ -80,19 +81,6 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
     return path_params, query_params
 
 
-def _payload_valid(res) -> bool:
-    if not getattr(res, "ok", False):
-        return False
-    pj = getattr(res, "payload_json", None)
-    if pj is None:
-        return False
-    if isinstance(pj, dict):
-        return len(pj) > 0
-    if isinstance(pj, list):
-        return len(pj) > 0
-    return False
-
-
 async def fetch_all(
     client: UwClient,
     tickers: List[str],
@@ -148,8 +136,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     post_utc = hours.post_end_et.astimezone(UTC) if hours.post_end_et else None
     sec_to_close = hours.seconds_to_close(asof_et)
 
-    # Fetch OUTSIDE the cycle lock (avoid holding lock over network IO).
-    # Fetch OUTSIDE the cycle lock (avoid holding lock over network IO).
     async def _run_fetch():
         net = cfg.get("network", {})
         sys_cfg = cfg.get("system", {})
@@ -182,7 +168,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     db = DbWriter(cfg["storage"]["duckdb_path"], cfg["storage"]["writer_lock_path"])
 
     try:
-        # Hold lock ONLY for DB write/commit section.
         with FileLock(cfg["storage"]["cycle_lock_path"]):
             with db.writer() as con:
                 db.ensure_schema(con)
@@ -205,81 +190,66 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     notes=run_notes,
                 )
 
-                # Persist events with correct run_id; build per-ticker event lists for DQ/lineage/state.
-                events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any]]] = {t: [] for t in tickers}
+                events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any, PlannedCall]]] = {t: [] for t in tickers}
 
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
+                    
+                    # 1. Fetch prior state before evaluating new payload
+                    prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
+                    prev_hash = prev_state["last_payload_hash"] if prev_state else None
+                    
+                    # 2. Insert the raw event attempt
                     event_id = db.insert_raw_event(
-                        con,
-                        run_id,
-                        tkr,
-                        endpoint_id,
-                        res.requested_at_utc,
-                        res.received_at_utc,
-                        res.status_code,
-                        res.latency_ms,
-                        res.payload_hash,
-                        res.payload_json,
-                        res.retry_count > 0,
-                        res.error_type,
-                        res.error_message,
-                        cb,
+                        con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
+                        res.status_code, res.latency_ms, res.payload_hash, res.payload_json,
+                        res.retry_count > 0, res.error_type, res.error_message, cb,
                     )
 
-                    if tkr in events_by_ticker:
-                        events_by_ticker[tkr].append((endpoint_id, event_id, res))
+                    # 3. Classify the payload deterministically
+                    payload_class, na_error = classify_payload(res, prev_hash, call.method, call.path, sess)
+                    if na_error and not res.error_message:
+                        res.error_message = na_error
 
-                    # endpoint_state is per ticker+endpoint; only advance on SUCCESS payloads.
-                    if getattr(res, "ok", False) and getattr(res, "payload_hash", None):
-                        prev = con.execute(
-                            "SELECT last_payload_hash FROM endpoint_state WHERE ticker=? AND endpoint_id=?",
-                            [tkr, endpoint_id],
-                        ).fetchone()
-                        changed = (prev is None) or (prev[0] != res.payload_hash)
-                        db.upsert_endpoint_state_success(
-                            con, tkr, endpoint_id, event_id, res.received_at_utc, res.payload_hash, changed
-                        )
+                    # 4. Update the endpoint state
+                    is_success = payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE)
+                    is_changed = (payload_class == EndpointPayloadClass.SUCCESS_HAS_DATA)
+                    db.upsert_endpoint_state(con, tkr, endpoint_id, str(event_id), res, is_success, is_changed)
+
+                    # 5. Resolve the Effective Payload for this cycle
+                    rec_ts = res.received_at_utc if not isinstance(res.received_at_utc, (int, float)) else dt.datetime.fromtimestamp(res.received_at_utc, UTC)
+                    resolved = resolve_effective_payload(str(event_id), rec_ts, payload_class, prev_state)
+                    
+                    if tkr not in events_by_ticker:
+                        events_by_ticker[tkr] = []
+                    events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call))
 
                 # Write snapshots + lineage + predictions.
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
-                    valid = sum(1 for (_eid, _event_id, r) in evs if _payload_valid(r))
+                    # DQ is now based strictly on Effective Payload freshness
+                    valid = sum(1 for (_, _, res, _) in evs if res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY))
                     dq = (valid / len(evs)) if evs else 0.0
 
                     snapshot_id = db.insert_snapshot(
-                        con,
-                        run_id=run_id,
-                        asof_ts_utc=asof_utc,
-                        ticker=tkr,
-                        session_label=sess,
-                        is_trading_day=True,
-                        is_early_close=hours.is_early_close,
-                        data_quality_score=dq,
-                        market_close_utc=close_utc,
-                        post_end_utc=post_utc,
-                        seconds_to_close=sec_to_close,
+                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
+                        is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
+                        market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
                     )
 
-                    # Minimal lineage: associate this snapshot with the latest event for each planned endpoint.
-                    for endpoint_id, event_id, r in evs:
-                        if _payload_valid(r):
-                            freshness = "FRESH"
-                        elif getattr(r, "ok", False) and getattr(r, "payload_json", None) is not None:
-                            freshness = "INVALID"
-                        else:
-                            freshness = "MISSING"
+                    for endpoint_id, event_id, res, call in evs:
+                        meta = {
+                            "method": call.method,
+                            "path": call.path,
+                            "endpoint_id": endpoint_id
+                        }
+                        db.insert_lineage(
+                            con, snapshot_id, endpoint_id, res.used_event_id,
+                            res.freshness_state.name, res.stale_age_seconds,
+                            res.payload_class.name, res.na_reason, meta
+                        )
 
-                        age = None
-                        if getattr(r, "received_at_utc", None):
-                            try:
-                                age = max(0, int((asof_utc - r.received_at_utc).total_seconds()))
-                            except Exception:
-                                age = None
-
-                        db.insert_lineage(con, snapshot_id, endpoint_id, event_id, freshness, age)
-
-                    # Mock predictions (until real model is wired in).
+                    # Mock predictions
                     class MockPred:
                         bias = "NEUTRAL"
                         confidence = 0.0
@@ -291,7 +261,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         model_hash = "abc"
 
                     p = MockPred()
-                    start_price = None  # Never invent a price.
+                    start_price = None
 
                     for h in cfg["validation"]["horizons_minutes"]:
                         db.insert_prediction(
@@ -311,6 +281,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "model_version": p.model_version,
                                 "model_hash": p.model_hash,
                                 "is_mock": True,
+                                "meta_json": {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None}
                             },
                         )
 
@@ -319,7 +290,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                             con,
                             {
                                 "snapshot_id": snapshot_id,
-                                "horizon_minutes": 0,  # sentinel for TO_CLOSE
+                                "horizon_minutes": 0,
                                 "horizon_kind": "TO_CLOSE",
                                 "horizon_seconds": int(sec_to_close),
                                 "start_price": start_price,
@@ -332,6 +303,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "model_version": p.model_version,
                                 "model_hash": p.model_hash,
                                 "is_mock": True,
+                                "meta_json": {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None}
                             },
                         )
 

@@ -13,8 +13,6 @@ from .metric_specs import INSTITUTIONAL_METRICS, EndpointRef, MetricSpec
 
 UTC = timezone.utc
 
-
-# [Fix: Step 2] Make capabilities library-safe with Typed Exceptions.
 class CapabilitiesError(Exception):
     """Base exception for Capabilities logic."""
     pass
@@ -27,8 +25,6 @@ class SchemaMismatchError(CapabilitiesError):
     """Raised when the database lacks required tables or columns."""
     pass
 
-
-# [Fix: Step 4 & 6] Typed struct formalizing distinct timestamp semantics.
 @dataclass(frozen=True)
 class EndpointTruth:
     has_success: bool
@@ -41,9 +37,7 @@ class EndpointTruth:
     selected_endpoint_id: Optional[int]
     selected_success_event_id: Optional[str]
 
-
 def flatten_keys(obj: Any, prefix: str, list_cap: int, out: Set[str]) -> None:
-    """Deterministically flatten JSON keys into dot paths (emits leaf nodes)."""
     if isinstance(obj, dict):
         for k in sorted(obj.keys()):
             new_prefix = f"{prefix}.{k}" if prefix else k
@@ -56,14 +50,12 @@ def flatten_keys(obj: Any, prefix: str, list_cap: int, out: Set[str]) -> None:
         if prefix:
             out.add(prefix)
 
-
 def ensure_utc(ts: Optional[datetime]) -> Optional[datetime]:
     if ts is None:
         return None
     if ts.tzinfo is None:
         return ts.replace(tzinfo=UTC)
     return ts.astimezone(UTC)
-
 
 class CapabilitiesChecker:
     def __init__(self, catalog: Any, plan_yaml: Dict[str, Any], db_path: str, validate_schema: bool = True):
@@ -92,7 +84,6 @@ class CapabilitiesChecker:
         return cls(catalog, plan_yaml, db_path)
 
     def _validate_db_schema(self) -> None:
-        # [Fix: Step 3] Validate specific required columns, preventing schema drift silently.
         try:
             with duckdb.connect(self.db_path, read_only=True) as con:
                 tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
@@ -116,7 +107,6 @@ class CapabilitiesChecker:
     def extract_db_truth(self, con: duckdb.DuckDBPyConnection, method: str, path: str) -> EndpointTruth:
         now_utc = datetime.now(UTC)
         
-        # [Fix: Step 5] Rank variants deterministically even for "failures-only" endpoints
         variant_row = con.execute("""
             WITH ep_max AS (
                 SELECT e.endpoint_id,
@@ -139,7 +129,6 @@ class CapabilitiesChecker:
 
         winner_eid = variant_row[0]
 
-        # [Fix: Step 4] Fetch 'best success' mapping exactly to multi-ticker guarantees
         best_success_row = con.execute("""
             SELECT last_success_event_id, last_success_ts_utc, last_change_ts_utc
             FROM endpoint_state
@@ -148,7 +137,6 @@ class CapabilitiesChecker:
             LIMIT 1
         """, [winner_eid]).fetchone()
 
-        # [Fix: Step 4] Fetch 'latest attempt' mapping
         latest_attempt_row = con.execute("""
             SELECT http_status, error_type, received_at_utc
             FROM raw_http_events
@@ -187,13 +175,28 @@ class CapabilitiesChecker:
                 except Exception:
                     pass
 
+        # Phase 3: Fallback for "has_success" if endpoint_state doesn't have a success ID 
+        if not found_success and winner_eid:
+            fallback_row = con.execute("""
+                SELECT event_id, payload_json FROM raw_http_events 
+                WHERE endpoint_id = ? AND http_status BETWEEN 200 AND 299 AND payload_json IS NOT NULL
+                ORDER BY received_at_utc DESC LIMIT 1
+            """, [winner_eid]).fetchone()
+            
+            if fallback_row:
+                found_success = True
+                try:
+                    pj = json.loads(fallback_row[1]) if isinstance(fallback_row[1], str) else fallback_row[1]
+                    flatten_keys(pj, "", 5, observed_keys)
+                except Exception:
+                    pass
+
         if latest_attempt_row:
             status, error, rec_ts = latest_attempt_row
             latest_status = status
             latest_error = error
             latest_attempt_ts = ensure_utc(rec_ts)
 
-        # Disambiguated time aggregations
         last_success_age = int((now_utc - best_success_ts).total_seconds()) if best_success_ts else None
         last_payload_change_age = int((now_utc - best_change_ts).total_seconds()) if best_change_ts else None
         last_attempt_age = int((now_utc - latest_attempt_ts).total_seconds()) if latest_attempt_ts else None

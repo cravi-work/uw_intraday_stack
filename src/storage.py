@@ -79,16 +79,42 @@ CREATE TABLE IF NOT EXISTS predictions (
   realized_at_utc TIMESTAMP,
   outcome_label TEXT,
   brier_score DOUBLE,
-  log_loss DOUBLE
+  log_loss DOUBLE,
+  meta_json JSON
 );
 
--- [Issue D] Dedupe includes horizon_seconds
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON);
 CREATE TABLE IF NOT EXISTS derived_levels (snapshot_id UUID, level_type TEXT, price DOUBLE, magnitude DOUBLE, meta_json JSON);
-CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID, endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER);
-CREATE TABLE IF NOT EXISTS endpoint_state (ticker TEXT, endpoint_id INTEGER, last_success_event_id UUID, last_success_ts_utc TIMESTAMP, last_payload_hash TEXT, last_change_ts_utc TIMESTAMP, last_change_event_id UUID, PRIMARY KEY (ticker, endpoint_id));
+
+CREATE TABLE IF NOT EXISTS snapshot_lineage (
+    snapshot_id UUID, 
+    endpoint_id INTEGER, 
+    used_event_id UUID, 
+    freshness_state TEXT, 
+    data_age_seconds INTEGER,
+    payload_class TEXT,
+    na_reason TEXT,
+    meta_json JSON
+);
+
+CREATE TABLE IF NOT EXISTS endpoint_state (
+    ticker TEXT, 
+    endpoint_id INTEGER, 
+    last_success_event_id UUID, 
+    last_success_ts_utc TIMESTAMP, 
+    last_payload_hash TEXT, 
+    last_change_ts_utc TIMESTAMP, 
+    last_change_event_id UUID,
+    last_attempt_event_id UUID,
+    last_attempt_ts_utc TIMESTAMP,
+    last_attempt_http_status INTEGER,
+    last_attempt_error_type TEXT,
+    last_attempt_error_msg TEXT,
+    PRIMARY KEY (ticker, endpoint_id)
+);
+
 CREATE TABLE IF NOT EXISTS raw_http_events (event_id UUID PRIMARY KEY, run_id UUID, requested_at_utc TIMESTAMP, received_at_utc TIMESTAMP, ticker TEXT, endpoint_id INTEGER, http_status INTEGER, latency_ms INTEGER, payload_hash TEXT, payload_json JSON, is_retry BOOLEAN, error_type TEXT, error_msg TEXT, circuit_state_json JSON);
 CREATE TABLE IF NOT EXISTS config_history (config_version VARCHAR, ingested_at_utc TIMESTAMP, yaml_content VARCHAR);
 CREATE TABLE IF NOT EXISTS dim_tickers (ticker TEXT PRIMARY KEY);
@@ -110,7 +136,6 @@ class DbWriter:
 
     def _migrate_additive(self, con: duckdb.DuckDBPyConnection):
         def _add(tbl, col, typ):
-            # [Issue I] Removed try/except to prevent silent failures
             cols = [r[1] for r in con.execute(f"PRAGMA table_info('{tbl}')").fetchall()]
             if col not in cols: 
                 logger.info(f"Migrating {tbl}: Adding {col} {typ}")
@@ -124,14 +149,25 @@ class DbWriter:
         _add("predictions", "horizon_kind", "TEXT DEFAULT 'FIXED'")
         _add("predictions", "horizon_seconds", "INTEGER")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
+        
+        # Phase 3 additions
+        _add("endpoint_state", "last_attempt_event_id", "UUID")
+        _add("endpoint_state", "last_attempt_ts_utc", "TIMESTAMP")
+        _add("endpoint_state", "last_attempt_http_status", "INTEGER")
+        _add("endpoint_state", "last_attempt_error_type", "TEXT")
+        _add("endpoint_state", "last_attempt_error_msg", "TEXT")
+        
+        _add("snapshot_lineage", "payload_class", "TEXT")
+        _add("snapshot_lineage", "na_reason", "TEXT")
+        _add("snapshot_lineage", "meta_json", "JSON")
+        
+        _add("predictions", "meta_json", "JSON")
 
-    def insert_snapshot(self, con, *, run_id, asof_ts_utc, ticker, session_label, is_trading_day, data_quality_score, 
-                        is_early_close: bool, market_close_utc: Optional[datetime], post_end_utc: Optional[datetime], seconds_to_close: Optional[int]) -> str:
+    def insert_snapshot(self, con, *, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close: bool, data_quality_score, market_close_utc: Optional[datetime], post_end_utc: Optional[datetime], seconds_to_close: Optional[int]) -> str:
         row = con.execute("SELECT snapshot_id FROM snapshots WHERE ticker=? AND asof_ts_utc=?", [ticker.upper(), asof_ts_utc]).fetchone()
         if row: return str(row[0])
 
         snapshot_id = uuid.uuid4()
-        # [Issue 5] Explicit Columns
         con.execute("""INSERT INTO snapshots (
             snapshot_id, run_id, asof_ts_utc, ticker, session_label, 
             is_trading_day, is_early_close, data_quality_score, 
@@ -141,17 +177,11 @@ class DbWriter:
         return str(snapshot_id)
 
     def insert_prediction(self, con, p):
-        """Idempotent insert keyed by (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds).
-
-        DuckDB uniqueness semantics with NULLs can be surprising. We delete any existing row for the
-        same horizon key before inserting a new prediction_id.
-        """
         snapshot_id = str(p["snapshot_id"])
         horizon_kind = p.get("horizon_kind", "FIXED")
         horizon_minutes = p.get("horizon_minutes")
         horizon_seconds = p.get("horizon_seconds")
 
-        # Normalize TO_CLOSE to avoid NULL horizon_minutes.
         if horizon_kind == "TO_CLOSE":
             if horizon_minutes is None:
                 horizon_minutes = 0
@@ -160,7 +190,6 @@ class DbWriter:
         elif horizon_minutes is not None:
             horizon_minutes = int(horizon_minutes)
 
-        # Idempotency: remove any prior row for the same horizon key.
         con.execute(
             """DELETE FROM predictions
                WHERE snapshot_id=? AND horizon_kind=?
@@ -175,12 +204,12 @@ class DbWriter:
             INSERT INTO predictions (
                 prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds,
                 start_price, bias, confidence, prob_up, prob_down, prob_flat,
-                model_name, model_version, model_hash, is_mock
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                model_name, model_version, model_hash, is_mock, meta_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds,
                 p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"],
-                p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False),
+                p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), json.dumps(p.get("meta_json", {}))
             ],
         )
         return pid
@@ -195,7 +224,6 @@ class DbWriter:
         return eid
 
     def insert_raw_event(self, con, run_id, ticker, endpoint_id, req_at, rec_at, status, lat, ph, pj, retry, etype, emsg, circ):
-        # Cast floats to UTC datetime objects for DuckDB
         if isinstance(req_at, (int, float)): req_at = datetime.fromtimestamp(req_at, UTC)
         if isinstance(rec_at, (int, float)): rec_at = datetime.fromtimestamp(rec_at, UTC)
         
@@ -223,27 +251,53 @@ class DbWriter:
 
     def upsert_tickers(self, con, tickers):
         con.executemany("INSERT OR IGNORE INTO dim_tickers (ticker) VALUES (?)", [[t.upper()] for t in tickers])
-    def upsert_endpoint_state_success(self, con, ticker, endpoint_id, event_id, rec_at, ph, changed):
-        # Cast float to UTC datetime object for DuckDB
-        if isinstance(rec_at, (int, float)): rec_at = datetime.fromtimestamp(rec_at, UTC)
+
+    def get_endpoint_state(self, con, ticker: str, endpoint_id: int) -> Optional[Dict[str, Any]]:
+        row = con.execute("SELECT last_success_event_id, last_success_ts_utc, last_payload_hash, last_change_ts_utc, last_change_event_id FROM endpoint_state WHERE ticker=? AND endpoint_id=?", [ticker, endpoint_id]).fetchone()
+        if not row: return None
+        return {
+            "last_success_event_id": str(row[0]) if row[0] else None,
+            "last_success_ts_utc": row[1],
+            "last_payload_hash": row[2],
+            "last_change_ts_utc": row[3],
+            "last_change_event_id": str(row[4]) if row[4] else None
+        }
+
+    def upsert_endpoint_state(self, con, ticker: str, endpoint_id: int, event_id: str, res: Any, is_success_class: bool, changed: bool):
+        rec_at = res.received_at_utc if not isinstance(res.received_at_utc, (int, float)) else datetime.fromtimestamp(res.received_at_utc, UTC)
         
-        con.execute("""INSERT INTO endpoint_state (ticker, endpoint_id, last_success_event_id, last_success_ts_utc, last_payload_hash, last_change_ts_utc, last_change_event_id)
-            VALUES (?,?,?,?,?,?,?) ON CONFLICT(ticker, endpoint_id) DO UPDATE SET 
-            last_success_event_id=excluded.last_success_event_id, last_success_ts_utc=excluded.last_success_ts_utc, last_payload_hash=excluded.last_payload_hash,
-            last_change_ts_utc=CASE WHEN ? THEN excluded.last_success_ts_utc ELSE endpoint_state.last_change_ts_utc END,
-            last_change_event_id=CASE WHEN ? THEN excluded.last_success_event_id ELSE endpoint_state.last_change_event_id END""",
-            [ticker, endpoint_id, str(event_id), rec_at, ph, rec_at, str(event_id), changed, changed])
+        # Ensure row exists
+        con.execute("INSERT OR IGNORE INTO endpoint_state (ticker, endpoint_id) VALUES (?,?)", [ticker, endpoint_id])
+        
+        # Always update attempt metrics
+        con.execute("""UPDATE endpoint_state SET last_attempt_event_id=?, last_attempt_ts_utc=?, last_attempt_http_status=?, last_attempt_error_type=?, last_attempt_error_msg=? WHERE ticker=? AND endpoint_id=?""",
+                    [str(event_id), rec_at, res.status_code, res.error_type, res.error_message, ticker, endpoint_id])
+
+        # Conditionally update success metrics (protects against empty/invalid overwriting good state)
+        if is_success_class:
+            con.execute("""UPDATE endpoint_state SET last_success_event_id=?, last_success_ts_utc=?, last_payload_hash=?,
+                last_change_ts_utc=CASE WHEN ? THEN ? ELSE last_change_ts_utc END,
+                last_change_event_id=CASE WHEN ? THEN ? ELSE last_change_event_id END
+                WHERE ticker=? AND endpoint_id=?""",
+                [str(event_id), rec_at, res.payload_hash, changed, rec_at, changed, str(event_id), ticker, endpoint_id])
+
     def insert_features(self, con, snapshot_id, feats, meta):
         for k, v in feats.items(): con.execute("INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json) VALUES (?,?,?,?)", [str(snapshot_id), k, v, json.dumps(meta)])
+    
     def insert_levels(self, con, snapshot_id, levels):
         if not levels: return
         con.executemany("INSERT INTO derived_levels (snapshot_id, level_type, price, magnitude, meta_json) VALUES (?,?,?,?,?)", [[str(snapshot_id), l["level_type"], l["price"], l["magnitude"], json.dumps(l.get("meta", {}))] for l in levels])
-    def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds):
-        con.execute("INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds) VALUES (?,?,?,?,?)", [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds])
+    
+    def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json):
+        con.execute("INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json) VALUES (?,?,?,?,?,?,?,?)", 
+            [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds, payload_class, na_reason, json.dumps(meta_json) if meta_json else None])
+            
     def end_run(self, con, run_id):
         con.execute("UPDATE meta_runs SET ended_at_utc=? WHERE run_id=?", [datetime.now(UTC), str(run_id)])
+        
     def ro_connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(self.duckdb_path, read_only=True)
+        
     @contextlib.contextmanager
     def writer(self):
         con = self._connect_new()
