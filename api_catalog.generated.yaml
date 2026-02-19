@@ -1,0 +1,3637 @@
+version: 1
+source: generated from document.yaml
+categories:
+  Alerts:
+    endpoints:
+    - method: GET
+      path: /api/alerts
+      summary: Alerts
+      description: 'Returns all the alerts that have been triggered for the user.
+
+
+        Time filtering is available using the `newer_than` and `older_than` parameters:
+
+        - The maximum lookback period is 14 days
+
+        - If no time ran'
+      operationId: PublicApi.AlertsController.alerts
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: intraday_only
+        in: query
+        required: false
+        schema: ''
+      - name: config_ids[]
+        in: query
+        required: false
+        schema: ''
+      - name: ticker_symbols
+        in: query
+        required: false
+        schema: ''
+      - name: noti_types[]
+        in: query
+        required: false
+        schema: ''
+      - name: newer_than
+        in: query
+        required: false
+        schema: string
+      - name: older_than
+        in: query
+        required: false
+        schema: string
+    - method: GET
+      path: /api/alerts/configuration
+      summary: Alert configurations
+      description: 'Returnst all alert configurations of the user.
+
+
+        Users can create alerts for:
+
+        - Market tide
+
+        - Gamma exposure (GEX), Vanna exposure (VEX), Charm exposure (CEX)
+
+        - Interval Contract screeners (replicates '
+      operationId: PublicApi.AlertsController.configs
+      parameters: []
+  Congress_Politicians:
+    endpoints:
+    - method: GET
+      path: /api/congress/congress-trader
+      summary: Recent Reports By Trader
+      description: 'Returns the recent reports by the given congress member.
+
+        '
+      operationId: PublicApi.CongressController.congress_trader
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: name
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/congress/late-reports
+      summary: Recent Late Reports
+      description: 'Returns the recent late reports by congress members.
+
+        If a date is given, will only return recent late reports, which''s report
+        date is <= the given input date.
+
+        '
+      operationId: PublicApi.CongressController.congress_late_reports
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/congress/recent-trades
+      summary: Recent Congress Trades
+      description: 'Returns the latest transacted trades by congress members.
+
+        If a date is given, will only return reports, which''s transaction date is
+        <= the given input date.
+
+        '
+      operationId: PublicApi.CongressController.congress_recent_trades
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/politician-portfolios/disclosures
+      summary: Annual Disclosures List
+      description: 'Returns all annual disclosure file records for politicians.
+
+        Can be filtered by politician_id and/or limited to latest per politician.
+
+
+        This is an enterprise only endpoint. Contact dan@unusualwhales.co'
+      operationId: PublicApi.PoliticianPortfoliosController.disclosures
+      parameters:
+      - name: politician_id
+        in: query
+        required: false
+        schema: string
+      - name: latest_only
+        in: query
+        required: false
+        schema: boolean
+      - name: year
+        in: query
+        required: false
+        schema: integer
+    - method: GET
+      path: /api/politician-portfolios/holders/{ticker}
+      summary: Politician Portfolio Holders by Ticker
+      description: 'Returns all politician portfolio owner names, ID, and holdings
+        for the specified ticker.
+
+
+        This is an enterprise only endpoint. Contact dan@unusualwhales.com for details
+        about accessing this data.
+
+        '
+      operationId: PublicApi.PoliticianPortfoliosController.holds_ticker
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: string
+      - name: aggregate_all_portfolios
+        in: query
+        required: false
+        schema: boolean
+    - method: GET
+      path: /api/politician-portfolios/people
+      summary: Politicians List
+      description: 'Returns all politician names and IDs.
+
+
+        This is an enterprise only endpoint. Contact dan@unusualwhales.com for details
+        about accessing this data.
+
+        '
+      operationId: PublicApi.PoliticianPortfoliosController.people
+      parameters: []
+    - method: GET
+      path: /api/politician-portfolios/recent_trades
+      summary: Politician Trades
+      description: 'Returns the latest transacted trades by congress members.
+
+        If a date is given, will only return reports, which''s transaction date is
+        <= the given input date.
+
+
+        This is an enterprise only endpoint. Conta'
+      operationId: PublicApi.PoliticianPortfoliosController.recent_trades
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: politician_id
+        in: query
+        required: false
+        schema: ''
+      - name: filter_late_reports
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: disclosure_newer_than
+        in: query
+        required: false
+        schema: ''
+      - name: disclosure_older_than
+        in: query
+        required: false
+        schema: ''
+      - name: transaction_newer_than
+        in: query
+        required: false
+        schema: ''
+      - name: transaction_older_than
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/politician-portfolios/{politician_id}
+      summary: Politician Portfolios
+      description: 'Returns all portfolios and holdings for a politician.
+
+
+        This is an enterprise only endpoint. Contact dan@unusualwhales.com for details
+        about accessing this data.
+
+        '
+      operationId: PublicApi.PoliticianPortfoliosController.portfolios
+      parameters:
+      - name: politician_id
+        in: path
+        required: true
+        schema: string
+      - name: aggregate_all_portfolios
+        in: query
+        required: false
+        schema: boolean
+  Darkpool:
+    endpoints:
+    - method: GET
+      path: /api/darkpool/recent
+      summary: Recent Darkpool Trades
+      description: 'Returns the latest darkpool trades.
+
+        '
+      operationId: PublicApi.DarkpoolController.darkpool_recent
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: max_premium
+        in: query
+        required: false
+        schema: ''
+      - name: min_size
+        in: query
+        required: false
+        schema: ''
+      - name: max_size
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/darkpool/{ticker}
+      summary: Ticker Darkpool Trades
+      description: 'Returns the darkpool trades for the given ticker on a given day.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last market day.
+
+        '
+      operationId: PublicApi.DarkpoolController.darkpool_ticker
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: newer_than
+        in: query
+        required: false
+        schema: ''
+      - name: older_than
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: max_premium
+        in: query
+        required: false
+        schema: ''
+      - name: min_size
+        in: query
+        required: false
+        schema: ''
+      - name: max_size
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+  ETFs:
+    endpoints:
+    - method: GET
+      path: /api/etfs/{ticker}/exposure
+      summary: Exposure
+      description: 'Returns all ETFs in which the given ticker is a holding
+
+        '
+      operationId: PublicApi.EtfController.exposure
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/etfs/{ticker}/holdings
+      summary: Holdings
+      description: 'Returns the holdings of the ETF
+
+        '
+      operationId: PublicApi.EtfController.holdings
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/etfs/{ticker}/in-outflow
+      summary: Inflow & Outflow
+      description: 'Returns an ETF''s inflow and outflow
+
+        '
+      operationId: PublicApi.EtfController.in_outflow
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/etfs/{ticker}/info
+      summary: Information
+      description: 'Returns the information about the given ETF ticker.
+
+        '
+      operationId: PublicApi.EtfController.info
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/etfs/{ticker}/weights
+      summary: Sector & Country weights
+      description: 'Returns the sector & country weights for the given ETF ticker.
+
+        '
+      operationId: PublicApi.EtfController.weights
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+  Earnings:
+    endpoints:
+    - method: GET
+      path: /api/earnings/afterhours
+      summary: Afterhours
+      description: 'Returns the afterhours earnings for a given date.
+
+        '
+      operationId: PublicApi.EarningsController.afterhours
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/earnings/premarket
+      summary: Premarket
+      description: 'Returns the premarket earnings for a given date.
+
+        '
+      operationId: PublicApi.EarningsController.premarket
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/earnings/{ticker}
+      summary: Historical Ticker Earnings
+      description: 'Returns the historical earnings for the given ticker.
+
+        '
+      operationId: PublicApi.EarningsController.ticker
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+  Insider:
+    endpoints:
+    - method: GET
+      path: /api/insider/transactions
+      summary: Transactions
+      description: 'Returns the latest insider transactions.
+
+
+        By default all transacations that have been filled by the same person on the
+        same day with the same trade code are aggregated into a single row.
+
+        Each of those'
+      operationId: PublicApi.InsiderController.transactions
+      parameters:
+      - name: ticker_symbol
+        in: query
+        required: false
+        schema: ''
+      - name: min_value
+        in: query
+        required: false
+        schema: string
+      - name: max_value
+        in: query
+        required: false
+        schema: string
+      - name: min_price
+        in: query
+        required: false
+        schema: string
+      - name: max_price
+        in: query
+        required: false
+        schema: string
+      - name: owner_name
+        in: query
+        required: false
+        schema: string
+      - name: sectors
+        in: query
+        required: false
+        schema: string
+      - name: industries
+        in: query
+        required: false
+        schema: string
+      - name: min_marketcap
+        in: query
+        required: false
+        schema: ''
+      - name: max_marketcap
+        in: query
+        required: false
+        schema: ''
+      - name: market_cap_size
+        in: query
+        required: false
+        schema: string
+      - name: min_earnings_dte
+        in: query
+        required: false
+        schema: string
+      - name: max_earnings_dte
+        in: query
+        required: false
+        schema: string
+      - name: min_amount
+        in: query
+        required: false
+        schema: string
+      - name: max_amount
+        in: query
+        required: false
+        schema: string
+      - name: is_director
+        in: query
+        required: false
+        schema: boolean
+      - name: is_officer
+        in: query
+        required: false
+        schema: boolean
+      - name: is_s_p_500
+        in: query
+        required: false
+        schema: boolean
+      - name: is_ten_percent_owner
+        in: query
+        required: false
+        schema: boolean
+      - name: common_stock_only
+        in: query
+        required: false
+        schema: boolean
+      - name: transaction_codes[]
+        in: query
+        required: false
+        schema: string
+      - name: security_ad_codes
+        in: query
+        required: false
+        schema: string
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: group
+        in: query
+        required: false
+        schema: boolean
+      - name: start_date
+        in: query
+        required: false
+        schema: string
+      - name: end_date
+        in: query
+        required: false
+        schema: string
+    - method: GET
+      path: /api/insider/{sector}/sector-flow
+      summary: Sector Flow
+      description: 'Returns an aggregated view of the insider flow for the given sector.
+
+
+        This can be used to quickly examine the buy & sell insider flow for a given
+        trading date
+
+        '
+      operationId: PublicApi.InsiderController.sector_flow
+      parameters:
+      - name: sector
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/insider/{ticker}
+      summary: Insiders
+      description: 'Returns all insiders for the given ticker
+
+        '
+      operationId: PublicApi.InsiderController.insiders
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/insider/{ticker}/ticker-flow
+      summary: Ticker Flow
+      description: 'Returns an aggregated view of the insider flow for the given ticker.
+
+
+        This can be used to quickly examine the buy & sell insider flow for a given
+        trading date
+
+        '
+      operationId: PublicApi.InsiderController.ticker_flow
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+  Institutions:
+    endpoints:
+    - method: GET
+      path: /api/institution/{name}/activity
+      summary: Institutional Activity (Deprecated)
+      description: 'The trading activities for a given institution.
+
+        '
+      operationId: PublicApi.InstitutionController.activity
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institution/{name}/activity/v2
+      summary: Institutional Activity
+      description: 'The trading activities for a given institution.
+
+
+        If the result contains multiple report periods, it will contain first the
+        latest report period results ordered by the `order` and `order_direction`,
+
+        th'
+      operationId: PublicApi.InstitutionController.activity_v2
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema: ''
+      - name: ticker_symbol
+        in: query
+        required: false
+        schema: ''
+      - name: start_date
+        in: query
+        required: false
+        schema: ''
+      - name: end_date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institution/{name}/holdings
+      summary: Institutional Holdings
+      description: 'Returns the holdings for a given institution.
+
+        '
+      operationId: PublicApi.InstitutionController.holdings
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema: ''
+      - name: ticker_symbol
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: start_date
+        in: query
+        required: false
+        schema: ''
+      - name: end_date
+        in: query
+        required: false
+        schema: ''
+      - name: security_types
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institution/{name}/sectors
+      summary: Sector Exposure
+      description: 'The sector exposure for a given institution.
+
+        '
+      operationId: PublicApi.InstitutionController.sectors
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institution/{ticker}/ownership
+      summary: Institutional Ownership
+      description: 'The institutional ownership of a given ticker.
+
+        '
+      operationId: PublicApi.InstitutionController.ownership
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: start_date
+        in: query
+        required: false
+        schema: ''
+      - name: end_date
+        in: query
+        required: false
+        schema: ''
+      - name: tags[]
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institutions
+      summary: List of Institutions
+      description: 'Returns a list of institutions.
+
+        '
+      operationId: PublicApi.InstitutionController.list
+      parameters:
+      - name: name
+        in: query
+        required: false
+        schema: ''
+      - name: min_total_value
+        in: query
+        required: false
+        schema: ''
+      - name: max_total_value
+        in: query
+        required: false
+        schema: ''
+      - name: min_share_value
+        in: query
+        required: false
+        schema: ''
+      - name: max_share_value
+        in: query
+        required: false
+        schema: ''
+      - name: tags[]
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/institutions/latest_filings
+      summary: Latest Filings
+      description: 'The latest institutional filings.
+
+        '
+      operationId: PublicApi.InstitutionController.latest_filings
+      parameters:
+      - name: name
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: string
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+  LitFlow:
+    endpoints:
+    - method: GET
+      path: /api/lit-flow/recent
+      summary: Recent Lit Flow Trades
+      description: 'Returns the latest lit exchange trades.
+
+        '
+      operationId: PublicApi.LitFlowController.lit_flow_recent
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: max_premium
+        in: query
+        required: false
+        schema: ''
+      - name: min_size
+        in: query
+        required: false
+        schema: ''
+      - name: max_size
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/lit-flow/{ticker}
+      summary: Ticker Lit Flow Trades
+      description: 'Returns the lit exchange trades for the given ticker on a given
+        day.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last market day.
+
+        '
+      operationId: PublicApi.LitFlowController.lit_flow_ticker
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: newer_than
+        in: query
+        required: false
+        schema: ''
+      - name: older_than
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: max_premium
+        in: query
+        required: false
+        schema: ''
+      - name: min_size
+        in: query
+        required: false
+        schema: ''
+      - name: max_size
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+  Market:
+    endpoints:
+    - method: GET
+      path: /api/market/correlations
+      summary: Correlations
+      description: 'Returns the correlations between a list of tickers.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last market day.
+
+
+        You can filter the time period either b'
+      operationId: PublicApi.MarketController.correlations
+      parameters:
+      - name: tickers
+        in: query
+        required: true
+        schema: ''
+      - name: interval
+        in: query
+        required: false
+        schema: ''
+      - name: start_date
+        in: query
+        required: false
+        schema: ''
+      - name: end_date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/economic-calendar
+      summary: Economic calendar
+      description: 'Returns the economic calendar.
+
+        '
+      operationId: PublicApi.MarketController.events
+      parameters: []
+    - method: GET
+      path: /api/market/fda-calendar
+      summary: FDA Calendar
+      description: 'Returns FDA calendar data with filtering options.
+
+
+        The FDA calendar contains information about:
+
+        - PDUFA (Prescription Drug User Fee Act) dates
+
+        - Advisory Committee Meetings
+
+        - FDA Decisions
+
+        - Clinical '
+      operationId: PublicApi.MarketController.fda_calendar
+      parameters:
+      - name: announced_date_min
+        in: query
+        required: false
+        schema: ''
+      - name: announced_date_max
+        in: query
+        required: false
+        schema: ''
+      - name: target_date_min
+        in: query
+        required: false
+        schema: ''
+      - name: target_date_max
+        in: query
+        required: false
+        schema: ''
+      - name: drug
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/insider-buy-sells
+      summary: Total Insider Buy & Sells
+      description: 'Returns the total amount of purchases & sells as well as notional
+        values for insider transactions
+
+        across the market
+
+        '
+      operationId: PublicApi.MarketController.insider_buy_sells
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/market-tide
+      summary: Market Tide
+      description: Market Tide is a proprietary tool that can be viewed from the Market
+        Overview page. The Market Tide chart provides real time data based on a proprietary
+        formula that examines market wide options activ
+      operationId: PublicApi.MarketController.market_tide
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: otm_only
+        in: query
+        required: false
+        schema: ''
+      - name: interval_5m
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/oi-change
+      summary: OI Change
+      description: 'Returns the non-Index/non-ETF contracts and OI change data with
+        the highest OI change (default: descending).
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/'
+      operationId: PublicApi.MarketController.oi_change
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/sector-etfs
+      summary: Sector Etfs
+      description: 'Returns the current trading days statistics for the SPDR sector
+        etfs
+
+
+        ----
+
+        This can be used to build a market overview such as:
+
+
+        ![sectors etf](https://i.imgur.com/yQ5o6rR.png)
+
+        '
+      operationId: PublicApi.MarketController.sector_etfs
+      parameters: []
+    - method: GET
+      path: /api/market/spike
+      summary: SPIKE
+      description: 'Returns the SPIKE values for the given date.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last market day.
+
+        '
+      operationId: PublicApi.MarketController.spike
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/top-net-impact
+      summary: Top Net Impact
+      description: Returns the top tickers by net premium (half bullish, half bearish).
+        Defaults to last market day.
+      operationId: PublicApi.MarketController.top_net_impact
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: issue_types[]
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/total-options-volume
+      summary: Total Options Volume
+      description: 'Returns the total options volume and premium for all trade executions
+
+        that happened on a given trading date.
+
+
+        ----
+
+        This can be used to build a market options overview such as:
+
+
+        ![Market State](https:/'
+      operationId: PublicApi.MarketController.total_options_volume
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/{sector}/sector-tide
+      summary: Sector Tide
+      description: 'The Sector tide is similar to the Market Tide. While the market
+        tide is based on options activity of the whole market
+
+        the sector tide is only based on the options activity of companies which are
+        in th'
+      operationId: PublicApi.MarketController.sec_indst
+      parameters:
+      - name: sector
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/market/{ticker}/etf-tide
+      summary: ETF Tide
+      description: 'The ETF tide is similar to the Market Tide. While the market tide
+        is based on options activity of the whole market
+
+        the ETF tide is only based on the options activity of the holdings of the
+        specified E'
+      operationId: PublicApi.MarketController.etf_tide
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+  News:
+    endpoints:
+    - method: GET
+      path: /api/news/headlines
+      summary: News Headlines
+      description: 'Returns the latest news headlines for financial markets.
+
+
+        This endpoint provides access to news headlines that may impact the markets,
+        including company-specific
+
+        news, sector news, and market-wide eve'
+      operationId: PublicApi.NewsController.headlines
+      parameters:
+      - name: sources
+        in: query
+        required: false
+        schema: ''
+      - name: search_term
+        in: query
+        required: false
+        schema: ''
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: major_only
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+  Options:
+    endpoints:
+    - method: GET
+      path: /api/option-contract/{id}/flow
+      summary: Flow Data
+      description: 'Returns the last 50 option trades for the given option chain.
+        Optionally a min premium and a side can be supplied in the query for further
+        filtering.
+
+        If no date is specified data for the last trading '
+      operationId: PublicApi.OptionContractController.flow
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: ''
+      - name: side
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/option-contract/{id}/historic
+      summary: Historic Data
+      description: 'Returns for every trading day historic data for the given option
+        contract
+
+        '
+      operationId: PublicApi.OptionContractController.history
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/option-contract/{id}/intraday
+      summary: Intraday Data
+      description: 'Returns 1 minute interval intraday data for the given option contract.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last market day.
+
+        '
+      operationId: PublicApi.OptionContractController.intraday
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/option-contract/{id}/volume-profile
+      summary: Volume Profile
+      description: 'Returns the volume profile (volume - sweep, floor, cross, ask,
+        bid, etc. - per fill price) for an option symbol on a given trading day.
+
+        Date must be the current or a past date. If no date is given, re'
+      operationId: PublicApi.OptionContractController.volume_profile
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/option-trades/flow-alerts
+      summary: Flow Alerts
+      description: 'Returns the latest flow alerts.
+
+        '
+      operationId: PublicApi.OptionTradeController.flow_alerts
+      parameters:
+      - name: ticker_symbol
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+      - name: max_premium
+        in: query
+        required: false
+        schema: ''
+      - name: min_size
+        in: query
+        required: false
+        schema: ''
+      - name: max_size
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume
+        in: query
+        required: false
+        schema: ''
+      - name: min_open_interest
+        in: query
+        required: false
+        schema: ''
+      - name: max_open_interest
+        in: query
+        required: false
+        schema: ''
+      - name: all_opening
+        in: query
+        required: false
+        schema: ''
+      - name: is_floor
+        in: query
+        required: false
+        schema: ''
+      - name: is_sweep
+        in: query
+        required: false
+        schema: ''
+      - name: is_call
+        in: query
+        required: false
+        schema: ''
+      - name: is_put
+        in: query
+        required: false
+        schema: ''
+      - name: is_ask_side
+        in: query
+        required: false
+        schema: ''
+      - name: is_bid_side
+        in: query
+        required: false
+        schema: ''
+      - name: rule_name[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_diff
+        in: query
+        required: false
+        schema: ''
+      - name: max_diff
+        in: query
+        required: false
+        schema: ''
+      - name: min_volume_oi_ratio
+        in: query
+        required: false
+        schema: ''
+      - name: max_volume_oi_ratio
+        in: query
+        required: false
+        schema: ''
+      - name: is_otm
+        in: query
+        required: false
+        schema: ''
+      - name: issue_types[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_dte
+        in: query
+        required: false
+        schema: ''
+      - name: max_dte
+        in: query
+        required: false
+        schema: ''
+      - name: min_ask_perc
+        in: query
+        required: false
+        schema: ''
+      - name: max_ask_perc
+        in: query
+        required: false
+        schema: ''
+      - name: min_bid_perc
+        in: query
+        required: false
+        schema: ''
+      - name: max_bid_perc
+        in: query
+        required: false
+        schema: ''
+      - name: min_bull_perc
+        in: query
+        required: false
+        schema: ''
+      - name: max_bull_perc
+        in: query
+        required: false
+        schema: ''
+      - name: min_bear_perc
+        in: query
+        required: false
+        schema: ''
+      - name: max_bear_perc
+        in: query
+        required: false
+        schema: ''
+      - name: min_skew
+        in: query
+        required: false
+        schema: ''
+      - name: max_skew
+        in: query
+        required: false
+        schema: ''
+      - name: min_price
+        in: query
+        required: false
+        schema: ''
+      - name: max_price
+        in: query
+        required: false
+        schema: ''
+      - name: min_iv_change
+        in: query
+        required: false
+        schema: ''
+      - name: max_iv_change
+        in: query
+        required: false
+        schema: ''
+      - name: min_size_vol_ratio
+        in: query
+        required: false
+        schema: ''
+      - name: max_size_vol_ratio
+        in: query
+        required: false
+        schema: ''
+      - name: min_spread
+        in: query
+        required: false
+        schema: ''
+      - name: max_spread
+        in: query
+        required: false
+        schema: ''
+      - name: min_marketcap
+        in: query
+        required: false
+        schema: ''
+      - name: max_marketcap
+        in: query
+        required: false
+        schema: ''
+      - name: is_multi_leg
+        in: query
+        required: false
+        schema: ''
+      - name: size_greater_oi
+        in: query
+        required: false
+        schema: ''
+      - name: vol_greater_oi
+        in: query
+        required: false
+        schema: ''
+      - name: newer_than
+        in: query
+        required: false
+        schema: ''
+      - name: older_than
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/option-trades/full-tape/{date}
+      summary: Full Tape
+      description: 'Download all option transactions (the "full tape") for a given
+        trading date.
+
+
+        NOTICE: Access to this endpoint is only included in the Advanced API subscription.
+
+
+        The last 3 trading days are available '
+      operationId: PublicApi.OptionTradeController.full_tape
+      parameters:
+      - name: date
+        in: path
+        required: true
+        schema: ''
+  Other:
+    endpoints:
+    - method: GET
+      path: /api/group-flow/{flow_group}/greek-flow
+      summary: Greek flow
+      description: 'Returns the group flow''s greek flow (delta & vega flow) for the
+        given market day broken down per minute.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last'
+      operationId: PublicApi.GroupFlowController.greek_flow
+      parameters:
+      - name: flow_group
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/group-flow/{flow_group}/greek-flow/{expiry}
+      summary: Greek flow by expiry
+      description: 'Returns the group flow''s greek flow (delta & vega flow) for the
+        given market day broken down per minute & expiry.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the cur'
+      operationId: PublicApi.GroupFlowController.greek_flow_expiry
+      parameters:
+      - name: flow_group
+        in: path
+        required: true
+        schema: ''
+      - name: expiry
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/net-flow/expiry
+      summary: Net Flow Expiry
+      description: Returns net premium flow by `tide_type` category, `moneyness` category,
+        and `expiration` category, allowing you to create chart variations like [https://unusualwhales.com/zero-dte](https://unusualwhal
+      operationId: PublicApi.NetFlowController.expiry
+      parameters:
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: moneyness
+        in: query
+        required: false
+        schema: array
+      - name: tide_type
+        in: query
+        required: false
+        schema: array
+      - name: expiration
+        in: query
+        required: false
+        schema: array
+    - method: GET
+      path: /api/socket
+      summary: WebSocket channels
+      description: 'Returns the available WebSocket channels for connections.
+
+
+        ## Websocket Guide
+
+        #You can find fully-functional examples that stream data from many channels
+        here:
+
+
+        - Python: [https://github.com/unusual-w'
+      operationId: PublicApi.SocketController.channels
+      parameters: []
+    - method: GET
+      path: /api/socket/flow_alerts
+      summary: Flow alerts
+      description: '**NOTE:**
+
+        This is the documentation for websocket channel `flow-alerts`.
+
+        Websocket access for personal use is only available through the [Advanced
+        plan](https://unusualwhales.com/pricing?product=api).'
+      operationId: PublicApi.SocketController.flow_alerts
+      parameters: []
+    - method: GET
+      path: /api/socket/gex
+      summary: GEX
+      description: '**NOTE:**
+
+        This is the documentation for websocket channels `gex:<TICKER>`, `gex_strike:<TICKER>`,
+        and `gex_strike_expiry:<TICKER>`.
+
+        Websocket access for personal use is only available through the[Adva'
+      operationId: PublicApi.SocketController.gex
+      parameters: []
+    - method: GET
+      path: /api/socket/news
+      summary: News
+      description: '**NOTE:**
+
+        This is the documentation for websocket channel `news`.
+
+        Websocket access for personal use is only available through the [Advanced
+        plan](https://unusualwhales.com/pricing?product=api).
+
+
+        You c'
+      operationId: PublicApi.SocketController.news
+      parameters: []
+    - method: GET
+      path: /api/socket/option_trades
+      summary: Option trades
+      description: '**NOTE:**
+
+        This is the documentation for websocket channels `option_trades` and `option_trades:<TICKER>`.
+
+        Websocket access for personal use is only available through the [Advanced
+        plan](https://unusual'
+      operationId: PublicApi.SocketController.option_trades
+      parameters: []
+    - method: GET
+      path: /api/socket/price
+      summary: Price
+      description: '**NOTE:**
+
+        This is the documentation for websocket channel `price:<TICKER>`.
+
+        Websocket access for personal use is only available through the[Advanced plan](https://unusualwhales.com/pricing?product=api'
+      operationId: PublicApi.SocketController.price
+      parameters: []
+    - method: GET
+      path: /api/stock-directory/ticker-exchanges
+      summary: Ticker Exchange Mapping
+      description: 'Returns a mapping of all tickers to their exchanges.
+
+        '
+      operationId: PublicApi.StockDirectoryController.ticker_exchanges
+      parameters: []
+  Screener:
+    endpoints:
+    - method: GET
+      path: /api/screener/analysts
+      summary: Analyst Rating
+      description: 'Returns the latest analyst rating for the given ticker.
+
+        '
+      operationId: PublicApi.ScreenerController.analyst_ratings
+      parameters:
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: integer
+      - name: action
+        in: query
+        required: false
+        schema: ''
+      - name: recommendation
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/screener/option-contracts
+      summary: Hottest Chains
+      description: 'A contract screener endpoint to screen the market for contracts
+        by a variety of filter options.
+
+
+        For an example of what can be build with this endpoint check out the [Hottest
+        Contracts](https://unusua'
+      operationId: PublicApi.ScreenerController.contract_screener
+      parameters:
+      - name: ticker_symbol
+        in: query
+        required: false
+        schema: ''
+      - name: sectors[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_underlying_price
+        in: query
+        required: false
+        schema: string
+      - name: max_underlying_price
+        in: query
+        required: false
+        schema: string
+      - name: is_otm
+        in: query
+        required: false
+        schema: boolean
+      - name: exclude_ex_div_ticker
+        in: query
+        required: false
+        schema: boolean
+      - name: min_dte
+        in: query
+        required: false
+        schema: integer
+      - name: max_dte
+        in: query
+        required: false
+        schema: integer
+      - name: min_diff
+        in: query
+        required: false
+        schema: string
+      - name: max_diff
+        in: query
+        required: false
+        schema: string
+      - name: min_strike
+        in: query
+        required: false
+        schema: string
+      - name: max_strike
+        in: query
+        required: false
+        schema: string
+      - name: type
+        in: query
+        required: false
+        schema: ''
+      - name: expiry_dates[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_marketcap
+        in: query
+        required: false
+        schema: string
+      - name: max_marketcap
+        in: query
+        required: false
+        schema: string
+      - name: min_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_ticker_30_d_avg_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_ticker_30_d_avg_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_contract_30_d_avg_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_contract_30_d_avg_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_multileg_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_multileg_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: min_floor_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_floor_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_change
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_change
+        in: query
+        required: false
+        schema: string
+      - name: min_daily_perc_change
+        in: query
+        required: false
+        schema: string
+      - name: max_daily_perc_change
+        in: query
+        required: false
+        schema: string
+      - name: min_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_avg_price
+        in: query
+        required: false
+        schema: string
+      - name: max_avg_price
+        in: query
+        required: false
+        schema: string
+      - name: min_volume_oi_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_volume_oi_ratio
+        in: query
+        required: false
+        schema: string
+      - name: min_open_interest
+        in: query
+        required: false
+        schema: integer
+      - name: max_open_interest
+        in: query
+        required: false
+        schema: integer
+      - name: min_floor_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_floor_volume
+        in: query
+        required: false
+        schema: integer
+      - name: vol_greater_oi
+        in: query
+        required: false
+        schema: boolean
+      - name: issue_types[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_ask_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_ask_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_bid_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_bid_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_skew_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_skew_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_bull_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_bull_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_bear_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_bear_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_bid_side_perc_7_day
+        in: query
+        required: false
+        schema: string
+      - name: max_bid_side_perc_7_day
+        in: query
+        required: false
+        schema: string
+      - name: min_ask_side_perc_7_day
+        in: query
+        required: false
+        schema: string
+      - name: max_ask_side_perc_7_day
+        in: query
+        required: false
+        schema: string
+      - name: min_days_of_oi_increases
+        in: query
+        required: false
+        schema: integer
+      - name: max_days_of_oi_increases
+        in: query
+        required: false
+        schema: integer
+      - name: min_days_of_vol_greater_than_oi
+        in: query
+        required: false
+        schema: integer
+      - name: max_days_of_vol_greater_than_oi
+        in: query
+        required: false
+        schema: integer
+      - name: min_iv_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_iv_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_delta
+        in: query
+        required: false
+        schema: string
+      - name: max_delta
+        in: query
+        required: false
+        schema: string
+      - name: min_gamma
+        in: query
+        required: false
+        schema: string
+      - name: max_gamma
+        in: query
+        required: false
+        schema: string
+      - name: min_theta
+        in: query
+        required: false
+        schema: string
+      - name: max_theta
+        in: query
+        required: false
+        schema: string
+      - name: min_vega
+        in: query
+        required: false
+        schema: string
+      - name: max_vega
+        in: query
+        required: false
+        schema: string
+      - name: min_return_on_capital_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_return_on_capital_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_oi_change
+        in: query
+        required: false
+        schema: integer
+      - name: max_oi_change
+        in: query
+        required: false
+        schema: integer
+      - name: min_volume_ticker_vol_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_volume_ticker_vol_ratio
+        in: query
+        required: false
+        schema: string
+      - name: min_sweep_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_sweep_volume_ratio
+        in: query
+        required: false
+        schema: string
+      - name: min_from_low_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_from_low_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_from_high_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_from_high_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_earnings_dte
+        in: query
+        required: false
+        schema: integer
+      - name: max_earnings_dte
+        in: query
+        required: false
+        schema: integer
+      - name: min_transactions
+        in: query
+        required: false
+        schema: integer
+      - name: max_transactions
+        in: query
+        required: false
+        schema: integer
+      - name: min_close
+        in: query
+        required: false
+        schema: string
+      - name: max_close
+        in: query
+        required: false
+        schema: string
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: is_new
+        in: query
+        required: false
+        schema: boolean
+    - method: GET
+      path: /api/screener/stocks
+      summary: Stock Screener
+      description: 'A stock screener endpoint to screen the market for stocks by a
+        variety of filter options.
+
+
+        For an example of what can be build with this endpoint check out the [Stock
+        Screener](https://unusualwhales.c'
+      operationId: PublicApi.ScreenerController.stock_screener
+      parameters:
+      - name: ticker
+        in: query
+        required: false
+        schema: ''
+      - name: issue_types[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_change
+        in: query
+        required: false
+        schema: string
+      - name: max_change
+        in: query
+        required: false
+        schema: string
+      - name: min_underlying_price
+        in: query
+        required: false
+        schema: string
+      - name: max_underlying_price
+        in: query
+        required: false
+        schema: string
+      - name: is_s_p_500
+        in: query
+        required: false
+        schema: boolean
+      - name: has_dividends
+        in: query
+        required: false
+        schema: boolean
+      - name: sectors[]
+        in: query
+        required: false
+        schema: ''
+      - name: min_marketcap
+        in: query
+        required: false
+        schema: string
+      - name: max_marketcap
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_3_day_total
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_3_day_total
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_3_day_call
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_3_day_call
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_3_day_put
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_3_day_put
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_30_day_total
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_30_day_total
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_30_day_call
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_30_day_call
+        in: query
+        required: false
+        schema: string
+      - name: min_perc_30_day_put
+        in: query
+        required: false
+        schema: string
+      - name: max_perc_30_day_put
+        in: query
+        required: false
+        schema: string
+      - name: min_total_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_total_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_call_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_call_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_put_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_put_oi_change_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_implied_move
+        in: query
+        required: false
+        schema: string
+      - name: max_implied_move
+        in: query
+        required: false
+        schema: string
+      - name: min_implied_move_perc
+        in: query
+        required: false
+        schema: string
+      - name: max_implied_move_perc
+        in: query
+        required: false
+        schema: string
+      - name: min_volatility
+        in: query
+        required: false
+        schema: string
+      - name: max_volatility
+        in: query
+        required: false
+        schema: string
+      - name: min_iv_rank
+        in: query
+        required: false
+        schema: string
+      - name: max_iv_rank
+        in: query
+        required: false
+        schema: string
+      - name: min_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_call_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_call_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_put_volume
+        in: query
+        required: false
+        schema: integer
+      - name: max_put_volume
+        in: query
+        required: false
+        schema: integer
+      - name: min_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_call_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_call_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_put_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_put_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_net_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_net_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_net_call_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_net_call_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_net_put_premium
+        in: query
+        required: false
+        schema: string
+      - name: max_net_put_premium
+        in: query
+        required: false
+        schema: string
+      - name: min_oi
+        in: query
+        required: false
+        schema: integer
+      - name: max_oi
+        in: query
+        required: false
+        schema: integer
+      - name: min_oi_vs_vol
+        in: query
+        required: false
+        schema: string
+      - name: max_oi_vs_vol
+        in: query
+        required: false
+        schema: string
+      - name: min_put_call_ratio
+        in: query
+        required: false
+        schema: string
+      - name: max_put_call_ratio
+        in: query
+        required: false
+        schema: string
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: min_stock_volume_vs_avg30_volume
+        in: query
+        required: false
+        schema: string
+      - name: max_avg30_volume
+        in: query
+        required: false
+        schema: string
+      - name: date
+        in: query
+        required: false
+        schema: ''
+  Seasonality:
+    endpoints:
+    - method: GET
+      path: /api/seasonality/market
+      summary: Market Seasonality
+      description: 'Returns the average return by month for the tickers SPY, QQQ,
+        IWM, XLE, XLC, XLK, XLV, XLP, XLY, XLRE, XLF, XLI, XLB .
+
+        '
+      operationId: PublicApi.SeasonalityController.market_seasonality
+      parameters: []
+    - method: GET
+      path: /api/seasonality/{month}/performers
+      summary: Month Performers
+      description: 'Returns the tickers with the highest performance in terms of price
+        change in the month over the years.
+
+        Per default the result is ordered by ''positive_months_perc'' descending,
+        then ''median_change'' desc'
+      operationId: PublicApi.SeasonalityController.month_performers
+      parameters:
+      - name: month
+        in: path
+        required: true
+        schema: ''
+      - name: min_years
+        in: query
+        required: false
+        schema: ''
+      - name: ticker_for_sector
+        in: query
+        required: false
+        schema: ''
+      - name: s_p_500_nasdaq_only
+        in: query
+        required: false
+        schema: ''
+      - name: min_oi
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/seasonality/{ticker}/monthly
+      summary: Average return per month
+      description: 'Returns the average return by month for the given ticker.
+
+        '
+      operationId: PublicApi.SeasonalityController.monthly
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/seasonality/{ticker}/year-month
+      summary: Price change per month per year
+      description: 'Returns the relative price change for all past months over multiple
+        years.
+
+        '
+      operationId: PublicApi.SeasonalityController.year_month
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+  Shorts:
+    endpoints:
+    - method: GET
+      path: /api/short_screener
+      summary: Short Screener
+      description: 'Returns short interest and float data for percentage calculations
+        based off search params.
+
+        This endpoint provides information about the percentage of float that is shorted,
+
+        the float size, and the day'
+      operationId: PublicApi.ShortController.short_screener
+      parameters:
+      - name: tickers
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: offset
+        in: query
+        required: false
+        schema: ''
+      - name: min_short_interest
+        in: query
+        required: false
+        schema: ''
+      - name: max_short_interest
+        in: query
+        required: false
+        schema: ''
+      - name: min_days_to_cover
+        in: query
+        required: false
+        schema: ''
+      - name: max_days_to_cover
+        in: query
+        required: false
+        schema: ''
+      - name: min_si_float
+        in: query
+        required: false
+        schema: ''
+      - name: max_si_float
+        in: query
+        required: false
+        schema: ''
+      - name: min_si_float_with_synth_long_pct_of_total_shares
+        in: query
+        required: false
+        schema: ''
+      - name: max_si_float_with_synth_long_pct_of_total_shares
+        in: query
+        required: false
+        schema: ''
+      - name: min_total_float
+        in: query
+        required: false
+        schema: ''
+      - name: max_total_float
+        in: query
+        required: false
+        schema: ''
+      - name: order_by
+        in: query
+        required: false
+        schema: ''
+      - name: order_direction
+        in: query
+        required: false
+        schema: ''
+      - name: min_market_date
+        in: query
+        required: false
+        schema: ''
+      - name: max_market_date
+        in: query
+        required: false
+        schema: ''
+      - name: min_fee_rate
+        in: query
+        required: false
+        schema: ''
+      - name: max_fee_rate
+        in: query
+        required: false
+        schema: ''
+      - name: min_rebate_rate
+        in: query
+        required: false
+        schema: ''
+      - name: max_rebate_rate
+        in: query
+        required: false
+        schema: ''
+      - name: min_short_shares_available
+        in: query
+        required: false
+        schema: ''
+      - name: max_short_shares_available
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/data
+      summary: Short Data
+      description: 'Returns short data including rebate rate and short shares available
+        for a ticker.
+
+        '
+      operationId: PublicApi.ShortController.short_data
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/ftds
+      summary: Failures to Deliver
+      description: 'Returns the short failures to deliver per day for the given ticker
+        starting from the given date.
+
+        If no date is given, returns the data for the current/last market day.
+
+        '
+      operationId: PublicApi.ShortController.failures_to_deliver
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/interest-float
+      summary: V1 Short Interest and Float (Deprecated)
+      description: '(This endpoint has been deprecated, use V2 now) Returns short
+        interest and float data for percentage calculations for a ticker.
+
+        This endpoint provides information about the percentage of float that is'
+      operationId: PublicApi.ShortController.short_interest_and_float
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/interest-float/v2
+      summary: V2 Short Interest and Float
+      description: 'Returns short interest and float data for percentage calculations
+        for a ticker.
+
+        This endpoint provides information about the percentage of float that is shorted,
+
+        the float size, and the days to cover '
+      operationId: PublicApi.ShortController.short_interest_and_float_v2
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/volume-and-ratio
+      summary: Short Volume and Ratio
+      description: 'Returns short volume and short ratio data for a ticker.
+
+        '
+      operationId: PublicApi.ShortController.short_volume_and_ratio
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/shorts/{ticker}/volumes-by-exchange
+      summary: Short Volume By Exchange
+      description: 'Returns short volume data broken down by exchange for a ticker.
+
+        '
+      operationId: PublicApi.ShortController.short_volume_by_exchange
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+  Stock_Ticker_Data:
+    endpoints:
+    - method: GET
+      path: /api/stock/{sector}/tickers
+      summary: Companies in Sector
+      description: 'Returns a list of tickers which are in the given sector.
+
+        '
+      operationId: PublicApi.TickerController.companies_in_sector
+      parameters:
+      - name: sector
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/atm-chains
+      summary: ATM Chains
+      description: 'Returns the ATM chains for the given expirations
+
+        '
+      operationId: PublicApi.TickerController.atm_chains
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: expirations[]
+        in: query
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/expiry-breakdown
+      summary: Expiry Breakdown
+      description: 'Returns all expirations for the given trading day for a ticker.
+
+        '
+      operationId: PublicApi.OptionContractController.expiry_breakdown
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/flow-alerts
+      summary: Flow Alerts
+      description: 'This endpoint has been deprecated and will be removed.
+
+        Please migrate to this Flow Alerts endpoint, which provides a more detailed
+        response: [https://api.unusualwhales.com/docs#/operations/PublicApi.O'
+      operationId: PublicApi.TickerController.flow_alerts
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: is_ask_side
+        in: query
+        required: false
+        schema: ''
+      - name: is_bid_side
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/flow-per-expiry
+      summary: Flow per expiry
+      description: 'Returns the option flow per expiry for the last trading day
+
+        '
+      operationId: PublicApi.TickerController.flow_per_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/flow-per-strike
+      summary: Flow per strike
+      description: 'Returns the option flow per strike for a given trading day.
+
+        '
+      operationId: PublicApi.TickerController.flow_per_strike
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/flow-per-strike-intraday
+      summary: Flow per strike intraday
+      description: 'Returns the options flow for a given date in one minute intervals
+        (the one minute intervals are not aggregated with each other).
+
+        '
+      operationId: PublicApi.TickerController.flow_per_strike_intraday
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: filter
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/flow-recent
+      summary: Recent flows
+      description: 'Returns the latest flows for the given ticker. Optionally a min
+        premium and a side can be supplied in the query for further filtering.
+
+        '
+      operationId: PublicApi.TickerController.flow_recent
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: side
+        in: query
+        required: false
+        schema: ''
+      - name: min_premium
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-exposure
+      summary: Greek Exposure
+      description: 'Greek Exposure is the assumed greek exposure that market makers
+        are exposed to.
+
+
+        The most popular greek exposure is gamma exposure (GEX).
+
+
+        Investors and large funds lower risk and protect their money '
+      operationId: PublicApi.TickerController.greek_exposure
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: timeframe
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-exposure/expiry
+      summary: Greek Exposure By Expiry
+      description: 'The greek exposure of a ticker grouped by expiry dates across
+        all contracts on a given market date.
+
+        '
+      operationId: PublicApi.TickerController.greek_exposure_by_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-exposure/strike
+      summary: Greek Exposure By Strike
+      description: 'The greek exposure of a ticker grouped by strike price across
+        all contracts on a given market date.
+
+        '
+      operationId: PublicApi.TickerController.greek_exposure_by_strike
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-exposure/strike-expiry
+      summary: Greek Exposure By Strike And Expiry
+      description: 'The greek exposure of a ticker grouped by strike price for a specific
+        expiry date.
+
+        '
+      operationId: PublicApi.TickerController.greek_exposure_by_strike_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: expiry
+        in: query
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-flow
+      summary: Greek flow
+      description: 'Returns the tickers greek flow (delta & vega flow) for the given
+        market day broken down per minute.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last mark'
+      operationId: PublicApi.TickerController.greek_flow
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greek-flow/{expiry}
+      summary: Greek flow by expiry
+      description: 'Returns the tickers greek flow (delta & vega flow) for the given
+        market day broken down per minute & expiry.
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/'
+      operationId: PublicApi.TickerController.greek_flow_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: expiry
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/greeks
+      summary: Greeks
+      description: 'Returns the greeks for each strike for a single expiry date.
+
+        '
+      operationId: PublicApi.TickerController.greeks
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: expiry
+        in: query
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/historical-risk-reversal-skew
+      summary: Historical Risk Reversal Skew
+      description: 'Returns the historical risk reversal skew (the difference between
+        put and call volatility) at a delta of 25 or 10 (colloquial for 0.25 or 0.1)
+        for a given expiry date.
+
+        '
+      operationId: PublicApi.TickerController.historical_risk_reversal_skew
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: expiry
+        in: query
+        required: true
+        schema: ''
+      - name: timeframe
+        in: query
+        required: false
+        schema: ''
+      - name: delta
+        in: query
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/info
+      summary: Information
+      description: 'Returns a information about the given ticker.
+
+        '
+      operationId: PublicApi.TickerController.info
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/insider-buy-sells
+      summary: Insider buy & sells
+      description: 'Returns the total amount of purchases & sells as well as notional
+        values for insider transactions
+
+        for the given ticker
+
+        '
+      operationId: PublicApi.TickerController.insider_buy_sell
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/interpolated-iv
+      summary: Interpolated IV
+      description: 'Returns the Interpolated IV for a given trading day. If there
+        is no expiration then the data is calcualted via linear interpolation
+
+        with the next 2 closest expirations
+
+
+        Date must be the current or a p'
+      operationId: PublicApi.TickerController.interpolated_iv
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/iv-rank
+      summary: IV Rank
+      description: 'Returns the IV rank data for a ticker over a period of time.
+
+        IV rank is a measure of where current implied volatility stands relative to
+        its historical range.
+
+        '
+      operationId: PublicApi.TickerController.iv_rank
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: timespan
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/max-pain
+      summary: Max Pain
+      description: 'Returns the max pain for all expirations for the given ticker
+        for the last 120 days
+
+        '
+      operationId: PublicApi.TickerController.max_pain
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/net-prem-ticks
+      summary: Call/Put Net/Vol Ticks
+      description: 'Returns the net premium ticks for a given ticker which can be
+        used to build the following chart:
+
+        ![Net Prem chart](https://i.imgur.com/Rom1kcB.png)
+
+
+        ----
+
+        Each tick is resembling the data for a single '
+      operationId: PublicApi.TickerController.net_prem_ticks
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/nope
+      summary: Nope
+      description: 'Returns the tickers NOPE for the given market day broken down
+        per minute.
+
+
+        NOPE is the Net Options Pricing Effect, which tracks the intraday net delta
+        of any ticker, but most research has been done on'
+      operationId: PublicApi.TickerController.nope
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/ohlc/{candle_size}
+      summary: OHLC
+      description: 'Returns the Open High Low Close (OHLC) candle data for a given
+        ticker.
+
+
+        Results are limited to 2,500 elements even if there are more available.
+
+
+        Note: If you select 1d as a candle_size then the candle'
+      operationId: PublicApi.TickerController.ohlc
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: candle_size
+        in: path
+        required: true
+        schema: ''
+      - name: timeframe
+        in: query
+        required: false
+        schema: ''
+      - name: end_date
+        in: query
+        required: false
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/oi-change
+      summary: OI Change
+      description: 'Returns the tickers contracts'' OI change data ordered by absolute
+        OI change (default: descending).
+
+        Date must be the current or a past date. If no date is given, returns data
+        for the current/last marke'
+      operationId: PublicApi.TickerController.oi_change
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: order
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/oi-per-expiry
+      summary: OI per Expiry
+      description: 'Returns the total open interest for calls and puts for a specific
+        expiry date.
+
+        '
+      operationId: PublicApi.TickerController.oi_per_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/oi-per-strike
+      summary: OI per Strike
+      description: 'Returns the total open interest for calls and puts for a specific
+        strike.
+
+        '
+      operationId: PublicApi.TickerController.oi_per_strike
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/option-chains
+      summary: Option Chains
+      description: 'Returns all option symbols for the given ticker that were present
+        at the given day.
+
+
+        If no date is given, returns data for the current/last market day.
+
+
+        You can use the following regex to extract unde'
+      operationId: PublicApi.TickerController.option_chains
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/option-contracts
+      summary: Option contracts
+      description: 'Returns all option contracts for the given ticker
+
+        '
+      operationId: PublicApi.OptionContractController.option_contracts
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: expiry
+        in: query
+        required: false
+        schema: ''
+      - name: option_type
+        in: query
+        required: false
+        schema: ''
+      - name: vol_greater_oi
+        in: query
+        required: false
+        schema: boolean
+      - name: exclude_zero_vol_chains
+        in: query
+        required: false
+        schema: boolean
+      - name: exclude_zero_dte
+        in: query
+        required: false
+        schema: boolean
+      - name: exclude_zero_oi_chains
+        in: query
+        required: false
+        schema: boolean
+      - name: maybe_otm_only
+        in: query
+        required: false
+        schema: boolean
+      - name: option_symbol
+        in: query
+        required: false
+        schema: array
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/option/stock-price-levels
+      summary: Option Price Levels
+      description: 'Returns the call and put volume per price level for the given
+        ticker.
+
+
+        ----
+
+        Can be used to build a chart such as following:
+
+        ![Option Price Level chart](https://i.imgur.com/y6BZ4sG.png)
+
+        '
+      operationId: PublicApi.TickerController.option_price_level
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/option/volume-oi-expiry
+      summary: Volume & OI per Expiry
+      description: 'Returns the total volume and open interest per expiry for the
+        given ticker.
+
+        '
+      operationId: PublicApi.TickerController.vol_oi_per_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/options-volume
+      summary: Options Volume
+      description: 'Returns the options volume & premium for all trade executions
+
+        that happened on a given trading date for the given ticker.
+
+
+        ----
+
+        This can be used to build a ticker options overview such as:
+
+
+        ![Table](h'
+      operationId: PublicApi.TickerController.options_volume
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/ownership
+      summary: Ownership
+      description: 'Returns the institutions, insider trades and politicians with
+        the most shares
+
+        '
+      operationId: PublicApi.TickerController.ownership
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/spot-exposures
+      summary: Spot GEX exposures per 1min
+      description: 'Returns the spot GEX exposures for the given ticker per minute.
+
+
+        Spot GEX is the assumed $ value of the given greek (ie. gamma) exposure that
+        market makers need to hedge per 1% change of the underlyin'
+      operationId: PublicApi.TickerController.spot_exposures_one_minute
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/spot-exposures/expiry-strike
+      summary: Spot GEX exposures by strike & expiry
+      description: 'Returns the most recent spot GEX exposures across all strikes
+        for the given ticker & expiration on a given date. Calculated either with
+        open interest or with volume.
+
+
+        Data is available since 2025-01-1'
+      operationId: PublicApi.TickerController.spot_exposures_by_strike_expiry_v2
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: expirations[]
+        in: query
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+      - name: min_strike
+        in: query
+        required: false
+        schema: ''
+      - name: max_strike
+        in: query
+        required: false
+        schema: ''
+      - name: min_dte
+        in: query
+        required: false
+        schema: ''
+      - name: max_dte
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/spot-exposures/strike
+      summary: Spot GEX exposures by strike
+      description: 'Returns the most recent spot GEX exposures across all strikes
+        for the given ticker on a given date. Calculated either with open interest
+        or with volume.
+
+
+        Spot GEX is the assumed $ value of the given g'
+      operationId: PublicApi.TickerController.spot_exposures_by_strike
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: min_strike
+        in: query
+        required: false
+        schema: ''
+      - name: max_strike
+        in: query
+        required: false
+        schema: ''
+      - name: limit
+        in: query
+        required: false
+        schema: ''
+      - name: page
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/spot-exposures/{expiry}/strike
+      summary: Spot GEX exposures by strike & expiry (Deprecated)
+      description: This endpoint has been deprecated and will be removed, please migrate
+        to the new [endpoint](https://api.unusualwhales.com/docs#/operations/PublicApi.TickerController.spot_exposures_by_strike_expiry_v2
+      operationId: PublicApi.TickerController.spot_exposures_by_strike_expiry
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: expiry
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: min_strike
+        in: query
+        required: false
+        schema: ''
+      - name: max_strike
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/stock-state
+      summary: Stock State
+      description: 'Returns the last stock state for the given ticker.
+
+
+        This is the easiest way to retreive the open, close, high, low and volume
+        of the last trading day.
+
+        '
+      operationId: PublicApi.TickerController.last_stock_state
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/stock-volume-price-levels
+      summary: Off/Lit Price Levels
+      description: 'Returns the lit & off lit stock volume per price level for the
+        given ticker.
+
+
+        ----
+
+        Important: The volume does **NOT** represent the full market dialy volume.
+        It
+
+        only represents the volume of executed '
+      operationId: PublicApi.TickerController.stock_volume_price_level
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/volatility/realized
+      summary: Realized Volatility
+      description: 'The implied and realized volatility of a given ticker. The implied
+        volatility is the expected 30 day forward looking volatility.
+
+
+        The realized/historical volatility is the volatility of the stock pric'
+      operationId: PublicApi.TickerController.realized_volatility
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+      - name: timeframe
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/volatility/stats
+      summary: Volatility Statistics
+      description: 'Returns comprehensive volatility statistics for a ticker on a
+        specific date, including
+
+        implied volatility data, realized volatility data, and their respective high/low
+        values
+
+        for the past year.
+
+        '
+      operationId: PublicApi.TickerController.volatility_stats
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''
+    - method: GET
+      path: /api/stock/{ticker}/volatility/term-structure
+      summary: Implied Volatility Term Structure
+      description: 'The average of the latest volatilities for the at the money call
+        and put contracts for every expiry date.
+
+        '
+      operationId: PublicApi.TickerController.implied_volatility_term_structure
+      parameters:
+      - name: ticker
+        in: path
+        required: true
+        schema: ''
+      - name: date
+        in: query
+        required: false
+        schema: ''

@@ -1,0 +1,113 @@
+system:
+  timezone: America/New_York
+  base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
+  api_key_env: UW_API_KEY
+ingestion:
+  watchlist:
+  - INTC
+  - NFLX
+  - TSLA
+  cadence_minutes: 5
+  ingest_start_et: 04:00
+  ingest_end_et: '20:00'
+  premarket_start_et: 04:00
+  regular_start_et: 09:30
+  regular_end_et: '16:00'
+  afterhours_end_et: '20:00'
+  fallback_max_age_minutes: 15
+  invalid_after_minutes: 60
+  enable_market_context: true
+  volume_profile_top_n: 7
+  darkpool_band_width: 0.5
+  darkpool_top_n: 7
+  wall_top_n: 5
+  gex_top_n: 7
+validation:
+  horizons_minutes:
+  - 15
+  - 60
+  flat_threshold_pct: 0.001
+  realized_snapshot_tolerance_minutes: 10
+network:
+  timeout_seconds: 12
+  max_retries: 3
+  backoff_seconds:
+  - 0.5
+  - 1.5
+  - 3.5
+  max_concurrent_requests: 12
+  rate_limit_per_second: 8
+  circuit_breaker:
+    failure_threshold: 5
+    cool_down_seconds: 90
+    half_open_max_calls: 2
+storage:
+  duckdb_path: ./uw_stack.duckdb
+  writer_lock_path: ./uw_stack.duckdb.lock
+  cycle_lock_path: ./uw_cycle.lock
+model:
+  model_name: bounded_additive_score
+  model_version: 1.0.0
+  safe_mode_enabled: true
+  confidence_cap: 0.7
+  min_confidence: 0.35
+  neutral_threshold: 0.55
+  direction_margin: 0.08
+  min_flat_prob: 0.15
+  max_flat_prob: 0.65
+  flat_from_data_quality_scale: 0.7
+  weights:
+    net_gex_sign: 0.35
+    flow_premium_imbalance: 0.4
+    dp_magnet_pressure: 0.2
+    term_structure_slope: 0.15
+    lit_vs_dp_divergence: 0.15
+    realized_volatility: -0.1
+  calibration:
+    bins:
+    - 0.0
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    - 0.6
+    - 0.7
+    - 0.8
+    - 0.9
+    - 1.0
+    mapped:
+    - 0.02
+    - 0.08
+    - 0.16
+    - 0.26
+    - 0.38
+    - 0.5
+    - 0.62
+    - 0.74
+    - 0.84
+    - 0.92
+    - 0.98
+adapt:
+  enabled: true
+  rolling_window_predictions: 500
+  drift:
+    brier_warn: 0.25
+    brier_bad: 0.3
+    logloss_warn: 0.85
+    logloss_bad: 1.1
+  bounds:
+    weights:
+      min: -1.0
+      max: 1.0
+      max_step: 0.05
+    confidence_cap:
+      min: 0.55
+      max: 0.9
+      max_step: 0.05
+    flat_from_data_quality_scale:
+      min: 0.1
+      max: 0.9
+      max_step: 0.1
+    calibration:
+      max_step: 0.05

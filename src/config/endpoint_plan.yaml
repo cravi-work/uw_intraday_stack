@@ -1,0 +1,166 @@
+# Explicit endpoint plan.
+# IMPORTANT: The runner validates (method,path,query params) against api_catalog.generated.yaml
+# before calling. Do NOT add endpoints that are not in the catalog.
+
+plans:
+  default:
+    # Price & microstructure
+    - name: ohlc_1m
+      method: GET
+      path: /api/stock/{ticker}/ohlc/{candle_size}
+      path_params:
+        candle_size: "1m"
+      query_params:
+        date: "{date}"
+        limit: 700
+
+    - name: stock_volume_price_levels
+      method: GET
+      path: /api/stock/{ticker}/stock-volume-price-levels
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # Dealer / GEX / Greeks
+    - name: spot_exposures
+      method: GET
+      path: /api/stock/{ticker}/spot-exposures
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: spot_exposures_strike
+      method: GET
+      path: /api/stock/{ticker}/spot-exposures/strike
+      path_params: {}
+      query_params:
+        date: "{date}"
+        limit: 500
+
+    - name: greek_exposure
+      method: GET
+      path: /api/stock/{ticker}/greek-exposure
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # Options flow / pressure
+    - name: flow_per_strike_intraday
+      method: GET
+      path: /api/stock/{ticker}/flow-per-strike-intraday
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: flow_recent
+      method: GET
+      path: /api/stock/{ticker}/flow-recent
+      path_params: {}
+      query_params: {}
+
+    - name: net_prem_ticks
+      method: GET
+      path: /api/stock/{ticker}/net-prem-ticks
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # OI / chain structure
+    - name: oi_per_strike
+      method: GET
+      path: /api/stock/{ticker}/oi-per-strike
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: oi_change
+      method: GET
+      path: /api/stock/{ticker}/oi-change
+      path_params: {}
+      query_params:
+        date: "{date}"
+        limit: 200
+        order: "desc"
+
+    - name: volume_oi_expiry
+      method: GET
+      path: /api/stock/{ticker}/option/volume-oi-expiry
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # Volatility
+    - name: term_structure
+      method: GET
+      path: /api/stock/{ticker}/volatility/term-structure
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: interpolated_iv
+      method: GET
+      path: /api/stock/{ticker}/interpolated-iv
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: realized_vol
+      method: GET
+      path: /api/stock/{ticker}/volatility/realized
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    - name: iv_rank
+      method: GET
+      path: /api/stock/{ticker}/iv-rank
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # Liquidity / DP / Lit
+    - name: darkpool_ticker
+      method: GET
+      path: /api/darkpool/{ticker}
+      path_params: {}
+      query_params:
+        date: "{date}"
+        limit: 500
+
+    - name: litflow_ticker
+      method: GET
+      path: /api/lit-flow/{ticker}
+      path_params: {}
+      query_params:
+        date: "{date}"
+        limit: 500
+
+    - name: option_stock_price_levels
+      method: GET
+      path: /api/stock/{ticker}/option/stock-price-levels
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+    # Key levels
+    - name: max_pain
+      method: GET
+      path: /api/stock/{ticker}/max-pain
+      path_params: {}
+      query_params:
+        date: "{date}"
+
+  market_context:
+    - name: market_tide
+      method: GET
+      path: /api/market/market-tide
+      path_params: {}
+      query_params:
+        date: "{date}"
+        interval_5m: true
+
+    - name: economic_calendar
+      method: GET
+      path: /api/market/economic-calendar
+      path_params: {}
+      query_params: {}
