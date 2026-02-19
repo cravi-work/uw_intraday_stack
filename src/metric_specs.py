@@ -21,11 +21,13 @@ class MetricSpec:
     name: str
     required_endpoints: List[EndpointRef]
     required_keys_by_endpoint: Dict[EndpointRef, KeyRule]
-    # [Fix: Step 7] Explicit presence-only endpoints to prevent silent passes
+    # Explicit presence-only endpoints to prevent silent passes
     presence_only_endpoints: Set[EndpointRef] = field(default_factory=set)
 
 
-# Institutional seed set: explicitly curated, minimal dependencies based on actual extractors
+# [Review Note 6] Anti-Hallucination Safe Standard:
+# Key rules must be derived from either a tested extractor or a captured payload schema snapshot in DB.
+# Endpoints without verified key rules must be explicitly flagged as presence_only.
 INSTITUTIONAL_METRICS: List[MetricSpec] = [
     MetricSpec(
         name="Gamma/Dealer",
@@ -60,7 +62,7 @@ INSTITUTIONAL_METRICS: List[MetricSpec] = [
             EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew"),
         ],
         required_keys_by_endpoint={},
-        # [Fix: Step 7] Explicitly denote volatile endpoints as presence-only 
+        # Unverified schemas marked explicitly presence-only
         presence_only_endpoints={
             EndpointRef("GET", "/api/stock/{ticker}/option-chains"),
             EndpointRef("GET", "/api/stock/{ticker}/option-contracts"),
@@ -74,7 +76,6 @@ INSTITUTIONAL_METRICS: List[MetricSpec] = [
             EndpointRef("GET", "/api/market/total-options-volume"),
         ],
         required_keys_by_endpoint={},
-        # [Fix: Step 7]
         presence_only_endpoints={
             EndpointRef("GET", "/api/market/top-net-impact"),
             EndpointRef("GET", "/api/market/total-options-volume"),
