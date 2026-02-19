@@ -2,27 +2,31 @@ from __future__ import annotations
 
 def is_empty_valid(method: str, path: str, session_label: str) -> bool:
     """
-    Determines if an empty JSON payload ({} or []) is legitimate.
+    Determines if an empty JSON payload ({} or []) is legitimately empty 
+    based on the specific endpoint and the market session.
     """
-    # Event/transactional feeds are legitimately empty when there is zero flow
-    transactional_endpoints = [
+    method = method.upper()
+    
+    # 1. ALWAYS_EMPTY_VALID: Transactional feeds that are empty when volume is zero
+    always_valid = [
         "/flow-alerts",
-        "/darkpool/",
-        "/lit-flow/"
+        "/darkpool",
+        "/lit-flow"
     ]
-    if any(ep in path for ep in transactional_endpoints):
+    if any(ep in path for ep in always_valid):
         return True
-        
-    # During Pre-market (PRE) and After-hours (AFT), options volume metrics 
-    # might legitimately be empty because options do not trade in extended hours.
-    if session_label in ("PRE", "AFT"):
-        options_volume_endpoints = [
-            "/flow-per-strike",
-            "/flow-recent",
-            "/net-prem-ticks"
-        ]
-        if any(ep in path for ep in options_volume_endpoints):
-            return True
 
-    # Base case: Structural endpoints (chains, contracts, greeks) should never be empty
+    # 2. SESSION_EMPTY_VALID: Options volume feeds empty outside regular hours
+    session_valid = [
+        "/flow-per-strike",
+        "/flow-recent",
+        "/net-prem-ticks"
+    ]
+    if any(ep in path for ep in session_valid):
+        if session_label in ("PRE", "AFT", "CLOSED"):
+            return True
+        return False
+
+    # 3. NEVER_EMPTY_VALID: Structural endpoints (OHLC, chains, greeks) 
+    # Must never be empty. If they are, it is a data provider error.
     return False

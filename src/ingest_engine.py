@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from .api_catalog_loader import load_api_catalog
@@ -13,10 +13,10 @@ from .file_lock import FileLock, FileLockError
 from .scheduler import ET, UTC, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
-from .endpoint_truth import EndpointPayloadClass, FreshnessState, classify_payload, resolve_effective_payload
+from .endpoint_truth import EndpointPayloadClass, FreshnessState, MetaContract, classify_payload, resolve_effective_payload
+from .time_utils import to_utc_dt
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True)
 class PlannedCall:
@@ -26,7 +26,6 @@ class PlannedCall:
     path_params: Dict[str, Any]
     query_params: Dict[str, Any]
     is_market: bool
-
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
     req = ["ingestion", "storage", "system", "network", "validation"]
@@ -43,7 +42,6 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     if "horizons_minutes" not in cfg["validation"]:
         raise KeyError("Missing validation.horizons_minutes")
 
-
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
     def _parse(l, market: bool = False) -> List[PlannedCall]:
         return [
@@ -57,7 +55,6 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
             )
             for x in (l or [])
         ]
-
     core = _parse(plan_yaml.get("plans", {}).get("default", []))
     market = (
         _parse(plan_yaml.get("plans", {}).get("market_context", []), True)
@@ -66,20 +63,16 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
     )
     return core, market
 
-
 def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     def _sub(v):
         if isinstance(v, str):
             return v.replace("{ticker}", ticker).replace("{date}", date_str)
         return v
-
     path_params = {k: _sub(v) for k, v in call.path_params.items()}
     if "{ticker}" in call.path:
         path_params = {**path_params, "ticker": ticker}
-
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
     return path_params, query_params
-
 
 async def fetch_all(
     client: UwClient,
@@ -102,13 +95,15 @@ async def fetch_all(
         for c in core:
             pp, qp = _expand(c, tkr, date_str)
             tasks.append(_one(tkr, c, pp, qp))
-
     for c in market:
         pp, qp = _expand(c, "", date_str)
         tasks.append(_one("__MARKET__", c, pp, qp))
 
     return await asyncio.gather(*tasks)
 
+def _get_worst_freshness(states: List[FreshnessState]) -> FreshnessState:
+    order = {FreshnessState.ERROR: 0, FreshnessState.EMPTY_VALID: 1, FreshnessState.STALE_CARRY: 2, FreshnessState.FRESH: 3}
+    return min(states, key=lambda s: order[s]) if states else FreshnessState.ERROR
 
 def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     _validate_config(cfg)
@@ -154,17 +149,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
             circuit_cool_down_seconds=cb.get("cool_down_seconds", net.get("circuit_cool_down_seconds", 60)),
             circuit_half_open_max_calls=cb.get("half_open_max_calls", net.get("circuit_half_open_max_calls", 3))
         ) as client:
-            return await fetch_all(
-                client,
-                tickers,
-                asof_et.date().isoformat(),
-                core,
-                market,
-                max_concurrency=net.get("max_concurrency", 20),
-            )
+            return await fetch_all(client, tickers, asof_et.date().isoformat(), core, market, max_concurrency=net.get("max_concurrency", 20))
 
     fetch_results = asyncio.run(_run_fetch())
-
     db = DbWriter(cfg["storage"]["duckdb_path"], cfg["storage"]["writer_lock_path"])
 
     try:
@@ -179,54 +166,38 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 run_notes = f"SESS={sess}"
                 if hours.reason != "NORMAL":
                     run_notes += f"; {hours.reason}"
-                run_id = db.begin_run(
-                    con,
-                    asof_utc,
-                    sess,
-                    hours.is_trading_day,
-                    hours.is_early_close,
-                    cfg_ver,
-                    registry.catalog_hash,
-                    notes=run_notes,
-                )
+                run_id = db.begin_run(con, asof_utc, sess, hours.is_trading_day, hours.is_early_close, cfg_ver, registry.catalog_hash, notes=run_notes)
 
                 events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any, PlannedCall]]] = {t: [] for t in tickers}
 
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
-                    
-                    # 1. Fetch prior state before evaluating new payload
                     prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     prev_hash = prev_state["last_payload_hash"] if prev_state else None
                     
-                    # 2. Insert the raw event attempt
                     event_id = db.insert_raw_event(
                         con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
                         res.status_code, res.latency_ms, res.payload_hash, res.payload_json,
                         res.retry_count > 0, res.error_type, res.error_message, cb,
                     )
 
-                    # 3. Classify the payload deterministically
                     payload_class, na_error = classify_payload(res, prev_hash, call.method, call.path, sess)
                     if na_error and not res.error_message:
                         res.error_message = na_error
 
-                    # 4. Update the endpoint state
                     is_success = payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE)
                     is_changed = (payload_class == EndpointPayloadClass.SUCCESS_HAS_DATA)
                     db.upsert_endpoint_state(con, tkr, endpoint_id, str(event_id), res, is_success, is_changed)
 
-                    # 5. Resolve the Effective Payload for this cycle
-                    resolved = resolve_effective_payload(str(event_id), res.received_at_utc, payload_class, prev_state)
+                    current_ts = to_utc_dt(res.received_at_utc, fallback=to_utc_dt(res.requested_at_utc, fallback=dt.datetime.now(UTC)))
+                    resolved = resolve_effective_payload(str(event_id), current_ts, payload_class, prev_state)
                     
                     if tkr not in events_by_ticker:
                         events_by_ticker[tkr] = []
                     events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call))
 
-                # Write snapshots + lineage + predictions.
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
-                    # DQ is now based strictly on Effective Payload freshness
                     valid = sum(1 for (_, _, res, _) in evs if res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY))
                     dq = (valid / len(evs)) if evs else 0.0
 
@@ -236,19 +207,39 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
                     )
 
+                    source_endpoints = []
+                    freshness_states = []
+                    ages = []
+                    
                     for endpoint_id, event_id, res, call in evs:
-                        meta = {
+                        op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
+                        src_meta = {
                             "method": call.method,
                             "path": call.path,
-                            "endpoint_id": endpoint_id
+                            "operation_id": op_id,
+                            "endpoint_id": endpoint_id,
+                            "used_event_id": res.used_event_id
                         }
+                        source_endpoints.append(src_meta)
+                        freshness_states.append(res.freshness_state)
+                        if res.stale_age_seconds is not None:
+                            ages.append(res.stale_age_seconds)
+
                         db.insert_lineage(
                             con, snapshot_id, endpoint_id, res.used_event_id,
                             res.freshness_state.name, res.stale_age_seconds,
-                            res.payload_class.name, res.na_reason, meta
+                            res.payload_class.name, res.na_reason, src_meta
                         )
 
-                    # Mock predictions
+                    worst_freshness = _get_worst_freshness(freshness_states).name
+                    max_age_min = (max(ages) // 60) if ages else None
+                    aggregated_meta = MetaContract(
+                        source_endpoints=source_endpoints,
+                        freshness_state=worst_freshness,
+                        stale_age_min=max_age_min,
+                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY") else "DEPENDENCY_ERROR"
+                    )
+
                     class MockPred:
                         bias = "NEUTRAL"
                         confidence = 0.0
@@ -260,8 +251,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         model_hash = "abc"
 
                     p = MockPred()
-                    start_price = None
-
                     for h in cfg["validation"]["horizons_minutes"]:
                         db.insert_prediction(
                             con,
@@ -270,7 +259,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "horizon_minutes": int(h),
                                 "horizon_kind": "FIXED",
                                 "horizon_seconds": None,
-                                "start_price": start_price,
+                                "start_price": None,
                                 "bias": p.bias,
                                 "confidence": p.confidence,
                                 "prob_up": p.prob_up,
@@ -280,29 +269,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "model_version": p.model_version,
                                 "model_hash": p.model_hash,
                                 "is_mock": True,
-                                "meta_json": {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None}
-                            },
-                        )
-
-                    if sec_to_close is not None and sec_to_close > 0:
-                        db.insert_prediction(
-                            con,
-                            {
-                                "snapshot_id": snapshot_id,
-                                "horizon_minutes": 0,
-                                "horizon_kind": "TO_CLOSE",
-                                "horizon_seconds": int(sec_to_close),
-                                "start_price": start_price,
-                                "bias": p.bias,
-                                "confidence": p.confidence,
-                                "prob_up": p.prob_up,
-                                "prob_down": p.prob_down,
-                                "prob_flat": p.prob_flat,
-                                "model_name": p.model_name,
-                                "model_version": p.model_version,
-                                "model_hash": p.model_hash,
-                                "is_mock": True,
-                                "meta_json": {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None}
+                                "meta_json": asdict(aggregated_meta)
                             },
                         )
 
@@ -310,7 +277,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
     except FileLockError:
         logger.warning("Skipping cycle: lock held")
-
 
 class IngestionEngine:
     def __init__(self, *, cfg: Dict[str, Any], catalog_path: str):

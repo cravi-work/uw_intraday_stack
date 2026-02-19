@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import datetime
 
 from .endpoint_rules import is_empty_valid
+from .time_utils import to_utc_dt
 
 class EndpointPayloadClass(Enum):
     SUCCESS_HAS_DATA = "SUCCESS_HAS_DATA"
@@ -33,18 +34,6 @@ class ResolvedLineage:
     payload_class: EndpointPayloadClass
     na_reason: Optional[str]
 
-def _safe_utc(ts: Any) -> Optional[datetime.datetime]:
-    """Safely coerces naive DuckDB timestamps, floats, or aware datetimes into standard UTC."""
-    if not ts:
-        return None
-    if isinstance(ts, (int, float)):
-        return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
-    if isinstance(ts, datetime.datetime):
-        if ts.tzinfo is None:
-            return ts.replace(tzinfo=datetime.timezone.utc)
-        return ts.astimezone(datetime.timezone.utc)
-    return None
-
 def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str, session_label: str) -> Tuple[EndpointPayloadClass, Optional[str]]:
     if not getattr(res, "ok", False) or getattr(res, "payload_json", None) is None:
         return EndpointPayloadClass.ERROR, getattr(res, "error_message", "HTTP Error or Missing JSON")
@@ -53,8 +42,11 @@ def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str,
     is_empty = False
     if isinstance(pj, dict) and not pj: is_empty = True
     if isinstance(pj, list) and not pj: is_empty = True
-    # Unwrap UW specific {"data": []} empty envelopes
-    if isinstance(pj, dict) and len(pj) == 1 and "data" in pj and not pj["data"]: is_empty = True
+    
+    # Unwrap UW specific envelope schemas
+    if isinstance(pj, dict) and len(pj) == 1:
+        if "data" in pj and not pj["data"]: is_empty = True
+        if "results" in pj and not pj["results"]: is_empty = True
 
     if is_empty:
         if is_empty_valid(method, path, session_label):
@@ -71,21 +63,21 @@ def resolve_effective_payload(
     prev_state: Optional[Dict[str, Any]]
 ) -> ResolvedLineage:
     
-    current_ts = _safe_utc(current_ts_raw) or datetime.datetime.now(datetime.timezone.utc)
+    current_ts = to_utc_dt(current_ts_raw, fallback=datetime.datetime.now(datetime.timezone.utc))
 
     if payload_class == EndpointPayloadClass.SUCCESS_HAS_DATA:
         return ResolvedLineage(current_event_id, FreshnessState.FRESH, 0, payload_class, None)
     
     if payload_class == EndpointPayloadClass.SUCCESS_STALE:
         used_id = prev_state["last_change_event_id"] if prev_state and prev_state.get("last_change_event_id") else current_event_id
-        prev_change_ts = _safe_utc(prev_state.get("last_change_ts_utc")) if prev_state else None
-        age = int((current_ts - prev_change_ts).total_seconds()) if prev_change_ts else 0
+        prev_change_ts = to_utc_dt(prev_state.get("last_change_ts_utc"), fallback=current_ts) if prev_state else current_ts
+        age = int((current_ts - prev_change_ts).total_seconds())
         return ResolvedLineage(used_id, FreshnessState.STALE_CARRY, max(0, age), payload_class, None)
 
-    # Empty Valid or Error conditions -> Attempt carry-forward
+    # SUCCESS_EMPTY_VALID or ERROR: Attempt carry-forward from last known success
     if prev_state and prev_state.get("last_success_event_id"):
-        prev_success_ts = _safe_utc(prev_state.get("last_success_ts_utc"))
-        age = int((current_ts - prev_success_ts).total_seconds()) if prev_success_ts else 0
+        prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
+        age = int((current_ts - prev_success_ts).total_seconds())
         return ResolvedLineage(
             prev_state["last_success_event_id"], 
             FreshnessState.STALE_CARRY, 
@@ -94,6 +86,6 @@ def resolve_effective_payload(
             f"CARRY_FORWARD_{payload_class.name}"
         )
     
-    # Complete failure (no prior success to fall back on)
+    # Complete failure: No prior success state available
     freshness = FreshnessState.EMPTY_VALID if payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID else FreshnessState.ERROR
     return ResolvedLineage(None, freshness, None, payload_class, "NO_PRIOR_SUCCESS")

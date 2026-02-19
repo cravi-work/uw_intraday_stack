@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 import duckdb
 from .api_catalog_loader import EndpointRegistry
+from .time_utils import to_utc_dt
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -150,7 +151,6 @@ class DbWriter:
         _add("predictions", "horizon_seconds", "INTEGER")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
         
-        # Phase 3 additions
         _add("endpoint_state", "last_attempt_event_id", "UUID")
         _add("endpoint_state", "last_attempt_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_attempt_http_status", "INTEGER")
@@ -160,7 +160,6 @@ class DbWriter:
         _add("snapshot_lineage", "payload_class", "TEXT")
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
-        
         _add("predictions", "meta_json", "JSON")
 
     def insert_snapshot(self, con, *, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close: bool, data_quality_score, market_close_utc: Optional[datetime], post_end_utc: Optional[datetime], seconds_to_close: Optional[int]) -> str:
@@ -224,13 +223,13 @@ class DbWriter:
         return eid
 
     def insert_raw_event(self, con, run_id, ticker, endpoint_id, req_at, rec_at, status, lat, ph, pj, retry, etype, emsg, circ):
-        if isinstance(req_at, (int, float)): req_at = datetime.fromtimestamp(req_at, UTC)
-        if isinstance(rec_at, (int, float)): rec_at = datetime.fromtimestamp(rec_at, UTC)
+        safe_req = to_utc_dt(req_at, fallback=datetime.now(UTC))
+        safe_rec = to_utc_dt(rec_at, fallback=safe_req)
         
         eid = uuid.uuid4()
         con.execute("""INSERT INTO raw_http_events (event_id, run_id, requested_at_utc, received_at_utc, ticker, endpoint_id, http_status, latency_ms, payload_hash, payload_json, is_retry, error_type, error_msg, circuit_state_json)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
-            [str(eid), str(run_id), req_at, rec_at, ticker, endpoint_id, status, lat, ph, json.dumps(pj) if pj else None, retry, etype, emsg, json.dumps(circ) if circ else None])
+            [str(eid), str(run_id), safe_req, safe_rec, ticker, endpoint_id, status, lat, ph, json.dumps(pj) if pj else None, retry, etype, emsg, json.dumps(circ) if circ else None])
         return eid
 
     def begin_run(self, con, asof_ts_utc, session_label, is_trading_day, is_early_close, config_version, api_catalog_hash, notes=""):
@@ -264,16 +263,14 @@ class DbWriter:
         }
 
     def upsert_endpoint_state(self, con, ticker: str, endpoint_id: int, event_id: str, res: Any, is_success_class: bool, changed: bool):
-        rec_at = res.received_at_utc if not isinstance(res.received_at_utc, (int, float)) else datetime.fromtimestamp(res.received_at_utc, UTC)
+        safe_req = to_utc_dt(res.requested_at_utc, fallback=datetime.now(UTC))
+        rec_at = to_utc_dt(res.received_at_utc, fallback=safe_req)
         
-        # Ensure row exists
         con.execute("INSERT OR IGNORE INTO endpoint_state (ticker, endpoint_id) VALUES (?,?)", [ticker, endpoint_id])
         
-        # Always update attempt metrics
         con.execute("""UPDATE endpoint_state SET last_attempt_event_id=?, last_attempt_ts_utc=?, last_attempt_http_status=?, last_attempt_error_type=?, last_attempt_error_msg=? WHERE ticker=? AND endpoint_id=?""",
                     [str(event_id), rec_at, res.status_code, res.error_type, res.error_message, ticker, endpoint_id])
 
-        # Conditionally update success metrics (protects against empty/invalid overwriting good state)
         if is_success_class:
             con.execute("""UPDATE endpoint_state SET last_success_event_id=?, last_success_ts_utc=?, last_payload_hash=?,
                 last_change_ts_utc=CASE WHEN ? THEN ? ELSE last_change_ts_utc END,
