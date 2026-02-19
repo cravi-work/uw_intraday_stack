@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,16 +13,24 @@ from .metric_specs import INSTITUTIONAL_METRICS, EndpointRef, MetricSpec
 
 UTC = timezone.utc
 
-# [Fix: Schema Typing Strictness]
-@dataclass
+
+# [Fix: Step 2] Make capabilities library-safe.
+class CapabilitiesError(Exception):
+    """Raised when capabilities checker encounters fatal state or schema errors."""
+    pass
+
+
+# [Fix: Step 6] Typed struct to formalize truth extraction returns.
+@dataclass(frozen=True)
 class EndpointTruth:
     has_success: bool
     last_status: Optional[int]
     last_error: Optional[str]
-    last_success_age: Optional[int]
-    last_change_age: Optional[int]
+    last_success_age_s: Optional[int]
+    last_change_age_s: Optional[int]
     observed_keys: List[str]
-    schema_source: str
+    selected_endpoint_id: Optional[int]
+    selected_success_event_id: Optional[str]
 
 
 def flatten_keys(obj: Any, prefix: str, list_cap: int, out: Set[str]) -> None:
@@ -55,21 +62,25 @@ def ensure_utc(ts: Optional[datetime]) -> Optional[datetime]:
 
 
 class CapabilitiesChecker:
-    def __init__(self, catalog: Any, plan_yaml: Dict[str, Any], db_path: str):
+    def __init__(self, catalog: Any, plan_yaml: Dict[str, Any], db_path: str, validate_db_schema: bool = True):
         self.catalog = catalog
         self.plan_yaml = plan_yaml
         self.db_path = db_path
         
-        # Build set of all planned endpoints from all tiers
-        self.planned_endpoints: Set[Tuple[str, str]] = set()
+        # [Fix: Step 8] Map endpoints to the tiers they belong to
+        self.planned_endpoints: Dict[Tuple[str, str], List[str]] = {}
         plans = self.plan_yaml.get("plans", {})
         for tier_name, entries in plans.items():
             for entry in entries:
                 m = str(entry.get("method", "")).upper()
                 p = str(entry.get("path", ""))
-                self.planned_endpoints.add((m, p))
+                key = (m, p)
+                if key not in self.planned_endpoints:
+                    self.planned_endpoints[key] = []
+                self.planned_endpoints[key].append(tier_name)
 
-        self._validate_db_schema()
+        if validate_db_schema:
+            self._validate_db_schema()
 
     @classmethod
     def from_paths(cls, catalog_path: str, db_path: str, plan_path: str) -> CapabilitiesChecker:
@@ -78,112 +89,102 @@ class CapabilitiesChecker:
         return cls(catalog, plan_yaml, db_path)
 
     def _validate_db_schema(self) -> None:
-        # [Fix: Step 2] Validate schema structure (columns), not just table presence.
+        # [Fix: Step 3] Validate specific required columns, not just table presence.
         try:
             with duckdb.connect(self.db_path, read_only=True) as con:
                 tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
-                required = {"dim_endpoints", "endpoint_state", "raw_http_events"}
-                if not required.issubset(tables):
-                    print(f"DB not initialized. Missing tables: {required - tables}")
-                    sys.exit(1)
+                required_tables = {"dim_endpoints", "endpoint_state", "raw_http_events"}
+                if not required_tables.issubset(tables):
+                    raise CapabilitiesError(f"DB not initialized. Missing tables: {required_tables - tables}")
                 
                 def check_columns(table: str, required_cols: Set[str]):
                     cols = {r[1] for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
                     missing = required_cols - cols
                     if missing:
-                        print(f"Schema mismatch in table '{table}'. Missing required columns: {missing}")
-                        sys.exit(1)
+                        raise CapabilitiesError(f"DB schema mismatch: table '{table}' missing required columns {missing}")
 
+                check_columns("dim_endpoints", {"endpoint_id", "method", "path"})
                 check_columns("endpoint_state", {"ticker", "endpoint_id", "last_success_event_id", "last_success_ts_utc", "last_change_ts_utc"})
-                check_columns("raw_http_events", {"endpoint_id", "event_id", "received_at_utc", "http_status", "error_type", "payload_json"})
+                check_columns("raw_http_events", {"event_id", "endpoint_id", "received_at_utc", "http_status", "error_type", "payload_json"})
 
         except duckdb.Error as e:
-            print(f"Failed to connect to DuckDB at {self.db_path}: {e}")
-            sys.exit(1)
+            raise CapabilitiesError(f"Failed to connect to DuckDB at {self.db_path}: {e}")
 
     def extract_db_truth(self, con: duckdb.DuckDBPyConnection, method: str, path: str) -> EndpointTruth:
-        """
-        Fetch ground truth for an endpoint deterministically.
-        Prioritizes variants with recent success across ALL tickers.
-        """
         now_utc = datetime.now(UTC)
         
-        # [Fix: Step 1] Derived aggregate to avoid non-deterministic multi-ticker JOIN duplications
-        variant_rows = con.execute("""
-            WITH agg AS (
-                SELECT endpoint_id, 
-                       MAX(last_success_ts_utc) AS max_succ, 
-                       MAX(last_change_ts_utc) AS max_chg 
-                FROM endpoint_state 
+        # [Fix: Step 5] Resolve the EXACT "winner" variant across multiple endpoint_id permutations.
+        variant_row = con.execute("""
+            WITH ep_max AS (
+                SELECT endpoint_id,
+                       MAX(last_success_ts_utc) AS max_succ,
+                       MAX(last_change_ts_utc) AS max_chg
+                FROM endpoint_state
                 GROUP BY endpoint_id
             )
-            SELECT t1.endpoint_id 
-            FROM dim_endpoints t1
-            LEFT JOIN agg ON t1.endpoint_id = agg.endpoint_id
-            WHERE t1.method = ? AND t1.path = ?
-            ORDER BY COALESCE(agg.max_succ, agg.max_chg) DESC NULLS LAST
-            LIMIT 3
-        """, [method.upper(), path]).fetchall()
+            SELECT d.endpoint_id
+            FROM dim_endpoints d
+            LEFT JOIN ep_max e ON d.endpoint_id = e.endpoint_id
+            WHERE d.method = ? AND d.path = ?
+            ORDER BY COALESCE(e.max_succ, e.max_chg) DESC NULLS LAST, d.endpoint_id DESC
+            LIMIT 1
+        """, [method.upper(), path]).fetchone()
 
+        if not variant_row:
+            return EndpointTruth(False, None, None, None, None, [], None, None)
+
+        winner_eid = variant_row[0]
+
+        # [Fix: Step 4] Deterministic best success across ALL tickers for the winner variant
+        best_success_row = con.execute("""
+            SELECT last_success_event_id, last_success_ts_utc
+            FROM endpoint_state
+            WHERE endpoint_id = ? AND last_success_event_id IS NOT NULL
+            ORDER BY last_success_ts_utc DESC NULLS LAST, ticker ASC
+            LIMIT 1
+        """, [winner_eid]).fetchone()
+
+        # [Fix: Step 4] Deterministic latest attempt across ALL tickers
+        latest_attempt_row = con.execute("""
+            SELECT http_status, error_type, received_at_utc
+            FROM raw_http_events
+            WHERE endpoint_id = ?
+            ORDER BY received_at_utc DESC NULLS LAST, event_id ASC
+            LIMIT 1
+        """, [winner_eid]).fetchone()
+
+        found_success = False
         observed_keys: Set[str] = set()
         best_success_ts: Optional[datetime] = None
-        latest_attempt_ts: Optional[datetime] = None
+        selected_event_id: Optional[str] = None
+        
         latest_status = None
         latest_error = None
-        found_success = False
-        schema_source = "none"
+        latest_attempt_ts: Optional[datetime] = None
 
-        for (eid,) in variant_rows:
-            # A. Check for success in endpoint_state deterministically across ALL tickers
-            state_row = con.execute("""
-                SELECT last_success_event_id, last_success_ts_utc
-                FROM endpoint_state
-                WHERE endpoint_id = ? AND last_success_event_id IS NOT NULL
-                ORDER BY last_success_ts_utc DESC NULLS LAST
-                LIMIT 1
-            """, [eid]).fetchone()
+        if best_success_row:
+            evt_id, succ_ts = best_success_row
+            best_success_ts = ensure_utc(succ_ts)
+            selected_event_id = str(evt_id)
+            
+            payload_row = con.execute(
+                "SELECT payload_json FROM raw_http_events WHERE event_id = ?",
+                [evt_id]
+            ).fetchone()
+            
+            if payload_row and payload_row[0]:
+                found_success = True
+                try:
+                    pj = json.loads(payload_row[0]) if isinstance(payload_row[0], str) else payload_row[0]
+                    flatten_keys(pj, "", 5, observed_keys)
+                except Exception:
+                    pass
 
-            if state_row:
-                evt_id, succ_ts = state_row
-                succ_ts = ensure_utc(succ_ts)
-                
-                if succ_ts:
-                    if best_success_ts is None or succ_ts > best_success_ts:
-                        best_success_ts = succ_ts
-                        
-                        payload_row = con.execute(
-                            "SELECT payload_json FROM raw_http_events WHERE event_id = ?",
-                            [evt_id]
-                        ).fetchone()
-                        
-                        if payload_row and payload_row[0]:
-                            found_success = True
-                            try:
-                                pj = json.loads(payload_row[0]) if isinstance(payload_row[0], str) else payload_row[0]
-                                observed_keys = set()
-                                flatten_keys(pj, "", 5, observed_keys)
-                                schema_source = "latest_success_event"
-                            except Exception:
-                                pass
-
-            # B. Latest raw event for status/error across ALL tickers (ticker is part of raw_events naturally)
-            latest_evt_row = con.execute("""
-                SELECT http_status, error_type, received_at_utc
-                FROM raw_http_events
-                WHERE endpoint_id = ?
-                ORDER BY received_at_utc DESC NULLS LAST
-                LIMIT 1
-            """, [eid]).fetchone()
-
-            if latest_evt_row:
-                status, error, rec_ts = latest_evt_row
-                rec_ts = ensure_utc(rec_ts)
-                
-                if rec_ts:
-                    if latest_attempt_ts is None or rec_ts > latest_attempt_ts:
-                        latest_attempt_ts = rec_ts
-                        latest_status = status
-                        latest_error = error
+        if latest_attempt_row:
+            status, error, rec_ts = latest_attempt_row
+            latest_status = status
+            latest_error = error
+            latest_attempt_ts = ensure_utc(rec_ts)
 
         last_success_age = int((now_utc - best_success_ts).total_seconds()) if best_success_ts else None
         last_change_age = int((now_utc - latest_attempt_ts).total_seconds()) if latest_attempt_ts else None
@@ -192,17 +193,16 @@ class CapabilitiesChecker:
             has_success=found_success,
             last_status=latest_status,
             last_error=latest_error,
-            last_success_age=last_success_age,
-            last_change_age=last_change_age,
+            last_success_age_s=last_success_age,
+            last_change_age_s=last_change_age,
             observed_keys=sorted(list(observed_keys)),
-            schema_source=schema_source
+            selected_endpoint_id=winner_eid,
+            selected_success_event_id=selected_event_id
         )
 
     def evaluate_metric(self, spec: MetricSpec, db_states: Dict[EndpointRef, EndpointTruth]) -> Dict[str, Any]:
         missing_endpoints = []
         missing_keys_reasons = []
-        
-        # [Fix: Step 3] Handle explicit presence-only endpoints securely
         used_presence_only = False
 
         for ep in spec.required_endpoints:
@@ -217,7 +217,7 @@ class CapabilitiesChecker:
 
             rule = spec.required_keys_by_endpoint.get(ep)
             
-            # STRICT validation: If no rule, it MUST be in presence_only_endpoints
+            # [Fix: Step 7] Explicit strictness evaluation
             if not rule:
                 if ep in spec.presence_only_endpoints:
                     used_presence_only = True
@@ -245,7 +245,7 @@ class CapabilitiesChecker:
             reasons.extend(missing_keys_reasons)
 
         if status == "COMPUTABLE" and used_presence_only:
-            status = "COMPUTABLE (presence-only; key rules not defined)"
+            status = "COMPUTABLE_PRESENCE_ONLY"
 
         return {"name": spec.name, "status": status, "reasons": reasons}
 
@@ -269,21 +269,26 @@ class CapabilitiesChecker:
             endpoint_details = []
             for ep in sorted_eps:
                 state = db_states[ep]
-                in_plan = (ep.method.upper(), ep.path) in self.planned_endpoints
+                key = (ep.method.upper(), ep.path)
+                in_plan = key in self.planned_endpoints
+                tiers = self.planned_endpoints.get(key, [])
                 op_id = self.catalog.get(ep.method, ep.path).operation_id if self.catalog.has(ep.method, ep.path) else "UNKNOWN"
+                
                 endpoint_details.append({
                     "method": ep.method,
                     "path": ep.path,
                     "operation_id": op_id,
                     "in_plan": in_plan,
+                    "plan_tiers": tiers,
                     "has_success": state.has_success,
                     "last_status": state.last_status,
                     "last_error": state.last_error,
-                    "last_success_age": state.last_success_age,
-                    "last_change_age": state.last_change_age,
+                    "last_success_age_s": state.last_success_age_s,
+                    "last_change_age_s": state.last_change_age_s,
                     "observed_keys_count": len(state.observed_keys),
                     "observed_keys_preview": state.observed_keys[:20],
-                    "schema_source": state.schema_source
+                    "selected_endpoint_id": state.selected_endpoint_id,
+                    "selected_success_event_id": state.selected_success_event_id
                 })
 
             out = {
@@ -306,33 +311,35 @@ class CapabilitiesChecker:
             print("ENDPOINT STATUS (Critical)")
             print("-" * 80)
             for ep in sorted_eps:
-                in_plan = (ep.method.upper(), ep.path) in self.planned_endpoints
+                key = (ep.method.upper(), ep.path)
+                tiers = self.planned_endpoints.get(key, [])
+                plan_str = f"in_plan: True (tiers: {tiers})" if tiers else "in_plan: False"
                 state = db_states[ep]
                 op_id = self.catalog.get(ep.method, ep.path).operation_id if self.catalog.has(ep.method, ep.path) else "UNKNOWN"
                 
-                print(f"{ep.method} {ep.path} [opId: {op_id}] (in_plan: {in_plan})")
+                print(f"{ep.method} {ep.path} [opId: {op_id}] ({plan_str})")
                 if not state.has_success:
                     if state.last_status or state.last_error:
-                        age_str = f"{state.last_change_age}s ago" if state.last_change_age is not None else "N/A"
+                        age_str = f"{state.last_change_age_s}s ago" if state.last_change_age_s is not None else "N/A"
                         print(f"  -> N/A: Never seen successful payload. Last attempt: {state.last_status} ({state.last_error or 'no error'}) {age_str}")
                     else:
                         print("  -> N/A: Never seen successful payload (no attempts found)")
                 else:
-                    sa = f"{state.last_success_age}s ago" if state.last_success_age is not None else "N/A"
-                    ca = f"{state.last_change_age}s ago" if state.last_change_age is not None else "N/A"
+                    sa = f"{state.last_success_age_s}s ago" if state.last_success_age_s is not None else "N/A"
+                    ca = f"{state.last_change_age_s}s ago" if state.last_change_age_s is not None else "N/A"
                     print(f"  Last Success: {sa} | Last Change: {ca} | Status: {state.last_status}")
                     
                     keys = state.observed_keys
                     preview = keys[:10]
                     suffix = "..." if len(keys) > 10 else ""
-                    print(f"  Keys ({len(keys)} observed): {preview} {suffix} ")
+                    print(f"  Keys ({len(keys)} observed): {preview} {suffix}")
                 print()
 
             print("=" * 80)
             print("METRIC COMPUTABILITY")
             print("-" * 80)
             for mr in metric_results:
-                status_str = f"[{mr['status']}]".ljust(12)
+                status_str = f"[{mr['status']}]".ljust(26)
                 print(f"{status_str} {mr['name']}")
                 if "COMPUTABLE" in mr['status']:
                     print("  All required endpoints and keys are present.")

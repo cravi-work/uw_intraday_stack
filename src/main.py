@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import sys
 import time
 from typing import Any
 
@@ -39,7 +40,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_loop(engine: Any) -> None:
-    # engine is typed as Any to avoid top-level import of IngestionEngine
     while True:
         now_et = dt.datetime.now(ET)
         hours = nyse_market_hours(
@@ -55,12 +55,14 @@ def run_loop(engine: Any) -> None:
         if in_ingest_window(now_et, hours):
             engine.run_cycle()
 
-        # Cadence may be updated by adapter (via config hot-reload). Use latest value each loop.
         cadence_minutes = int(engine.cfg["ingestion"]["cadence_minutes"])
         wake = next_wakeup_et(now_et, cadence_minutes)
         
         sleep_seconds = max(0.5, (wake - now_et).total_seconds())
-        logger.info(f"Sleeping until {wake.time()} ET ({int(sleep_seconds)}s)", extra={"json": {"wake_et": wake.isoformat()}})
+        logger.info(
+            f"Sleeping until {wake.time()} ET ({int(sleep_seconds)}s)", 
+            extra={"json": {"wake_et": wake.isoformat()}}
+        )
         
         time.sleep(sleep_seconds)
 
@@ -70,11 +72,18 @@ def main() -> None:
     configure_logging(service="uw_intraday_stack", level=args.log_level)
 
     if args.cmd == "capabilities":
-        from .capabilities import check_capabilities
-        check_capabilities(args.catalog, args.db, args.plan, args.format)
-        return
+        from .capabilities import check_capabilities, CapabilitiesError
+        # [Fix: Step 2] Handle typed exception to issue proper exit codes without polluting stack
+        try:
+            check_capabilities(args.catalog, args.db, args.plan, args.format)
+            sys.exit(0)
+        except CapabilitiesError as ce:
+            print(f"Capabilities Error: {ce}", file=sys.stderr)
+            sys.exit(2)
+        except Exception as e:
+            print(f"Unexpected Runtime Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    # Lazy import to keep capabilities command lightweight
     from .ingest_engine import IngestionEngine
     
     cfg = load_yaml("src/config/config.yaml").raw

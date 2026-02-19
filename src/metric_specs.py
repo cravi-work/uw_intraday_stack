@@ -21,7 +21,7 @@ class MetricSpec:
     name: str
     required_endpoints: List[EndpointRef]
     required_keys_by_endpoint: Dict[EndpointRef, KeyRule]
-    # [Fix: Pattern B] Explicitly label presence-only endpoints to prevent silent unsafe passes
+    # [Fix: Step 7] Explicit presence-only endpoints to prevent silent passes
     presence_only_endpoints: Set[EndpointRef] = field(default_factory=set)
 
 
@@ -32,51 +32,52 @@ INSTITUTIONAL_METRICS: List[MetricSpec] = [
         required_endpoints=[
             EndpointRef("GET", "/api/stock/{ticker}/greek-exposure/strike"),
             EndpointRef("GET", "/api/stock/{ticker}/greek-exposure/expiry"),
-            EndpointRef("GET", "/api/stock/{ticker}/spot-exposures/expiry-strike")
+            EndpointRef("GET", "/api/stock/{ticker}/spot-exposures/expiry-strike"),
         ],
         required_keys_by_endpoint={
             EndpointRef("GET", "/api/stock/{ticker}/greek-exposure/strike"): KeyRule(
                 any_of=[{"data.[].strike", "data.[].gamma_exposure"}, {"data.[].strike", "data.[].gex"}]
             )
-        }
+        },
     ),
     MetricSpec(
         name="Flow",
         required_endpoints=[
             EndpointRef("GET", "/api/stock/{ticker}/flow-per-strike"),
-            EndpointRef("GET", "/api/stock/{ticker}/flow-alerts")
+            EndpointRef("GET", "/api/stock/{ticker}/flow-alerts"),
         ],
         required_keys_by_endpoint={
             EndpointRef("GET", "/api/stock/{ticker}/flow-alerts"): KeyRule(
                 all_of={"data.[].premium", "data.[].dte", "data.[].side", "data.[].put_call"}
             )
-        }
+        },
     ),
     MetricSpec(
         name="Options Surface",
         required_endpoints=[
             EndpointRef("GET", "/api/stock/{ticker}/option-chains"),
             EndpointRef("GET", "/api/stock/{ticker}/option-contracts"),
-            EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew")
+            EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew"),
         ],
         required_keys_by_endpoint={},
-        # [Fix] Enforce presence-only explicitly since we lack strict key rules for these
+        # [Fix: Step 7] Explicitly denote volatile endpoints as presence-only 
         presence_only_endpoints={
             EndpointRef("GET", "/api/stock/{ticker}/option-chains"),
             EndpointRef("GET", "/api/stock/{ticker}/option-contracts"),
-            EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew")
-        }
+            EndpointRef("GET", "/api/stock/{ticker}/historical-risk-reversal-skew"),
+        },
     ),
     MetricSpec(
         name="Market Context",
         required_endpoints=[
             EndpointRef("GET", "/api/market/top-net-impact"),
-            EndpointRef("GET", "/api/market/total-options-volume")
+            EndpointRef("GET", "/api/market/total-options-volume"),
         ],
         required_keys_by_endpoint={},
+        # [Fix: Step 7]
         presence_only_endpoints={
             EndpointRef("GET", "/api/market/top-net-impact"),
-            EndpointRef("GET", "/api/market/total-options-volume")
-        }
-    )
+            EndpointRef("GET", "/api/market/total-options-volume"),
+        },
+    ),
 ]
