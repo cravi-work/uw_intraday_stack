@@ -1,12 +1,10 @@
 # Databases & Artifacts
 *.duckdb
-*.duckdb.*
+*.duckdb*
 *.bak
 
 # Locks
 *.lock
-uw.lock
-uw_cycle.lock
 
 # Python Cache & Envs
 __pycache__/
@@ -17,8 +15,6 @@ __pycache__/
 env/
 venv/
 .venv/
-env.bak/
-venv.bak/
 
 # Logs
 *.log
@@ -29,15 +25,11 @@ data/
 
 # Environments & Secrets
 .env
-.env.local
 config.json
-*.json.bak
 
 # IDE & Editor
 .vscode/
 .idea/
-*.swp
-*.swo
 
 # OS Specific
 .DS_Store

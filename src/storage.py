@@ -195,6 +195,10 @@ class DbWriter:
         return eid
 
     def insert_raw_event(self, con, run_id, ticker, endpoint_id, req_at, rec_at, status, lat, ph, pj, retry, etype, emsg, circ):
+        # Cast floats to UTC datetime objects for DuckDB
+        if isinstance(req_at, (int, float)): req_at = datetime.fromtimestamp(req_at, UTC)
+        if isinstance(rec_at, (int, float)): rec_at = datetime.fromtimestamp(rec_at, UTC)
+        
         eid = uuid.uuid4()
         con.execute("""INSERT INTO raw_http_events (event_id, run_id, requested_at_utc, received_at_utc, ticker, endpoint_id, http_status, latency_ms, payload_hash, payload_json, is_retry, error_type, error_msg, circuit_state_json)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
@@ -213,13 +217,16 @@ class DbWriter:
         ver = con.execute("SELECT nextval('seq_config_version')").fetchone()[0]
         con.execute("INSERT INTO meta_config (config_version, config_hash, config_yaml, created_at_utc) VALUES (?,?,?,?)", 
                     [ver, h, yaml_text, datetime.now(UTC)])
-        con.execute("INSERT OR IGNORE INTO config_history (config_version, ingested_at_utc, yaml_content) VALUES (?,?,?)", 
+        con.execute("INSERT INTO config_history (config_version, ingested_at_utc, yaml_content) VALUES (?,?,?)", 
                     [str(ver), datetime.now(UTC), yaml_text])
         return ver
 
     def upsert_tickers(self, con, tickers):
         con.executemany("INSERT OR IGNORE INTO dim_tickers (ticker) VALUES (?)", [[t.upper()] for t in tickers])
     def upsert_endpoint_state_success(self, con, ticker, endpoint_id, event_id, rec_at, ph, changed):
+        # Cast float to UTC datetime object for DuckDB
+        if isinstance(rec_at, (int, float)): rec_at = datetime.fromtimestamp(rec_at, UTC)
+        
         con.execute("""INSERT INTO endpoint_state (ticker, endpoint_id, last_success_event_id, last_success_ts_utc, last_payload_hash, last_change_ts_utc, last_change_event_id)
             VALUES (?,?,?,?,?,?,?) ON CONFLICT(ticker, endpoint_id) DO UPDATE SET 
             last_success_event_id=excluded.last_success_event_id, last_success_ts_utc=excluded.last_success_ts_utc, last_payload_hash=excluded.last_payload_hash,
