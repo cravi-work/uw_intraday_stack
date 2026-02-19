@@ -1,6 +1,44 @@
-# Local Database
-uw_stack.duckdb
+# Databases & Artifacts
+*.duckdb
+*.duckdb.*
+*.bak
 
-# API Keys and Secrets
+# Locks
+*.lock
+uw.lock
+uw_cycle.lock
+
+# Python Cache & Envs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Logs
+*.log
+
+# Generated outputs
+derived_levels/
+data/
+
+# Environments & Secrets
 .env
+.env.local
 config.json
+*.json.bak
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Specific
+.DS_Store
+Thumbs.db

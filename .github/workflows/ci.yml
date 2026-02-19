@@ -1,0 +1,46 @@
+name: Institutional CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-and-audit:
+    name: Run Tests and Audit (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest
+
+    - name: Run Repo Guard (Artifact Audit)
+      run: python scripts/repo_guard.py
+
+    - name: Run Unit Tests
+      run: pytest -q tests/
+
+    - name: Validate Capabilities against empty schema
+      # This step ensures the schema definition is robust and the capability 
+      # runner doesn't crash even if no ingestion cycles have ever run.
+      run: |
+        python -c "import duckdb; from src.storage import DbWriter; con=duckdb.connect('test_ci.duckdb'); DbWriter('test_ci.duckdb').ensure_schema(con)"
+        python -m src.main capabilities --catalog api_catalog.generated.yaml --db test_ci.duckdb --plan src/config/endpoint_plan.yaml --format json

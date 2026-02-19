@@ -149,15 +149,32 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     sec_to_close = hours.seconds_to_close(asof_et)
 
     # Fetch OUTSIDE the cycle lock (avoid holding lock over network IO).
+    # Fetch OUTSIDE the cycle lock (avoid holding lock over network IO).
     async def _run_fetch():
-        async with UwClient(registry=registry, **cfg["system"], **cfg["network"]) as client:
+        net = cfg.get("network", {})
+        sys_cfg = cfg.get("system", {})
+        cb = net.get("circuit_breaker", {})
+        
+        async with UwClient(
+            registry=registry,
+            base_url=net.get("base_url", "https://api.unusualwhales.com"),
+            api_key_env=sys_cfg.get("api_key_env", "UW_API_KEY"),
+            timeout_seconds=net.get("timeout_seconds", 10.0),
+            max_retries=net.get("max_retries", 3),
+            backoff_seconds=net.get("backoff_seconds", 1.0),
+            max_concurrent_requests=net.get("max_concurrent_requests", 20),
+            rate_limit_per_second=net.get("rate_limit_per_second", 10),
+            circuit_failure_threshold=cb.get("failure_threshold", net.get("circuit_failure_threshold", 5)),
+            circuit_cool_down_seconds=cb.get("cool_down_seconds", net.get("circuit_cool_down_seconds", 60)),
+            circuit_half_open_max_calls=cb.get("half_open_max_calls", net.get("circuit_half_open_max_calls", 3))
+        ) as client:
             return await fetch_all(
                 client,
                 tickers,
                 asof_et.date().isoformat(),
                 core,
                 market,
-                max_concurrency=cfg.get("network", {}).get("max_concurrency", 20),
+                max_concurrency=net.get("max_concurrency", 20),
             )
 
     fetch_results = asyncio.run(_run_fetch())

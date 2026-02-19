@@ -74,3 +74,18 @@ Configured in:
 ### Validator Hygiene
 - Predictions persist `start_price` (spot at decision time) to avoid any dependency on external/live data during validation.
 - Validation uses only stored snapshots/features/predictions in DuckDB (no API calls).
+
+
+# UW Intraday Stack
+
+High-reliability financial data ingestion system and institutional capability mapper.
+
+## Quickstart (`cmd.exe` native)
+
+This system is optimized for deterministic Windows environments. Open `cmd.exe` (Command Prompt) and run the following.
+
+1. **Create and activate the virtual environment**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt
