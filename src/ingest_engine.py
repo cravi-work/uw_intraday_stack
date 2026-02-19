@@ -217,8 +217,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     db.upsert_endpoint_state(con, tkr, endpoint_id, str(event_id), res, is_success, is_changed)
 
                     # 5. Resolve the Effective Payload for this cycle
-                    rec_ts = res.received_at_utc if not isinstance(res.received_at_utc, (int, float)) else dt.datetime.fromtimestamp(res.received_at_utc, UTC)
-                    resolved = resolve_effective_payload(str(event_id), rec_ts, payload_class, prev_state)
+                    resolved = resolve_effective_payload(str(event_id), res.received_at_utc, payload_class, prev_state)
                     
                     if tkr not in events_by_ticker:
                         events_by_ticker[tkr] = []
