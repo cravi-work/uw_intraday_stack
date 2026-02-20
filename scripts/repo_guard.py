@@ -55,10 +55,10 @@ def run_guard() -> None:
                 violations.append((raw_path, rule)); break
 
     if violations:
-        print("=" * 80 + "\n❌ REPO GUARD FAILED: Forbidden tracked artifacts found!")
+        print("=" * 80 + "\n[FAIL] REPO GUARD FAILED: Forbidden tracked artifacts found!")
         for file_path, rule in violations: print(f"File: {file_path}\n  Rule: {rule.name} ('{rule.pattern}')\n")
         sys.exit(2)
-    print("✅ Repo Guard passed. No forbidden artifacts found in index.")
+    print("[PASS] Repo Guard passed. No forbidden artifacts found in index.")
     sys.exit(0)
 
 if __name__ == "__main__":
