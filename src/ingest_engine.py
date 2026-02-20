@@ -128,6 +128,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     core, market = build_plan(cfg, plan_yaml)
     tickers = [t.upper() for t in cfg["ingestion"]["watchlist"]]
 
+    # Configurable stale cutoffs (with safe defaults)
+    val_cfg = cfg.get("validation", {})
+    fallback_max_age_seconds = int(val_cfg.get("fallback_max_age_minutes", 15)) * 60
+    invalid_after_seconds = int(val_cfg.get("invalid_after_minutes", 60)) * 60
+
     now_et = dt.datetime.now(ET)
     asof_et = floor_to_interval(now_et, int(cfg["ingestion"]["cadence_minutes"]))
     asof_utc = asof_et.astimezone(UTC)
@@ -209,8 +214,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     )
                     
                     assessment = classify_payload(res, prev_hash, call.method, call.path, sess)
-                    if assessment.error_reason and not res.error_message:
-                        res.error_message = assessment.error_reason
 
                     is_success_class = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
@@ -223,9 +226,13 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         attempt_ts_utc, is_success_class, is_changed
                     )
 
-                    resolved = resolve_effective_payload(str(event_id), attempt_ts_utc, assessment, prev_state)
+                    resolved = resolve_effective_payload(
+                        str(event_id), attempt_ts_utc, assessment, prev_state,
+                        fallback_max_age_seconds=fallback_max_age_seconds,
+                        invalid_after_seconds=invalid_after_seconds
+                    )
                     
-                    # Double-lock lineage invariants (in case resolver missed something)
+                    # Post-resolution Lineage Invariants
                     enforced_freshness = resolved.freshness_state
                     enforced_reason = resolved.na_reason
 
@@ -233,9 +240,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         enforced_freshness = FreshnessState.ERROR
                         enforced_reason = NaReasonCode.NO_PRIOR_SUCCESS.value
 
-                    if assessment.empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE and enforced_freshness == FreshnessState.EMPTY_VALID:
+                    if enforced_reason and NaReasonCode.STALE_TOO_OLD.value in enforced_reason:
                         enforced_freshness = FreshnessState.ERROR
-                        enforced_reason = NaReasonCode.NO_PRIOR_SUCCESS.value
+
+                    # Incorporate diagnostic shape errors from assessment cleanly into lineage
+                    if assessment.error_reason and not enforced_reason:
+                        enforced_reason = assessment.error_reason
 
                     resolved = replace(resolved, freshness_state=enforced_freshness, na_reason=enforced_reason)
 
@@ -252,6 +262,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         if res.freshness_state == FreshnessState.FRESH:
                             valid += 1
                         elif res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None:
+                            # Strict cutoff: if it's STALE_TOO_OLD, the invariant forced it to ERROR, so it fails here.
                             valid += 1
                         elif res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
                             valid += 1
@@ -277,7 +288,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                             "operation_id": op_id,
                             "endpoint_id": endpoint_id,
                             "signature": sig,
-                            "used_event_id": res.used_event_id
+                            "used_event_id": res.used_event_id,
+                            "missing_keys": asmnt.missing_keys
                         }
                         
                         source_endpoints.append(src_meta)

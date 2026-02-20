@@ -1,5 +1,7 @@
 from __future__ import annotations
 from enum import Enum
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
 
 class EmptyPayloadPolicy(Enum):
     """
@@ -11,23 +13,61 @@ class EmptyPayloadPolicy(Enum):
     EMPTY_MEANS_STALE = "EMPTY_MEANS_STALE"
     EMPTY_INVALID = "EMPTY_INVALID"
 
-# Endpoints where empty is ALWAYS valid data (e.g., legitimately zero alerts or darkpool prints)
-ALWAYS_EMPTY_IS_DATA_PATHS = {
-    "/api/stock/{ticker}/flow-alerts",
-    "/api/darkpool/{ticker}",
+@dataclass(frozen=True)
+class EndpointRule:
+    method: str
+    path: str
+    empty_policy_by_session: Dict[str, EmptyPayloadPolicy]
+    required_any_keys: Optional[Tuple[str, ...]] = None
+    required_all_keys: Optional[Tuple[str, ...]] = None
+    data_container_keys: Tuple[str, ...] = ("data", "results", "items", "trades", "history")
+
+RULE_REGISTRY: Dict[Tuple[str, str], EndpointRule] = {}
+
+def _register(rule: EndpointRule) -> None:
+    RULE_REGISTRY[(rule.method.upper(), rule.path)] = rule
+
+# --- Policy Definitions ---
+P_ALWAYS_DATA = {
+    "PRE": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "REG": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "AFT": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "CLOSED": EmptyPayloadPolicy.EMPTY_IS_DATA
+}
+
+P_FLOW = {
+    "PRE": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "REG": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "AFT": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "CLOSED": EmptyPayloadPolicy.EMPTY_MEANS_STALE
+}
+
+P_STRUCTURAL = {
+    "PRE": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "REG": EmptyPayloadPolicy.EMPTY_INVALID, 
+    "AFT": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "CLOSED": EmptyPayloadPolicy.EMPTY_MEANS_STALE
+}
+
+# 1. ALWAYS DATA
+for p in [
+    "/api/stock/{ticker}/flow-alerts", 
+    "/api/darkpool/{ticker}", 
     "/api/lit-flow/{ticker}"
-}
+]:
+    _register(EndpointRule("GET", p, P_ALWAYS_DATA))
 
-# Endpoints where empty is data in REG, but means STALE in PRE/AFT/CLOSED (Options volume feeds)
-SESSION_AWARE_FLOW_PATHS = {
-    "/api/stock/{ticker}/flow-per-strike",
-    "/api/stock/{ticker}/flow-per-strike-intraday",
-    "/api/stock/{ticker}/flow-recent",
+# 2. FLOW (Session-Aware Empties)
+for p in [
+    "/api/stock/{ticker}/flow-per-strike", 
+    "/api/stock/{ticker}/flow-per-strike-intraday", 
+    "/api/stock/{ticker}/flow-recent", 
     "/api/stock/{ticker}/net-prem-ticks"
-}
+]:
+    _register(EndpointRule("GET", p, P_FLOW))
 
-# Structural Options endpoints: should NEVER be empty in REG (Error), but are STALE in PRE/AFT
-SESSION_AWARE_OPTIONS_PATHS = {
+# 3. STRUCTURAL OPTIONS (Never empty in REG, Stale in PRE/AFT)
+for p in [
     "/api/stock/{ticker}/oi-per-strike",
     "/api/stock/{ticker}/oi-change",
     "/api/stock/{ticker}/option/volume-oi-expiry",
@@ -43,30 +83,19 @@ SESSION_AWARE_OPTIONS_PATHS = {
     "/api/stock/{ticker}/spot-exposures",
     "/api/stock/{ticker}/spot-exposures/strike",
     "/api/stock/{ticker}/spot-exposures/expiry-strike",
-    "/api/stock/{ticker}/max-pain"
-}
+    "/api/stock/{ticker}/max-pain",
+    "/api/market/sectors",
+    "/api/market/indices",
+    "/api/market/market-context"
+]:
+    _register(EndpointRule("GET", p, P_STRUCTURAL))
+
+
+def get_endpoint_rule(method: str, path: str) -> Optional[EndpointRule]:
+    return RULE_REGISTRY.get((method.upper(), path))
 
 def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayloadPolicy:
-    """
-    Determines if an empty JSON payload ({} or []) is legitimate data, 
-    stale data (due to extended hours), or an invalid error state based on exact path mapping.
-    """
-    if method.upper() != "GET":
+    rule = get_endpoint_rule(method, path)
+    if not rule:
         return EmptyPayloadPolicy.EMPTY_INVALID
-
-    if path in ALWAYS_EMPTY_IS_DATA_PATHS:
-        return EmptyPayloadPolicy.EMPTY_IS_DATA
-
-    if path in SESSION_AWARE_FLOW_PATHS:
-        if session_label in ("PRE", "AFT", "CLOSED"):
-            return EmptyPayloadPolicy.EMPTY_MEANS_STALE
-        return EmptyPayloadPolicy.EMPTY_IS_DATA
-
-    if path in SESSION_AWARE_OPTIONS_PATHS:
-        if session_label in ("PRE", "AFT", "CLOSED"):
-            return EmptyPayloadPolicy.EMPTY_MEANS_STALE
-        # During REG, these structural endpoints must fail-closed if empty
-        return EmptyPayloadPolicy.EMPTY_INVALID
-
-    # Fail closed: If not explicitly handled, an empty payload is an error.
-    return EmptyPayloadPolicy.EMPTY_INVALID
+    return rule.empty_policy_by_session.get(session_label, EmptyPayloadPolicy.EMPTY_INVALID)
