@@ -2,6 +2,7 @@ import datetime
 from src.endpoint_rules import EmptyPayloadPolicy
 from src.endpoint_truth import (
     EndpointPayloadClass,
+    EndpointStateRow,
     FreshnessState,
     NaReasonCode,
     PayloadAssessment,
@@ -31,14 +32,14 @@ def test_stale_too_old_cutoff():
         error_reason=None
     )
     
-    # Simulate a prior success from 3 hours ago (10,800 seconds)
     prev_success_ts = current_ts - datetime.timedelta(hours=3)
-    prev_state = {
-        "last_success_event_id": "prev_123",
-        "last_success_ts_utc": prev_success_ts,
-        "last_change_event_id": "prev_123",
-        "last_change_ts_utc": prev_success_ts
-    }
+    prev_state = EndpointStateRow(
+        last_success_event_id="prev_123",
+        last_success_ts_utc=prev_success_ts,
+        last_payload_hash="hash1",
+        last_change_event_id="prev_123",
+        last_change_ts_utc=prev_success_ts
+    )
     
     resolved = resolve_effective_payload(
         current_event_id="curr_123",
@@ -46,19 +47,59 @@ def test_stale_too_old_cutoff():
         assessment=assessment,
         prev_state=prev_state,
         fallback_max_age_seconds=900,
-        invalid_after_seconds=3600  # Hard cutoff at 1 hour
+        invalid_after_seconds=3600
     )
     
     assert resolved.freshness_state == FreshnessState.ERROR
     assert resolved.used_event_id is None
     assert resolved.na_reason == NaReasonCode.STALE_TOO_OLD.value
 
+def test_correct_stale_age_under_unchanged_payloads():
+    """
+    Simulates:
+    Cycle N: payload changed at T0 (sets last_change_ts=T0)
+    Cycles N+1..N+k: payload unchanged but still 2xx (updates last_success_ts each cycle)
+    Cycle N+k+1: endpoint returns ERROR at T1
+    Expected: resolved lineage for that endpoint is STALE_CARRY with stale_age_seconds approx (T1 - T0).
+    """
+    t0 = datetime.datetime(2025, 1, 1, 9, 30, tzinfo=datetime.timezone.utc)
+    t_intermediate = datetime.datetime(2025, 1, 1, 9, 45, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2025, 1, 1, 10, 0, tzinfo=datetime.timezone.utc)
+
+    # State after N+k cycles (last success is recent, but last change was T0)
+    prev_state = EndpointStateRow(
+        last_success_event_id="event_intermediate",
+        last_success_ts_utc=t_intermediate,
+        last_payload_hash="hash1",
+        last_change_event_id="event_t0",
+        last_change_ts_utc=t0
+    )
+
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.ERROR,
+        empty_policy=EmptyPayloadPolicy.EMPTY_INVALID,
+        is_empty=False,
+        changed=None,
+        error_reason="HTTP Error"
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="event_t1",
+        current_ts_raw=t1,
+        assessment=assessment,
+        prev_state=prev_state,
+        fallback_max_age_seconds=3600,
+        invalid_after_seconds=7200
+    )
+
+    assert resolved.freshness_state == FreshnessState.STALE_CARRY
+    assert resolved.used_event_id == "event_t0"
+    
+    expected_age = int((t1 - t0).total_seconds())
+    assert resolved.stale_age_seconds == expected_age
+    assert resolved.na_reason == NaReasonCode.CARRY_FORWARD_ERROR.value
+
 def test_provider_error_envelope_classification():
-    """
-    Asserts that a validly formatted JSON containing only provider error metadata
-    is classified as an ERROR and not as SUCCESS_HAS_DATA.
-    """
-    # This is valid JSON, but functionally it is an error wrapper.
     error_payload = {
         "status": 500,
         "error": "Internal Server Error",
@@ -72,10 +113,6 @@ def test_provider_error_envelope_classification():
     assert assessment.error_reason == "PROVIDER_ERROR_ENVELOPE"
 
 def test_empty_means_stale_no_prior():
-    """
-    Case A: EMPTY_MEANS_STALE + prev_state=None 
-    Must strictly return ERROR and NO_PRIOR_SUCCESS (never EMPTY_VALID).
-    """
     current_ts = datetime.datetime.now(datetime.timezone.utc)
     assessment = PayloadAssessment(
         payload_class=EndpointPayloadClass.SUCCESS_EMPTY_VALID,

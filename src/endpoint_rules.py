@@ -55,8 +55,7 @@ for p in [
     "/api/stock/{ticker}/interpolated-iv", "/api/stock/{ticker}/iv-rank", "/api/stock/{ticker}/historical-risk-reversal-skew",
     "/api/stock/{ticker}/greek-exposure", "/api/stock/{ticker}/greek-exposure/strike", "/api/stock/{ticker}/greek-exposure/expiry",
     "/api/stock/{ticker}/spot-exposures", "/api/stock/{ticker}/spot-exposures/strike", "/api/stock/{ticker}/spot-exposures/expiry-strike",
-    "/api/stock/{ticker}/max-pain", "/api/market/sectors", "/api/market/indices", "/api/market/market-context",
-    # Step 4: Missing Market Endpoints added explicitly
+    "/api/stock/{ticker}/max-pain",
     "/api/market/market-tide", "/api/market/economic-calendar", "/api/market/top-net-impact", "/api/market/total-options-volume"
 ]:
     _register(EndpointRule("GET", p, P_STRUCTURAL))
@@ -71,7 +70,6 @@ def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayload
     return rule.empty_policy_by_session.get(session_label, EmptyPayloadPolicy.EMPTY_INVALID)
 
 def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
-    """Startup validation: ensures every endpoint in the plan has an explicit rule."""
     missing = []
     for tier, eps in plan_yaml.get("plans", {}).items():
         for ep in eps:

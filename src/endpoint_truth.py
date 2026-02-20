@@ -30,6 +30,14 @@ class NaReasonCode(str, Enum):
     PAYLOAD_JSON_INVALID = "PAYLOAD_JSON_INVALID"
 
 @dataclass(frozen=True)
+class EndpointStateRow:
+    last_success_event_id: Optional[str]
+    last_success_ts_utc: Optional[datetime.datetime]
+    last_payload_hash: Optional[str]
+    last_change_ts_utc: Optional[datetime.datetime]
+    last_change_event_id: Optional[str]
+
+@dataclass(frozen=True)
 class EndpointContext:
     endpoint_id: int
     method: str
@@ -69,48 +77,36 @@ class ResolvedLineage:
     na_reason: Optional[str]
 
 def to_utc_dt(x: Any, *, fallback: datetime.datetime) -> datetime.datetime:
-    if x is None:
-        return fallback
-    if isinstance(x, (int, float)):
-        return datetime.datetime.fromtimestamp(x, datetime.timezone.utc)
+    if x is None: return fallback
+    if isinstance(x, (int, float)): return datetime.datetime.fromtimestamp(x, datetime.timezone.utc)
     if isinstance(x, datetime.datetime):
-        if x.tzinfo is None:
-            return x.replace(tzinfo=datetime.timezone.utc)
+        if x.tzinfo is None: return x.replace(tzinfo=datetime.timezone.utc)
         return x.astimezone(datetime.timezone.utc)
     return fallback
 
 def is_provider_error_envelope(pj: Any) -> bool:
-    if not isinstance(pj, dict): 
-        return False
+    if not isinstance(pj, dict): return False
     keys = set(pj.keys())
     error_keys = {"error", "message", "detail", "status"}
     data_containers = {"data", "results", "items", "trades", "history"}
-    if keys.intersection(error_keys) and not keys.intersection(data_containers):
-        return True
-    return False
+    return bool(keys.intersection(error_keys) and not keys.intersection(data_containers))
 
 def validate_shape(pj: Any, rule: Optional[EndpointRule]) -> Tuple[bool, Optional[str], Optional[List[str]]]:
-    if not rule or not isinstance(pj, dict): 
-        return True, None, None
-        
+    if not rule or not isinstance(pj, dict): return True, None, None
     actual_pj = pj
     for container in rule.data_container_keys:
         if container in pj and len(pj.keys()) <= 2:
             actual_pj = pj[container]
             break
-            
-    if not isinstance(actual_pj, dict): 
-        return True, None, None
+    if not isinstance(actual_pj, dict): return True, None, None
 
     keys = set(actual_pj.keys())
     if rule.required_all_keys:
         missing = [k for k in rule.required_all_keys if k not in keys]
         if missing: return False, "INVALID_SHAPE:Missing required_all_keys", missing
-            
     if rule.required_any_keys:
         if not any(k in keys for k in rule.required_any_keys):
             return False, "INVALID_SHAPE:Missing required_any_keys", list(rule.required_any_keys)
-
     return True, None, None
 
 def _enforce_invariants(res: ResolvedLineage) -> ResolvedLineage:
@@ -162,9 +158,26 @@ def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str,
     pclass = EndpointPayloadClass.SUCCESS_HAS_DATA if computed_changed else EndpointPayloadClass.SUCCESS_STALE
     return PayloadAssessment(pclass, policy, False, computed_changed, None)
 
+def _get_carry_forward_target(prev_state: Optional[EndpointStateRow], current_ts: datetime.datetime) -> Tuple[Optional[str], Optional[int]]:
+    """Prioritizes the exact timestamp of payload transformation (last_change), otherwise falls back to last fetch."""
+    if not prev_state:
+        return None, None
+    
+    if prev_state.last_change_event_id and prev_state.last_change_ts_utc:
+        prev_change_ts = to_utc_dt(prev_state.last_change_ts_utc, fallback=current_ts)
+        age = max(0, int((current_ts - prev_change_ts).total_seconds()))
+        return prev_state.last_change_event_id, age
+        
+    if prev_state.last_success_event_id and prev_state.last_success_ts_utc:
+        prev_success_ts = to_utc_dt(prev_state.last_success_ts_utc, fallback=current_ts)
+        age = max(0, int((current_ts - prev_success_ts).total_seconds()))
+        return prev_state.last_success_event_id, age
+        
+    return None, None
+
 def resolve_effective_payload(
     current_event_id: str, current_ts_raw: Any, assessment: PayloadAssessment, 
-    prev_state: Optional[Dict[str, Any]], fallback_max_age_seconds: int = 900, invalid_after_seconds: int = 3600
+    prev_state: Optional[EndpointStateRow], fallback_max_age_seconds: int = 900, invalid_after_seconds: int = 3600
 ) -> ResolvedLineage:
     current_ts = to_utc_dt(current_ts_raw, fallback=datetime.datetime.now(datetime.timezone.utc))
     pclass = assessment.payload_class
@@ -174,8 +187,8 @@ def resolve_effective_payload(
         return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.FRESH, 0, pclass, None))
     
     if pclass == EndpointPayloadClass.SUCCESS_STALE:
-        used_id = prev_state["last_change_event_id"] if prev_state and prev_state.get("last_change_event_id") else current_event_id
-        prev_change_ts = to_utc_dt(prev_state.get("last_change_ts_utc"), fallback=current_ts) if prev_state else current_ts
+        used_id = prev_state.last_change_event_id if prev_state and prev_state.last_change_event_id else current_event_id
+        prev_change_ts = to_utc_dt(prev_state.last_change_ts_utc, fallback=current_ts) if prev_state and prev_state.last_change_ts_utc else current_ts
         age = max(0, int((current_ts - prev_change_ts).total_seconds()))
         resolved = ResolvedLineage(used_id, FreshnessState.STALE_CARRY, age, pclass, None)
         return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
@@ -184,19 +197,17 @@ def resolve_effective_payload(
         if empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
             return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.EMPTY_VALID, 0, pclass, None))
         elif empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
-            if prev_state and prev_state.get("last_success_event_id"):
-                prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
-                age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-                resolved = ResolvedLineage(prev_state["last_success_event_id"], FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_EMPTY_MEANS_STALE.value)
+            cf_id, age = _get_carry_forward_target(prev_state, current_ts)
+            if cf_id:
+                resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_EMPTY_MEANS_STALE.value)
                 return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
             else:
                 return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value))
 
     if pclass == EndpointPayloadClass.ERROR:
-        if prev_state and prev_state.get("last_success_event_id"):
-            prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
-            age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-            resolved = ResolvedLineage(prev_state["last_success_event_id"], FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_ERROR.value)
+        cf_id, age = _get_carry_forward_target(prev_state, current_ts)
+        if cf_id:
+            resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_ERROR.value)
             return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
         else:
             return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value))

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, List
 import duckdb
 
 from .api_catalog_loader import EndpointRegistry
-from .endpoint_truth import to_utc_dt
+from .endpoint_truth import to_utc_dt, EndpointStateRow
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -77,7 +77,6 @@ class DbWriter:
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
 
-    # Step 1 Requirement: Efficient payload retrieval by event_id list
     def get_payloads_by_event_ids(self, con: duckdb.DuckDBPyConnection, event_ids: List[str]) -> Dict[str, Any]:
         if not event_ids: return {}
         placeholders = ','.join(['?'] * len(event_ids))
@@ -88,12 +87,9 @@ class DbWriter:
         for row in rows:
             eid, pj = str(row[0]), row[1]
             if pj is not None:
-                try:
-                    res[eid] = json.loads(pj) if isinstance(pj, str) else pj
-                except Exception:
-                    res[eid] = None
-            else:
-                res[eid] = None
+                try: res[eid] = json.loads(pj) if isinstance(pj, str) else pj
+                except Exception: res[eid] = None
+            else: res[eid] = None
         return res
 
     def insert_snapshot(
@@ -172,16 +168,27 @@ class DbWriter:
     def upsert_tickers(self, con, tickers):
         con.executemany("INSERT OR IGNORE INTO dim_tickers (ticker) VALUES (?)", [[t.upper()] for t in tickers])
 
-    def get_endpoint_state(self, con, ticker: str, endpoint_id: int) -> Optional[Dict[str, Any]]:
-        row = con.execute("SELECT last_success_event_id, last_success_ts_utc, last_payload_hash, last_change_ts_utc, last_change_event_id FROM endpoint_state WHERE ticker=? AND endpoint_id=?", [ticker, endpoint_id]).fetchone()
-        if not row: return None
-        return {
-            "last_success_event_id": str(row[0]) if row[0] else None,
-            "last_success_ts_utc": row[1],
-            "last_payload_hash": row[2],
-            "last_change_ts_utc": row[3],
-            "last_change_event_id": str(row[4]) if row[4] else None
-        }
+    def get_endpoint_state(self, con, ticker: str, endpoint_id: int) -> Optional[EndpointStateRow]:
+        row = con.execute(
+            """
+            SELECT last_success_event_id, last_success_ts_utc, last_payload_hash, 
+                   last_change_ts_utc, last_change_event_id 
+            FROM endpoint_state 
+            WHERE ticker=? AND endpoint_id=?
+            """, 
+            [ticker, endpoint_id]
+        ).fetchone()
+        
+        if not row: 
+            return None
+            
+        return EndpointStateRow(
+            last_success_event_id=str(row[0]) if row[0] else None,
+            last_success_ts_utc=row[1],
+            last_payload_hash=row[2],
+            last_change_ts_utc=row[3],
+            last_change_event_id=str(row[4]) if row[4] else None
+        )
 
     def upsert_endpoint_state(self, con, ticker: str, endpoint_id: int, event_id: str, res: Any, attempt_ts_utc: datetime, is_success_class: bool, changed: bool) -> None:
         con.execute("INSERT OR IGNORE INTO endpoint_state (ticker, endpoint_id) VALUES (?,?)", [ticker, endpoint_id])
@@ -195,7 +202,6 @@ class DbWriter:
                 [str(event_id), attempt_ts_utc, res.payload_hash, changed, attempt_ts_utc, changed, str(event_id), ticker, endpoint_id]
             )
 
-    # Updated Feature / Level inserts mapped directly to the unified MetaContract lists
     def insert_features(self, con, snapshot_id, features_with_meta: List[Dict[str, Any]]):
         for f in features_with_meta:
             con.execute(

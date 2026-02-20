@@ -128,7 +128,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     registry = load_api_catalog(catalog_path)
     plan_yaml = load_endpoint_plan("src/config/endpoint_plan.yaml")
     
-    # Step 4 Requirement: Fail fast if an endpoint plan exists without a Truth Model rule
     validate_plan_coverage(plan_yaml)
     
     core, market = build_plan(cfg, plan_yaml)
@@ -205,7 +204,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
                     prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
-                    prev_hash = prev_state["last_payload_hash"] if prev_state else None
+                    
+                    # Strictly using typed property from EndpointStateRow
+                    prev_hash = prev_state.last_payload_hash if prev_state else None
                     
                     event_id = db.insert_raw_event(
                         con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
@@ -257,17 +258,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         
                     events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call, sig, assessment))
 
-                # Step 1 Requirement: Building the Deterministic Effective Payload Map
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
-                    # Target only events that cleanly resolved and actually have a used_event_id
                     active_used_ids = [
                         str(res.used_event_id) for _, _, res, _, _, _ in evs 
                         if res.used_event_id and res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID)
                     ]
                     
-                    # Fetch all payloads deterministically from the database in a single query
                     payloads_from_db = db.get_payloads_by_event_ids(con, active_used_ids)
 
                     effective_payloads: Dict[int, Any] = {}
@@ -353,10 +351,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
                     )
 
-                    # Update lineage rows with actual snapshot ID (if implemented correctly upstream in writer)
                     con.execute("UPDATE snapshot_lineage SET snapshot_id = ? WHERE snapshot_id IS NULL", [str(snapshot_id)])
 
-                    # Extract features deterministically based SOLELY on the extracted payloads
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
                     db.insert_features(con, snapshot_id, features_insert_list)
