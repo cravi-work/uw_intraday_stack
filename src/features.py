@@ -1,11 +1,23 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping
 from dataclasses import dataclass
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
+from .analytics import build_gex_levels
 
 _grab_list = grab_list 
 _as_float = safe_float 
+
+class FeatureRow(TypedDict):
+    feature_key: str
+    feature_value: Optional[float]
+    meta_json: Dict[str, Any]
+
+class LevelRow(TypedDict):
+    level_type: str
+    price: Optional[float]
+    magnitude: Optional[float]
+    meta_json: Dict[str, Any]
 
 @dataclass
 class FeatureBundle:
@@ -82,7 +94,6 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         
     return FeatureBundle({"spot": close}, {"price": _build_meta(ctx, "extract_price_features", {"last_ts": ts})})
 
-
 def extract_smart_whale_pressure(
     flow_payload: Any,
     ctx: EndpointContext,
@@ -96,7 +107,6 @@ def extract_smart_whale_pressure(
 
     trades = grab_list(flow_payload)
     
-    # Strict List Container Check
     raw_list = None
     is_list_container = False
     
@@ -112,26 +122,18 @@ def extract_smart_whale_pressure(
                 break
     
     if not trades:
-        # Case 1: Not a list at all
         if not is_list_container:
             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_schema")})
-            
-        # Case 2: List exists but items are not dicts
         if raw_list and len(raw_list) > 0:
              return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "schema_non_dict_rows")})
              
-        # Case 3: Valid Empty List -> 0.0 (No Volume, safe empty state)
         meta = _build_meta(ctx, "extract_smart_whale_pressure", {"status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
-    # --- Processing ---
     whale_call = 0.0
     whale_put = 0.0
-    
-    # Counters
     valid_count = 0
     parseable_count = 0
-    
     skip_missing_fields = 0
     skip_bad_type = 0
     skip_bad_side = 0
@@ -143,7 +145,6 @@ def extract_smart_whale_pressure(
         side_raw = _find_first(t, ["side", "sentiment", "type"])
         pc_raw = _find_first(t, ["put_call", "option_type", "right"])
         
-        # 1. Integrity Check
         if prem is None or dte is None or is_na(side_raw) or is_na(pc_raw):
             skip_missing_fields += 1
             continue
@@ -163,12 +164,10 @@ def extract_smart_whale_pressure(
 
         parseable_count += 1
 
-        # 2. Logic Filters (Policy)
         if prem < min_premium or dte > max_dte:
             skip_threshold += 1
             continue
             
-        # 3. Aggregation
         valid_count += 1
         if is_bull:
             if pc == "CALL": whale_call += prem
@@ -177,7 +176,6 @@ def extract_smart_whale_pressure(
             if pc == "CALL": whale_call -= prem
             else: whale_put -= prem
 
-    # --- Final Verdict ---
     if valid_count == 0:
         if parseable_count > 0:
             meta = _build_meta(ctx, "extract_smart_whale_pressure", {
@@ -200,15 +198,9 @@ def extract_smart_whale_pressure(
 
     net = whale_call - whale_put
     meta = _build_meta(ctx, "extract_smart_whale_pressure", {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
-    
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
-
-def extract_dealer_greeks(
-    greek_payload: Any,
-    ctx: EndpointContext,
-    norm_scale: float = 1_000_000_000.0
-) -> FeatureBundle:
+def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_notional"]
     
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
@@ -229,13 +221,11 @@ def extract_dealer_greeks(
         return None
 
     meta = _build_meta(ctx, "extract_dealer_greeks", {"ts": latest.get("date"), "scale_used": norm_scale})
-    
     return FeatureBundle({
         "dealer_vanna": _normalize_signed(_sum(latest, "vanna"), scale=norm_scale),
         "dealer_charm": _normalize_signed(_sum(latest, "charm"), scale=norm_scale),
         "net_gamma_notional": _normalize_signed(_sum(latest, "gamma"), scale=norm_scale)
     }, {"greeks": meta})
-
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
@@ -264,21 +254,49 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     meta = _build_meta(ctx, "extract_gex_sign", {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
-# --- Consistent Stubs ---
-def extract_strike_flow_pressure(payload_a: Any, payload_b: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"strike_flow_imbalance": None}, {"strike_flow": _build_error_meta(ctx, "extract_strike_flow_pressure", "not_implemented")})
+# --- Central Extraction Orchestrator ---
 
-def extract_oi_shifts(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"net_oi_change": None}, {"oi": _build_error_meta(ctx, "extract_oi_shifts", "not_implemented")})
+def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, EndpointContext]) -> Tuple[List[FeatureRow], List[LevelRow]]:
+    by_path = {}
+    for eid, ctx in contexts.items():
+        key = (ctx.method.upper(), ctx.path)
+        by_path.setdefault(key, []).append((eid, effective_payloads.get(eid), ctx))
+        
+    def rank_freshness(fs: str) -> int:
+        return {"FRESH": 1, "STALE_CARRY": 2, "EMPTY_VALID": 3, "ERROR": 4}.get(fs, 5)
 
-def extract_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"term_structure_slope": None}, {"term_structure": _build_error_meta(ctx, "extract_term_structure", "not_implemented")})
+    for key in by_path:
+        by_path[key].sort(key=lambda x: (
+            rank_freshness(x[2].freshness_state),
+            x[2].stale_age_min if x[2].stale_age_min is not None else 999999,
+            x[0]
+        ))
 
-def extract_lit_vs_dp_divergence(payload_a: Any, payload_b: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"lit_vs_dp_divergence": None}, {"lit_dp": _build_error_meta(ctx, "extract_lit_vs_dp_divergence", "not_implemented")})
+    f_rows: List[FeatureRow] = []
+    l_rows: List[LevelRow] = []
 
-def extract_volatility_regime(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"iv_rank_regime": None}, {"vol": _build_error_meta(ctx, "extract_volatility_regime", "not_implemented")})
+    for (method, path), endpoints in by_path.items():
+        best_eid, payload, ctx = endpoints[0]
 
-def extract_gamma_squeeze_fuel(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
-    return FeatureBundle({"gamma_squeeze_fuel": None}, {"squeeze": _build_error_meta(ctx, "extract_gamma_squeeze_fuel", "not_implemented")})
+        if "spot-exposures" in path:
+            f_bundle = extract_gex_sign(payload, ctx)
+            for k, v in f_bundle.features.items():
+                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["gex"]})
+            
+            levels = build_gex_levels(payload)
+            # Level shape from analytics is (type, price, magnitude, details)
+            for l_type, price, mag, details in levels:
+                meta = _build_meta(ctx, "build_gex_levels", details)
+                l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+                
+        elif "flow-per-strike" in path or "flow-recent" in path:
+            f_bundle = extract_smart_whale_pressure(payload, ctx)
+            for k, v in f_bundle.features.items():
+                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["flow"]})
+                
+        elif "greek-exposure" in path:
+            f_bundle = extract_dealer_greeks(payload, ctx)
+            for k, v in f_bundle.features.items():
+                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["greeks"]})
+
+    return f_rows, l_rows

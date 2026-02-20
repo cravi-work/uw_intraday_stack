@@ -128,6 +128,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     registry = load_api_catalog(catalog_path)
     plan_yaml = load_endpoint_plan("src/config/endpoint_plan.yaml")
     
+    # Startup validation: ensures every endpoint in the plan has an explicit rule.
     validate_plan_coverage(plan_yaml)
     
     core, market = build_plan(cfg, plan_yaml)
@@ -205,7 +206,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
                     prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     
-                    # Strictly using typed property from EndpointStateRow
                     prev_hash = prev_state.last_payload_hash if prev_state else None
                     
                     event_id = db.insert_raw_event(
@@ -355,8 +355,37 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
-                    db.insert_features(con, snapshot_id, features_insert_list)
-                    db.insert_levels(con, snapshot_id, levels_insert_list)
+                    # --- Validation Gate ---
+                    valid_features = []
+                    valid_levels = []
+                    malformed_count = 0
+                    
+                    for f in features_insert_list:
+                        if (isinstance(f, dict) and "feature_key" in f and "feature_value" in f and "meta_json" in f):
+                            meta = f["meta_json"]
+                            if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
+                                valid_features.append(f)
+                                continue
+                        logger.warning(f"Malformed feature row skipped: {f}")
+                        malformed_count += 1
+
+                    for l in levels_insert_list:
+                        if (isinstance(l, dict) and "level_type" in l and "price" in l and "magnitude" in l and "meta_json" in l):
+                            meta = l["meta_json"]
+                            if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
+                                valid_levels.append(l)
+                                continue
+                        logger.warning(f"Malformed level row skipped: {l}")
+                        malformed_count += 1
+
+                    total_outputs = len(features_insert_list) + len(levels_insert_list)
+                    if total_outputs > 0 and (malformed_count / total_outputs) > 0.2:
+                        logger.error(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed (>20% threshold).")
+                        raise RuntimeError(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed.")
+                    
+                    db.insert_features(con, snapshot_id, valid_features)
+                    db.insert_levels(con, snapshot_id, valid_levels)
+                    # -----------------------
 
                     worst_freshness = _get_worst_freshness(freshness_states).name
                     max_age_min = (max(ages) // 60) if ages else None
