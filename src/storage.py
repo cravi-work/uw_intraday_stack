@@ -79,6 +79,21 @@ class DbWriter:
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
 
+    @contextlib.contextmanager
+    def writer(self):
+        """Enforces true ACID transaction guarantees. Reverts all partial inserts upon failure."""
+        con = self._connect_new()
+        con.execute("BEGIN TRANSACTION")
+        try:
+            yield con
+            con.execute("COMMIT")
+        except Exception as e:
+            con.execute("ROLLBACK")
+            logger.error(f"Transaction Rollback triggered due to: {str(e)}")
+            raise
+        finally:
+            con.close()
+
     def get_payloads_by_event_ids(self, con: duckdb.DuckDBPyConnection, event_ids: List[str]) -> Dict[str, Any]:
         if not event_ids: return {}
         placeholders = ','.join(['?'] * len(event_ids))
@@ -228,8 +243,3 @@ class DbWriter:
         con.execute("UPDATE meta_runs SET ended_at_utc=? WHERE run_id=?", [datetime.now(UTC), str(run_id)])
         
     def ro_connect(self) -> duckdb.DuckDBPyConnection: return duckdb.connect(self.duckdb_path, read_only=True)
-    @contextlib.contextmanager
-    def writer(self):
-        con = self._connect_new()
-        try: yield con
-        finally: con.close()

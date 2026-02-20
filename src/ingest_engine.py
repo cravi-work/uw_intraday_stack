@@ -376,9 +376,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         logger.warning(f"Malformed level row skipped: {l}")
                         malformed_count += 1
 
+                    # Inside _ingest_once_impl, immediately after features_insert_list validation:
+                    
                     total_outputs = len(features_insert_list) + len(levels_insert_list)
                     if total_outputs > 0 and (malformed_count / total_outputs) > 0.2:
-                        logger.error(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed (>20% threshold).")
+                        logger.error(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed (>20% threshold). Rollback enforced.")
+                        # This exception will get caught by storage.py db.writer(), which will execute "ROLLBACK"
                         raise RuntimeError(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed.")
                     
                     db.insert_features(con, snapshot_id, valid_features)

@@ -1,7 +1,10 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 from dataclasses import dataclass
 import hashlib
 import json
+import math
+
+PredictionLabel = Literal["UP", "DOWN", "FLAT"]
 
 @dataclass
 class Prediction:
@@ -15,11 +18,18 @@ class Prediction:
     model_hash: str
     meta: Dict[str, Any]
 
-def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
+def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> PredictionLabel:
     """
     Determines the discrete predicted label from continuous probabilities.
     Exact Tie Rule: FLAT > UP > DOWN.
+    Gracefully falls back to FLAT if probabilities are invalid (NaN/None).
     """
+    try:
+        if math.isnan(prob_up) or math.isnan(prob_down) or math.isnan(prob_flat):
+            return "FLAT"
+    except TypeError:
+        return "FLAT"
+
     if prob_flat >= prob_up and prob_flat >= prob_down: return "FLAT"
     if prob_up >= prob_down: return "UP"
     return "DOWN"
@@ -51,32 +61,19 @@ def bounded_additive_score(
         else:
             missing_keys.append(key)
 
-    if total_weight > 0:
-        coverage = present_weight / total_weight
-    else:
-        coverage = 0.0
-        
+    coverage = present_weight / total_weight if total_weight > 0 else 0.0
     dq_eff = min(data_quality_score, coverage)
 
-    # 1. Calculate Raw Bias
     raw_bias = score_sum / total_weight if total_weight > 0 else 0.0
-    
-    # 2. Mandatory Clamp
     raw_bias = max(-1.0, min(1.0, raw_bias))
     
-    # 3. Confidence Logic
-    if coverage < 0.4:
-        confidence = 0.0
-    else:
-        confidence = abs(raw_bias) * dq_eff
+    confidence = 0.0 if coverage < 0.4 else abs(raw_bias) * dq_eff
     confidence = max(min_confidence, min(confidence, confidence_cap))
 
-    # 4. Probability Shaping
     flat_prob = min_flat_prob + (max_flat_prob - min_flat_prob) * (1.0 - dq_eff * flat_from_data_quality_scale)
     flat_prob = min(max_flat_prob, max(min_flat_prob, flat_prob))
     remaining = 1.0 - flat_prob
     
-    # 5. Direction Logic (Strict Margin Enforcement)
     if abs(raw_bias) < (neutral_threshold + direction_margin):
         p_up = remaining / 2.0
         p_down = remaining / 2.0
@@ -87,20 +84,14 @@ def bounded_additive_score(
         p_down = remaining * (0.5 + (abs(raw_bias) / 2.0))
         p_up = remaining - p_down
 
-    # 6. Residual Patching
-    p_up = round(p_up, 4)
-    p_down = round(p_down, 4)
-    flat_prob = round(flat_prob, 4)
+    p_up, p_down, flat_prob = round(p_up, 4), round(p_down, 4), round(flat_prob, 4)
     
-    total = p_up + p_down + flat_prob
-    diff = 1.0 - total
-    
+    diff = 1.0 - (p_up + p_down + flat_prob)
     if abs(diff) > 1e-9:
         if flat_prob >= p_up and flat_prob >= p_down: flat_prob += diff
         elif p_up >= p_down: p_up += diff
         else: p_down += diff
             
-    # 7. Strong Audit Hash
     config_state = {
         "weights": weights, "neutral_threshold": neutral_threshold,
         "direction_margin": direction_margin,
@@ -111,17 +102,8 @@ def bounded_additive_score(
     model_hash = hashlib.sha256(json.dumps(config_state, sort_keys=True).encode()).hexdigest()[:16]
 
     return Prediction(
-        bias=raw_bias,
-        confidence=confidence,
-        prob_up=round(p_up, 4),
-        prob_down=round(p_down, 4),
-        prob_flat=round(flat_prob, 4),
-        model_name="phase0_additive",
-        model_version="1.0",
-        model_hash=model_hash,
-        meta={
-            "coverage": round(coverage, 2),
-            "dq_eff": round(dq_eff, 2),
-            "missing_keys": missing_keys
-        }
+        bias=raw_bias, confidence=confidence, prob_up=round(p_up, 4),
+        prob_down=round(p_down, 4), prob_flat=round(flat_prob, 4),
+        model_name="phase0_additive", model_version="1.0", model_hash=model_hash,
+        meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys}
     )
