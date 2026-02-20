@@ -353,67 +353,65 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
-                    # Validation Gate
+                    # ... [Validation Gate] ...
                     valid_features = []
                     valid_levels = []
                     malformed_count = 0
                     
                     for f in features_insert_list:
-                        if (isinstance(f, dict) and "feature_key" in f and "feature_value" in f and "meta_json" in f):
+                        if isinstance(f, dict) and "feature_key" in f and "meta_json" in f:
                             meta = f["meta_json"]
                             if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
-                                valid_features.append(f)
+                                valid_features.append(f) # Notice: We append even if feature_value is None.
                                 continue
                         logger.warning(f"Malformed feature row skipped: {f}")
                         malformed_count += 1
 
                     for l in levels_insert_list:
-                        if (isinstance(l, dict) and "level_type" in l and "price" in l and "magnitude" in l and "meta_json" in l):
+                        if isinstance(l, dict) and "level_type" in l and "meta_json" in l:
                             meta = l["meta_json"]
                             if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
-                                valid_levels.append(l)
+                                valid_levels.append(l) # Append even if price/magnitude is None.
                                 continue
                         logger.warning(f"Malformed level row skipped: {l}")
                         malformed_count += 1
 
-                    # Inside _ingest_once_impl, immediately after features_insert_list validation:
-                    
                     total_outputs = len(features_insert_list) + len(levels_insert_list)
                     if total_outputs > 0 and (malformed_count / total_outputs) > 0.2:
                         logger.error(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed (>20% threshold). Rollback enforced.")
-                        # This exception will get caught by storage.py db.writer(), which will execute "ROLLBACK"
                         raise RuntimeError(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed.")
                     
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
-                    # Model Execution
+                    # --- Prediction Execution ---
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in valid_features}
-                    start_price = feat_dict.get("spot") # Explicitly extract spot feature
+                    start_price = feat_dict.get("spot") 
 
-                    # Hardcode base weights since mock prediction is gone
-                    weights = cfg.get("validation", {}).get("model_weights", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
-                    pred = bounded_additive_score(feat_dict, dq, weights)
+                    if start_price is None:
+                        # Deterministic NA prediction fallback if dependency fails
+                        from .models import Prediction
+                        pred = Prediction(
+                            bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0, 
+                            model_name="NA", model_version="NA", model_hash="NA", 
+                            meta={"na_reason": "missing_spot_dependency"}
+                        )
+                        is_mock_flag = True
+                    else:
+                        weights = cfg.get("validation", {}).get("model_weights", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
+                        pred = bounded_additive_score(feat_dict, dq, weights)
+                        is_mock_flag = False
 
                     for h in cfg["validation"]["horizons_minutes"]:
                         db.insert_prediction(
                             con,
                             {
-                                "snapshot_id": snapshot_id, 
-                                "horizon_minutes": int(h), 
-                                "horizon_kind": "FIXED", 
-                                "horizon_seconds": None,
-                                "start_price": start_price, 
-                                "bias": pred.bias, 
-                                "confidence": pred.confidence, 
-                                "prob_up": pred.prob_up, 
-                                "prob_down": pred.prob_down, 
-                                "prob_flat": pred.prob_flat,
-                                "model_name": pred.model_name, 
-                                "model_version": pred.model_version, 
-                                "model_hash": pred.model_hash,
-                                "is_mock": False, 
-                                "meta_json": pred.meta
+                                "snapshot_id": snapshot_id, "horizon_minutes": int(h), "horizon_kind": "FIXED", 
+                                "horizon_seconds": None, "start_price": start_price, 
+                                "bias": pred.bias, "confidence": pred.confidence, 
+                                "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
+                                "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
+                                "is_mock": is_mock_flag, "meta_json": pred.meta
                             }
                         )
 
@@ -421,21 +419,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         db.insert_prediction(
                             con,
                             {
-                                "snapshot_id": snapshot_id, 
-                                "horizon_minutes": 0, 
-                                "horizon_kind": "TO_CLOSE", 
-                                "horizon_seconds": int(sec_to_close),
-                                "start_price": start_price, 
-                                "bias": pred.bias, 
-                                "confidence": pred.confidence, 
-                                "prob_up": pred.prob_up, 
-                                "prob_down": pred.prob_down, 
-                                "prob_flat": pred.prob_flat,
-                                "model_name": pred.model_name, 
-                                "model_version": pred.model_version, 
-                                "model_hash": pred.model_hash,
-                                "is_mock": False, 
-                                "meta_json": pred.meta
+                                "snapshot_id": snapshot_id, "horizon_minutes": 0, "horizon_kind": "TO_CLOSE", 
+                                "horizon_seconds": int(sec_to_close), "start_price": start_price, 
+                                "bias": pred.bias, "confidence": pred.confidence, 
+                                "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
+                                "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
+                                "is_mock": is_mock_flag, "meta_json": pred.meta
                             }
                         )
 

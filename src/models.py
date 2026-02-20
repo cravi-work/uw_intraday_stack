@@ -5,6 +5,7 @@ import json
 import math
 
 PredictionLabel = Literal["UP", "DOWN", "FLAT"]
+HorizonKind = Literal["FIXED", "TO_CLOSE"]
 
 @dataclass
 class Prediction:
@@ -30,6 +31,7 @@ def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> Predi
     except TypeError:
         return "FLAT"
 
+    # Deterministic resolution order for ties
     if prob_flat >= prob_up and prob_flat >= prob_down: return "FLAT"
     if prob_up >= prob_down: return "UP"
     return "DOWN"

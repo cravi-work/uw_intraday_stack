@@ -2,9 +2,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Literal
+from typing import Optional, Any
 import duckdb
-from .models import predicted_class
+from .models import predicted_class, HorizonKind
 
 UTC = timezone.utc
 
@@ -15,6 +15,9 @@ def _ensure_utc(dt_val: Optional[datetime]) -> Optional[datetime]:
     if dt_val is None: return None
     if dt_val.tzinfo is None: return dt_val.replace(tzinfo=UTC)
     return dt_val
+
+def _is_valid_prob(p: Any) -> bool:
+    return isinstance(p, (float, int)) and math.isfinite(p) and 0.0 <= p <= 1.0
 
 def realized_label(start_price: float, realized_price: float, flat_threshold_pct: float) -> str:
     if start_price <= 0: return "SKIPPED"
@@ -66,13 +69,18 @@ def validate_pending(
             skipped += 1
             continue
         
-        # Edge Case: Bad Probabilities must not crash, just flag & skip
-        if prob_up is None or prob_down is None or prob_flat is None or math.isnan(prob_up):
-            con.execute("UPDATE predictions SET meta_json = json_insert(meta_json, '$.validation_error', 'Invalid Probabilities') WHERE prediction_id = ?", [str(prediction_id)])
+        # STRICT VECTOR VALIDATION
+        valid_probs = _is_valid_prob(prob_up) and _is_valid_prob(prob_down) and _is_valid_prob(prob_flat)
+        if valid_probs:
+            prob_sum = float(prob_up) + float(prob_down) + float(prob_flat)
+            if not math.isclose(prob_sum, 1.0, abs_tol=1e-3):
+                valid_probs = False
+
+        if not valid_probs:
+            con.execute("UPDATE predictions SET meta_json = json_insert(meta_json, '$.validation_error', 'validation_skipped_invalid_probs') WHERE prediction_id = ?", [str(prediction_id)])
             skipped += 1
             continue
 
-        # STRICT HORIZON LOGIC
         if horizon_kind == "TO_CLOSE":
             if horizon_seconds is None: 
                 skipped += 1
@@ -92,11 +100,11 @@ def validate_pending(
         else:
             start_spot_row = con.execute("SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1", [str(snapshot_id)]).fetchone()
             if not start_spot_row or start_spot_row[0] is None:
+                con.execute("UPDATE predictions SET meta_json = json_insert(meta_json, '$.validation_error', 'missing_start_price') WHERE prediction_id = ?", [str(prediction_id)])
                 skipped += 1
                 continue
             start_spot = float(start_spot_row[0])
 
-        # ANTI-LEAKAGE: realized_asof MUST strictly be greater than prediction asof_ts_utc
         realized_snap_row = con.execute(
             """SELECT snapshot_id, asof_ts_utc FROM snapshots
                WHERE ticker = ? AND asof_ts_utc >= ? AND asof_ts_utc > ?
