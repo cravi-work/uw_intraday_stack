@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .api_catalog_loader import load_api_catalog
@@ -13,6 +13,7 @@ from .file_lock import FileLock, FileLockError
 from .scheduler import ET, UTC, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
+from .endpoint_rules import EmptyPayloadPolicy
 from .endpoint_truth import (
     EndpointPayloadClass, 
     FreshnessState, 
@@ -36,18 +37,18 @@ class PlannedCall:
 def _validate_config(cfg: Dict[str, Any]) -> None:
     req = ["ingestion", "storage", "system", "network", "validation"]
     for s in req:
-        if s not in cfg: 
+        if s not in cfg:
             raise KeyError(f"Config missing section: {s}")
             
     for k in ["duckdb_path", "cycle_lock_path", "writer_lock_path"]:
-        if k not in cfg["storage"]: 
+        if k not in cfg["storage"]:
             raise KeyError(f"Missing storage.{k}")
             
-    if "watchlist" not in cfg["ingestion"]: 
+    if "watchlist" not in cfg["ingestion"]:
         raise KeyError("Missing ingestion.watchlist")
-    if "cadence_minutes" not in cfg["ingestion"]: 
+    if "cadence_minutes" not in cfg["ingestion"]:
         raise KeyError("Missing ingestion.cadence_minutes")
-    if "horizons_minutes" not in cfg["validation"]: 
+    if "horizons_minutes" not in cfg["validation"]:
         raise KeyError("Missing validation.horizons_minutes")
 
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
@@ -78,7 +79,7 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
         return v
         
     path_params = {k: _sub(v) for k, v in call.path_params.items()}
-    if "{ticker}" in call.path: 
+    if "{ticker}" in call.path:
         path_params["ticker"] = ticker
         
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
@@ -190,7 +191,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 cfg_ver = db.insert_config(con, cfg_text)
 
                 run_notes = f"SESS={sess}"
-                if hours.reason != "NORMAL": 
+                if hours.reason != "NORMAL":
                     run_notes += f"; {hours.reason}"
                     
                 run_id = db.begin_run(
@@ -220,20 +221,37 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     if assessment.error_reason and not res.error_message:
                         res.error_message = assessment.error_reason
 
-                    is_success = (
+                    # Correctly classify empty data for updating state
+                    is_success_class = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
-                        (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy.name == "EMPTY_IS_DATA")
+                        (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA)
                     )
+                    
+                    # Update transition states correctly even for empty-but-valid transitions
                     is_changed = (assessment.changed is True)
 
                     db.upsert_endpoint_state(
                         con, tkr, endpoint_id, str(event_id), res, 
-                        attempt_ts_utc, is_success, is_changed
+                        attempt_ts_utc, is_success_class, is_changed
                     )
 
                     resolved = resolve_effective_payload(str(event_id), attempt_ts_utc, assessment, prev_state)
                     
-                    if tkr not in events_by_ticker: 
+                    # Enforce Lineage Invariants post-resolution
+                    enforced_freshness = resolved.freshness_state
+                    enforced_reason = resolved.na_reason
+                    
+                    if enforced_freshness == FreshnessState.STALE_CARRY and not resolved.used_event_id:
+                        enforced_freshness = FreshnessState.ERROR
+                        enforced_reason = "NO_PRIOR_SUCCESS"
+                        
+                    if enforced_freshness == FreshnessState.EMPTY_VALID and assessment.empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
+                        if not enforced_reason:
+                            enforced_reason = "NO_PRIOR_SUCCESS"
+                            
+                    resolved = replace(resolved, freshness_state=enforced_freshness, na_reason=enforced_reason)
+
+                    if tkr not in events_by_ticker:
                         events_by_ticker[tkr] = []
                         
                     events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call, sig))
@@ -260,23 +278,23 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     for endpoint_id, event_id, res, call, sig in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
-                        # Step 5.1: Build minimal dict required by MetaContract source_endpoints
-                        ep_info = {
+                        src_meta = {
                             "method": call.method,
                             "path": call.path,
                             "operation_id": op_id,
-                            "endpoint_id": endpoint_id
+                            "endpoint_id": endpoint_id,
+                            "signature": sig,
+                            "used_event_id": res.used_event_id
                         }
                         
-                        source_endpoints.append(ep_info)
+                        source_endpoints.append(src_meta)
                         freshness_states.append(res.freshness_state)
                         
                         if res.stale_age_seconds is not None:
                             ages.append(res.stale_age_seconds)
 
-                        # Step 5.2: Create and serialize the single endpoint MetaContract for lineage
                         lineage_meta = MetaContract(
-                            source_endpoints=[ep_info],
+                            source_endpoints=[src_meta],
                             freshness_state=res.freshness_state.name,
                             stale_age_min=(res.stale_age_seconds // 60) if res.stale_age_seconds is not None else None,
                             na_reason=res.na_reason
@@ -291,7 +309,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     worst_freshness = _get_worst_freshness(freshness_states).name
                     max_age_min = (max(ages) // 60) if ages else None
                     
-                    # Step 5.3: Create aggregated MetaContract for Predictions
                     aggregated_meta = MetaContract(
                         source_endpoints=source_endpoints,
                         freshness_state=worst_freshness,

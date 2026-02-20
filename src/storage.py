@@ -177,36 +177,31 @@ class DbWriter:
         self._migrate_additive(con)
 
     def _migrate_additive(self, con: duckdb.DuckDBPyConnection):
-        """Exhaustively verify and add missing columns to prevent crashes on existing DBs."""
         def _add(tbl, col, typ):
             cols = [r[1] for r in con.execute(f"PRAGMA table_info('{tbl}')").fetchall()]
             if col not in cols: 
                 logger.info(f"Migrating {tbl}: Adding {col} {typ}")
                 con.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
 
-        # Core Snapshot & Prediction expansions
         _add("snapshots", "is_early_close", "BOOLEAN")
         _add("snapshots", "market_close_utc", "TIMESTAMP")
         _add("snapshots", "post_end_utc", "TIMESTAMP")
         _add("snapshots", "seconds_to_close", "INTEGER")
+        
         _add("predictions", "prob_flat", "DOUBLE")
         _add("predictions", "horizon_kind", "TEXT DEFAULT 'FIXED'")
         _add("predictions", "horizon_seconds", "INTEGER")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
         _add("predictions", "meta_json", "JSON")
         
-        # Endpoint State Extensions (Ensuring backwards compatibility for missing Change Tracking)
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
-        
-        # Endpoint State Attempt Logging (Phase 0 Truth Model)
         _add("endpoint_state", "last_attempt_event_id", "UUID")
         _add("endpoint_state", "last_attempt_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_attempt_http_status", "INTEGER")
         _add("endpoint_state", "last_attempt_error_type", "TEXT")
         _add("endpoint_state", "last_attempt_error_msg", "TEXT")
         
-        # Snapshot Lineage Extensions (Phase 0 Truth Model)
         _add("snapshot_lineage", "payload_class", "TEXT")
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
@@ -385,7 +380,6 @@ class DbWriter:
             "last_change_event_id": str(row[4]) if row[4] else None
         }
 
-    # Strictly matches the requested signature
     def upsert_endpoint_state(
         self, con, ticker: str, endpoint_id: int, event_id: str, 
         res: Any, attempt_ts_utc: datetime, is_success_class: bool, changed: bool
