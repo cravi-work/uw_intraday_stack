@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Union, List
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -87,7 +87,7 @@ class UwClient:
         api_key_env: str,
         timeout_seconds: float,
         max_retries: int,
-        backoff_seconds: list[float],
+        backoff_seconds: Union[float, List[float]],
         max_concurrent_requests: int,
         rate_limit_per_second: int,
         circuit_failure_threshold: int,
@@ -99,7 +99,13 @@ class UwClient:
         self.api_key_env = api_key_env
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = int(max_retries)
-        self.backoff_seconds = [float(x) for x in backoff_seconds]
+        
+        # Robustly handle scalar or list configurations
+        if isinstance(backoff_seconds, (int, float)):
+            self.backoff_seconds = [float(backoff_seconds)]
+        else:
+            self.backoff_seconds = [float(x) for x in backoff_seconds]
+            
         self._limiter = AsyncLimiter(int(rate_limit_per_second), time_period=1.0)
         self._sem = asyncio.Semaphore(int(max_concurrent_requests))
         self._cb = CircuitBreaker(

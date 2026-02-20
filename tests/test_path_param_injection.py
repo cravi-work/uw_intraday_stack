@@ -1,10 +1,22 @@
-from src.config_loader import load_endpoint_plan, load_yaml
-from src.ingest_engine import build_plan, _expand_path_params_for_call
+from src.ingest_engine import PlannedCall, _expand
 
-def test_ticker_injected_for_paths():
-    cfg = load_yaml("src/config/config.yaml").raw
-    plan_yaml = load_endpoint_plan("src/config/endpoint_plan.yaml")
-    core, _ = build_plan(cfg, plan_yaml)
-    call = [c for c in core if "{ticker}" in c.path][0]
-    pp = _expand_path_params_for_call(call, ticker="SPY", date="2026-02-16")
-    assert pp["ticker"] == "SPY"
+def test_path_and_query_param_expansion():
+    """Asserts that both path and query parameters are dynamically injected with ticker and date."""
+    call = PlannedCall(
+        name="test_call",
+        method="GET",
+        path="/api/stock/{ticker}/test",
+        path_params={"target_date": "{date}"},
+        query_params={"start_date": "{date}", "limit": 50},
+        is_market=False
+    )
+    
+    path_params, query_params = _expand(call, "AAPL", "2025-10-31")
+    
+    # Check Path Params
+    assert path_params["ticker"] == "AAPL"
+    assert path_params["target_date"] == "2025-10-31"
+    
+    # Check Query Params
+    assert query_params["start_date"] == "2025-10-31"
+    assert query_params["limit"] == 50

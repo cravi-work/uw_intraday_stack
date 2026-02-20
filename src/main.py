@@ -6,6 +6,7 @@ import logging
 import sys
 import time
 from typing import Any
+import duckdb
 
 from .config_loader import load_yaml
 from .logging_config import configure_logging
@@ -19,10 +20,12 @@ def parse_args() -> argparse.Namespace:
 
     p_ingest = subparsers.add_parser("ingest", help="Run ingestion loop")
     p_ingest.add_argument("--catalog", default="api_catalog.generated.yaml")
+    p_ingest.add_argument("--config", default="src/config/config.yaml")
     p_ingest.add_argument("--log-level", default="INFO")
 
     p_once = subparsers.add_parser("ingest-once", help="Run single ingestion cycle")
     p_once.add_argument("--catalog", default="api_catalog.generated.yaml")
+    p_once.add_argument("--config", default="src/config/config.yaml")
     p_once.add_argument("--log-level", default="INFO")
 
     p_cap = subparsers.add_parser("capabilities", help="Check endpoint capabilities")
@@ -31,12 +34,19 @@ def parse_args() -> argparse.Namespace:
     p_cap.add_argument("--plan", default="src/config/endpoint_plan.yaml")
     p_cap.add_argument("--format", choices=["text", "json"], default="text")
     p_cap.add_argument("--log-level", default="INFO")
+    
+    p_val = subparsers.add_parser("validate", help="Run validation process over pending predictions")
+    p_val.add_argument("--config", default="src/config/config.yaml")
+    p_val.add_argument("--log-level", default="INFO")
+    
+    p_rep = subparsers.add_parser("replay", help="Replay historical snapshots")
+    p_rep.add_argument("ticker", type=str, help="Ticker to replay")
+    p_rep.add_argument("--log-level", default="INFO")
 
     return ap.parse_args()
 
 
 def run_loop(engine: Any) -> None:
-    # [Fix: Step 1] Keep scheduler imports strictly local to ingestion execution
     from .scheduler import ET, get_market_hours, floor_to_interval
 
     while True:
@@ -45,12 +55,10 @@ def run_loop(engine: Any) -> None:
         cfg_ingestion = engine.cfg["ingestion"]
         hours = get_market_hours(now_et.date(), cfg_ingestion)
 
-        # Ingest window gate evaluated locally
         if hours.is_trading_day and hours.ingest_start_et and hours.ingest_end_et:
             if hours.ingest_start_et <= now_et < hours.ingest_end_et:
                 engine.run_cycle()
 
-        # Compute next wakeup
         cadence_minutes = int(cfg_ingestion["cadence_minutes"])
         floored = floor_to_interval(now_et, cadence_minutes)
         wake = floored + dt.timedelta(minutes=cadence_minutes)
@@ -70,8 +78,6 @@ def main() -> None:
 
     if args.cmd == "capabilities":
         from .capabilities import check_capabilities, CapabilitiesError, DbOpenError, SchemaMismatchError
-        
-        # [Fix: Step 2] Handle typed capabilities exceptions internally instead of process-level exits
         try:
             check_capabilities(args.catalog, args.db, args.plan, args.format)
             sys.exit(0)
@@ -88,10 +94,32 @@ def main() -> None:
             print(f"Unexpected Runtime Error: {e}", file=sys.stderr)
             sys.exit(1)
 
+    elif args.cmd == "validate":
+        from .validator import validate_pending
+        cfg = load_yaml(args.config).raw
+        db_path = cfg["storage"]["duckdb_path"]
+        con = duckdb.connect(db_path)
+        try:
+            res = validate_pending(
+                con, 
+                now_utc=dt.datetime.now(dt.timezone.utc), 
+                flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct", 0.001),
+                tolerance_minutes=cfg.get("validation", {}).get("tolerance_minutes", 10)
+            )
+            print(f"Validation successful: {res.updated} updated, {res.skipped} skipped.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Validation Error: {e}", file=sys.stderr)
+            sys.exit(1)
+            
+    elif args.cmd == "replay":
+        from .replay_engine import run_replay
+        run_replay(args.ticker)
+        sys.exit(0)
+
     from .ingest_engine import IngestionEngine
-    
-    cfg = load_yaml("src/config/config.yaml").raw
-    engine = IngestionEngine(cfg=cfg, catalog_path=args.catalog)
+    cfg = load_yaml(getattr(args, "config", "src/config/config.yaml")).raw
+    engine = IngestionEngine(cfg=cfg, catalog_path=args.catalog, config_path=getattr(args, "config", "src/config/config.yaml"))
 
     if args.cmd == "ingest-once":
         engine.run_cycle()

@@ -15,6 +15,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
+from .models import bounded_additive_score
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -123,12 +124,11 @@ def _get_worst_freshness(states: List[FreshnessState]) -> FreshnessState:
         return min(states, key=lambda s: order[s])
     return FreshnessState.ERROR
 
-def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
+def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) -> None:
     _validate_config(cfg)
     registry = load_api_catalog(catalog_path)
     plan_yaml = load_endpoint_plan("src/config/endpoint_plan.yaml")
     
-    # Startup validation: ensures every endpoint in the plan has an explicit rule.
     validate_plan_coverage(plan_yaml)
     
     core, market = build_plan(cfg, plan_yaml)
@@ -168,7 +168,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
             api_key_env=sys_cfg.get("api_key_env", "UW_API_KEY"), 
             timeout_seconds=net.get("timeout_seconds", 10.0),
             max_retries=net.get("max_retries", 3), 
-            backoff_seconds=net.get("backoff_seconds", 1.0),
+            backoff_seconds=net.get("backoff_seconds", [1.0]),
             max_concurrent_requests=net.get("max_concurrent_requests", 20), 
             rate_limit_per_second=net.get("rate_limit_per_second", 10),
             circuit_failure_threshold=cb.get("failure_threshold", net.get("circuit_failure_threshold", 5)),
@@ -188,7 +188,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 db.ensure_schema(con)
                 db.upsert_tickers(con, tickers)
                 
-                cfg_text = open("src/config/config.yaml", "r", encoding="utf-8").read()
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg_text = f.read()
+                except FileNotFoundError:
+                    cfg_text = "{}"
+
                 cfg_ver = db.insert_config(con, cfg_text)
 
                 run_notes = f"SESS={sess}"
@@ -261,6 +266,17 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
+                    # 1. Evaluate Lineage & Quality First
+                    valid_count = sum(1 for _, _, res, _, _, asmnt in evs if res.freshness_state == FreshnessState.FRESH or (res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None) or (res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy.name == "EMPTY_IS_DATA"))
+                    dq = (valid_count / len(evs)) if evs else 0.0
+
+                    # 2. Insert Snapshot 
+                    snapshot_id = db.insert_snapshot(
+                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
+                        is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
+                        market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
+                    )
+                    
                     active_used_ids = [
                         str(res.used_event_id) for _, _, res, _, _, _ in evs 
                         if res.used_event_id and res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID)
@@ -274,8 +290,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     source_endpoints = []
                     freshness_states = []
                     ages = []
-                    valid_count = 0
                     
+                    # 3. Construct Contexts and write scoped Lineage directly
                     for endpoint_id, event_id, res, call, sig, asmnt in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
@@ -285,7 +301,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                         if res.used_event_id and f_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID):
                             eff_payload = payloads_from_db.get(str(res.used_event_id))
-                            
                             if eff_payload is None:
                                 f_state = FreshnessState.ERROR
                                 n_reason = NaReasonCode.USED_EVENT_NOT_FOUND.value if str(res.used_event_id) not in payloads_from_db else NaReasonCode.PAYLOAD_JSON_INVALID.value
@@ -305,13 +320,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                             na_reason=n_reason
                         )
                         contexts[endpoint_id] = ctx
-
-                        if f_state == FreshnessState.FRESH:
-                            valid_count += 1
-                        elif f_state == FreshnessState.STALE_CARRY and res.used_event_id is not None:
-                            valid_count += 1
-                        elif f_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy.name == "EMPTY_IS_DATA":
-                            valid_count += 1
                             
                         src_meta = {
                             "method": call.method,
@@ -338,24 +346,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         )
 
                         db.insert_lineage(
-                            con, snapshot_id=None, endpoint_id=endpoint_id, used_event_id=res.used_event_id,
+                            con, snapshot_id=snapshot_id, endpoint_id=endpoint_id, used_event_id=res.used_event_id,
                             freshness_state=f_state.name, data_age_seconds=res.stale_age_seconds,
                             payload_class=res.payload_class.name, na_reason=n_reason, meta_json=asdict(lineage_meta)
                         )
 
-                    dq = (valid_count / len(evs)) if evs else 0.0
-
-                    snapshot_id = db.insert_snapshot(
-                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
-                        is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
-                        market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
-                    )
-
-                    con.execute("UPDATE snapshot_lineage SET snapshot_id = ? WHERE snapshot_id IS NULL", [str(snapshot_id)])
-
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
-                    # --- Validation Gate ---
+                    # Validation Gate
                     valid_features = []
                     valid_levels = []
                     malformed_count = 0
@@ -385,31 +383,15 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
-                    # -----------------------
-
-                    worst_freshness = _get_worst_freshness(freshness_states).name
-                    max_age_min = (max(ages) // 60) if ages else None
                     
-                    aggregated_meta = MetaContract(
-                        source_endpoints=source_endpoints,
-                        freshness_state=worst_freshness,
-                        stale_age_min=max_age_min,
-                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY", "EMPTY_VALID") else NaReasonCode.DEPENDENCY_ERROR.value,
-                        details={}
-                    )
+                    # Model Execution
+                    feat_dict = {f["feature_key"]: f["feature_value"] for f in valid_features}
+                    start_price = feat_dict.get("spot") # Explicitly extract spot feature
 
-                    class MockPred:
-                        bias = "NEUTRAL"
-                        confidence = 0.0
-                        prob_up = 0.0
-                        prob_down = 0.0
-                        prob_flat = 1.0
-                        model_name = "mock"
-                        model_version = "1"
-                        model_hash = "abc"
+                    # Hardcode base weights since mock prediction is gone
+                    weights = cfg.get("validation", {}).get("model_weights", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
+                    pred = bounded_additive_score(feat_dict, dq, weights)
 
-                    p = MockPred()
-                    
                     for h in cfg["validation"]["horizons_minutes"]:
                         db.insert_prediction(
                             con,
@@ -418,17 +400,17 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "horizon_minutes": int(h), 
                                 "horizon_kind": "FIXED", 
                                 "horizon_seconds": None,
-                                "start_price": None, 
-                                "bias": p.bias, 
-                                "confidence": p.confidence, 
-                                "prob_up": p.prob_up, 
-                                "prob_down": p.prob_down, 
-                                "prob_flat": p.prob_flat,
-                                "model_name": p.model_name, 
-                                "model_version": p.model_version, 
-                                "model_hash": p.model_hash,
-                                "is_mock": True, 
-                                "meta_json": asdict(aggregated_meta)
+                                "start_price": start_price, 
+                                "bias": pred.bias, 
+                                "confidence": pred.confidence, 
+                                "prob_up": pred.prob_up, 
+                                "prob_down": pred.prob_down, 
+                                "prob_flat": pred.prob_flat,
+                                "model_name": pred.model_name, 
+                                "model_version": pred.model_version, 
+                                "model_hash": pred.model_hash,
+                                "is_mock": False, 
+                                "meta_json": pred.meta
                             }
                         )
 
@@ -440,17 +422,17 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                                 "horizon_minutes": 0, 
                                 "horizon_kind": "TO_CLOSE", 
                                 "horizon_seconds": int(sec_to_close),
-                                "start_price": None, 
-                                "bias": p.bias, 
-                                "confidence": p.confidence, 
-                                "prob_up": p.prob_up, 
-                                "prob_down": p.prob_down, 
-                                "prob_flat": p.prob_flat,
-                                "model_name": p.model_name, 
-                                "model_version": p.model_version, 
-                                "model_hash": p.model_hash,
-                                "is_mock": True, 
-                                "meta_json": asdict(aggregated_meta)
+                                "start_price": start_price, 
+                                "bias": pred.bias, 
+                                "confidence": pred.confidence, 
+                                "prob_up": pred.prob_up, 
+                                "prob_down": pred.prob_down, 
+                                "prob_flat": pred.prob_flat,
+                                "model_name": pred.model_name, 
+                                "model_version": pred.model_version, 
+                                "model_hash": pred.model_hash,
+                                "is_mock": False, 
+                                "meta_json": pred.meta
                             }
                         )
 
@@ -459,10 +441,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     except FileLockError:
         logger.warning("Skipping cycle: lock held")
 
+
 class IngestionEngine:
-    def __init__(self, *, cfg: Dict[str, Any], catalog_path: str):
+    def __init__(self, *, cfg: Dict[str, Any], catalog_path: str, config_path: str = "src/config/config.yaml"):
         self.cfg = cfg
         self.catalog_path = catalog_path
+        self.config_path = config_path
         
     def run_cycle(self) -> None:
-        _ingest_once_impl(self.cfg, self.catalog_path)
+        _ingest_once_impl(self.cfg, self.catalog_path, self.config_path)

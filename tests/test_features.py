@@ -19,7 +19,6 @@ def test_extract_all_na_propagation():
     
     f_rows, l_rows = extract_all(effective_payloads, contexts)
     
-    # Must yield the placeholder NA row (never 0.0)
     assert len(f_rows) > 0
     for f in f_rows:
         assert f["feature_value"] is None
@@ -42,7 +41,10 @@ def test_deterministic_sorting():
         stale_age_min=0, na_reason=None
     )
     
-    effective_payloads = {1: None, 2: []} # Valid empty list
+    # Pass a structurally valid mock payload so it doesn't fail the NA 'no_rows' discipline
+    valid_payload = [{"dealer_vanna": 100, "dealer_charm": 50, "net_gamma_notional": 200}]
+    
+    effective_payloads = {1: None, 2: valid_payload} 
     contexts = {1: ctx_stale, 2: ctx_fresh}
     
     f_rows, _ = extract_all(effective_payloads, contexts)

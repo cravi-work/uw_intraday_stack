@@ -1,48 +1,76 @@
-import json
 import duckdb
 import pandas as pd
+import json
+from typing import Optional
 from src.config_loader import load_yaml
 from src import features as feat
+from src.endpoint_truth import EndpointContext
 
-def run_replay(ticker: str):
+def run_replay(ticker: str, start_ts: Optional[str] = None, end_ts: Optional[str] = None):
     cfg = load_yaml("src/config/config.yaml").raw
     con = duckdb.connect(cfg["storage"]["duckdb_path"], read_only=True)
     
     print(f"--- REPLAYING {ticker} ---")
-    endpoints = con.execute("SELECT endpoint_id, path FROM dim_endpoints").fetchdf()
-    id_map = dict(zip(endpoints['endpoint_id'], endpoints['path']))
-
-    rows = con.execute("SELECT received_at_utc, endpoint_id, payload_json FROM raw_http_events WHERE ticker = ? ORDER BY received_at_utc ASC", [ticker.upper()]).fetchall()
     
-    cycles = {}
-    for ts, eid, p_str in rows:
-        if ts not in cycles: cycles[ts] = {}
-        path = id_map.get(eid, "")
-        # Route payloads based on URL substring
-        if "ohlc" in path: cycles[ts]["ohlc"] = json.loads(p_str)
-        if "flow-recent" in path: cycles[ts]["flow"] = json.loads(p_str)
-        if "greek-exposure" in path: cycles[ts]["greeks"] = json.loads(p_str)
-
+    # 1. Scope query optionally by timestamp
+    query = "SELECT snapshot_id, asof_ts_utc FROM snapshots WHERE ticker = ?"
+    params = [ticker.upper()]
+    
+    if start_ts:
+        query += " AND asof_ts_utc >= ?"
+        params.append(start_ts)
+    if end_ts:
+        query += " AND asof_ts_utc <= ?"
+        params.append(end_ts)
+        
+    query += " ORDER BY asof_ts_utc ASC"
+    
+    snapshots = con.execute(query, params).fetchall()
     results = []
-    for ts, payloads in cycles.items():
-        spot = feat.extract_price_features(payloads.get("ohlc")).features.get("spot")
-        whale = feat.extract_smart_whale_pressure(payloads.get("flow"))
-        vanna = feat.extract_dealer_greeks(payloads.get("greeks"))
+    
+    for snap_id, asof_ts in snapshots:
+        # 2. Fetch locked lineage for deterministic mapping
+        lineage_rows = con.execute("SELECT endpoint_id, used_event_id, freshness_state, data_age_seconds, na_reason, payload_class FROM snapshot_lineage WHERE snapshot_id = ?", [str(snap_id)]).fetchall()
+        
+        effective_payloads = {}
+        contexts = {}
+        
+        for eid, used_eid, f_state, age, na_reason, p_class in lineage_rows:
+            # 3. Resolve exact Payload used
+            if used_eid:
+                pj_row = con.execute("SELECT payload_json FROM raw_http_events WHERE event_id = ?", [str(used_eid)]).fetchone()
+                if pj_row and pj_row[0] is not None:
+                    effective_payloads[eid] = json.loads(pj_row[0]) if isinstance(pj_row[0], str) else pj_row[0]
+                else:
+                    effective_payloads[eid] = None
+            else:
+                effective_payloads[eid] = None
+                
+            # 4. Bind the correct context format expected by feature extractors
+            ep_info = con.execute("SELECT method, path, signature FROM dim_endpoints WHERE endpoint_id = ?", [eid]).fetchone()
+            if ep_info:
+                method, path, sig = ep_info
+                contexts[eid] = EndpointContext(
+                    endpoint_id=eid, method=method, path=path, operation_id=None, signature=sig,
+                    used_event_id=used_eid, payload_class=p_class, freshness_state=f_state,
+                    stale_age_min=(age // 60) if age is not None else None, na_reason=na_reason
+                )
+                
+        # 5. Extract via Orchestrator natively enforcing No Fake Zeroes policy
+        f_rows, l_rows = feat.extract_all(effective_payloads, contexts)
+        
+        feat_dict = {f["feature_key"]: f["feature_value"] for f in f_rows}
         
         results.append({
-            "Time": ts, 
-            "Spot": spot,
-            "Whale": whale.features.get("smart_whale_pressure", 0.0), 
-            "Vanna": vanna.features.get("dealer_vanna", 0.0)
+            "Time": asof_ts,
+            "Spot": feat_dict.get("spot"),
+            "Whale": feat_dict.get("smart_whale_pressure"),
+            "Vanna": feat_dict.get("dealer_vanna")
         })
 
     df = pd.DataFrame(results)
-    activity = df[(df["Whale"] != 0) | (df["Vanna"] != 0)]
-    if activity.empty:
-        print("No signals found. Check if your database contains 'flow-recent' and 'greek-exposure' payloads.")
+    if df.empty:
+        print("No snapshots found.")
     else:
-        print(activity)
-
-if __name__ == "__main__":
-    import sys
-    run_replay(sys.argv[1] if len(sys.argv) > 1 else "TSLA")
+        # Avoid displaying NA empty lines in CLI playback
+        print(df.dropna(subset=["Whale", "Vanna"], how="all"))

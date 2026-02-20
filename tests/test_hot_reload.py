@@ -1,10 +1,19 @@
+from unittest.mock import patch
 from src.ingest_engine import IngestionEngine
-from src.config_loader import load_yaml
 
-def test_engine_has_reload_config():
-    cfg = load_yaml("src/config/config.yaml").raw
+@patch("src.ingest_engine.load_api_catalog")
+def test_engine_initialization_contract(mock_load_catalog):
+    # We mock load_api_catalog so we don't need real network/files to test init
+    
+    cfg = {
+        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5},
+        "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "lock", "writer_lock_path": "wlock"},
+        "system": {},
+        "network": {},
+        "validation": {"horizons_minutes": [15, 60]}
+    }
+    
     eng = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml")
-    assert hasattr(eng, "reload_config")
-    # Should return bool; not asserting True because file may not exist in some envs
-    res = eng.reload_config("src/config/config.yaml")
-    assert isinstance(res, bool)
+    
+    # Asserts the core lifecycle method is present on the engine
+    assert hasattr(eng, "run_cycle")

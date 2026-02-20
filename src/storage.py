@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS meta_runs (run_id UUID PRIMARY KEY, started_at_utc TI
 CREATE TABLE IF NOT EXISTS snapshots (snapshot_id UUID PRIMARY KEY, run_id UUID REFERENCES meta_runs(run_id), asof_ts_utc TIMESTAMP NOT NULL, ticker TEXT NOT NULL, session_label TEXT, is_trading_day BOOLEAN, is_early_close BOOLEAN, data_quality_score DOUBLE, market_close_utc TIMESTAMP, post_end_utc TIMESTAMP, seconds_to_close INTEGER, created_at_utc TIMESTAMP DEFAULT current_timestamp, UNIQUE(ticker, asof_ts_utc));
 CREATE TABLE IF NOT EXISTS meta_config (config_version INTEGER PRIMARY KEY, config_hash TEXT NOT NULL, config_yaml TEXT NOT NULL, created_at_utc TIMESTAMP DEFAULT current_timestamp);
 CREATE TABLE IF NOT EXISTS dim_endpoints (endpoint_id INTEGER PRIMARY KEY, method TEXT, path TEXT, signature TEXT UNIQUE, params_hash TEXT, params_json JSON);
-CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias TEXT, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, meta_json JSON);
+CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias TEXT, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON);
@@ -65,6 +65,8 @@ class DbWriter:
         _add("predictions", "horizon_kind", "TEXT DEFAULT 'FIXED'")
         _add("predictions", "horizon_seconds", "INTEGER")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
+        _add("predictions", "outcome_price", "DOUBLE")
+        _add("predictions", "is_correct", "BOOLEAN")
         _add("predictions", "meta_json", "JSON")
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
@@ -145,7 +147,7 @@ class DbWriter:
         con.execute(
             """INSERT INTO raw_http_events (event_id, run_id, requested_at_utc, received_at_utc, ticker, endpoint_id, http_status, latency_ms, payload_hash, payload_json, is_retry, error_type, error_msg, circuit_state_json) 
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
-            [str(eid), str(run_id), safe_req, safe_rec, ticker, endpoint_id, status, lat, ph, json.dumps(pj) if pj else None, retry, etype, emsg, json.dumps(circ) if circ else None]
+            [str(eid), str(run_id), safe_req, safe_rec, ticker, endpoint_id, status, lat, ph, json.dumps(pj) if pj is not None else None, retry, etype, emsg, json.dumps(circ) if circ else None]
         )
         return eid
 

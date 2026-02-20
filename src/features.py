@@ -48,11 +48,8 @@ def merge_bundles(bundles: List[FeatureBundle]) -> FeatureBundle:
     return FeatureBundle(f_out, m_out)
 
 def _build_meta(ctx: EndpointContext, extractor_name: str, details: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Constructs the standardized Meta JSON schema required for downstream auditing."""
     d = {"extractor": extractor_name}
-    if details:
-        d.update(details)
-        
+    if details: d.update(details)
     return {
         "source_endpoints": [{
             "method": ctx.method,
@@ -69,13 +66,10 @@ def _build_meta(ctx: EndpointContext, extractor_name: str, details: Dict[str, An
     }
 
 def _build_error_meta(ctx: EndpointContext, extractor_name: str, na_reason: str) -> Dict[str, Any]:
-    """Overrides the metadata to explicitly indicate a deterministic failure state."""
     meta = _build_meta(ctx, extractor_name)
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
     return meta
-
-# --- Extractors ---
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
@@ -94,19 +88,11 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         
     return FeatureBundle({"spot": close}, {"price": _build_meta(ctx, "extract_price_features", {"last_ts": ts})})
 
-def extract_smart_whale_pressure(
-    flow_payload: Any,
-    ctx: EndpointContext,
-    min_premium: float = 10000.0,
-    max_dte: float = 14.0,
-    norm_scale: float = 500_000.0
-) -> FeatureBundle:
-    
+def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", ctx.na_reason or "missing_dependency_payload")})
 
     trades = grab_list(flow_payload)
-    
     raw_list = None
     is_list_container = False
     
@@ -126,7 +112,6 @@ def extract_smart_whale_pressure(
             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_schema")})
         if raw_list and len(raw_list) > 0:
              return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "schema_non_dict_rows")})
-             
         meta = _build_meta(ctx, "extract_smart_whale_pressure", {"status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
@@ -180,20 +165,14 @@ def extract_smart_whale_pressure(
         if parseable_count > 0:
             meta = _build_meta(ctx, "extract_smart_whale_pressure", {
                 "status": "filtered_zero", 
-                "n_raw_trades": len(trades), 
-                "parseable": parseable_count,
-                "skipped_threshold": skip_threshold,
-                "policy": {"min_prem": min_premium, "max_dte": max_dte}
+                "n_raw_trades": len(trades), "parseable": parseable_count,
+                "skipped_threshold": skip_threshold, "policy": {"min_prem": min_premium, "max_dte": max_dte}
             })
             return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
             
-        if skip_missing_fields > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "missing_required_fields")})
-        if skip_bad_type > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_put_call")})
-        if skip_bad_side > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_side_labels")})
-             
+        if skip_missing_fields > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "missing_required_fields")})
+        if skip_bad_type > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_put_call")})
+        if skip_bad_side > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_side_labels")})
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "no_valid_trades_unknown")})
 
     net = whale_call - whale_put
@@ -202,7 +181,6 @@ def extract_smart_whale_pressure(
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_notional"]
-    
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", ctx.na_reason or "missing_dependency_payload")})
 
@@ -211,7 +189,6 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", "no_rows")})
 
     latest = rows[-1]
-    
     def _sum(row, metric):
         t = safe_float(_find_first(row, [metric, f"total_{metric}", f"{metric}_exposure"]))
         if t is not None: return t
@@ -246,10 +223,8 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     if valid_rows == 0:
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", "missing_gamma_fields")})
     
-    if abs(tot_gamma) <= 1e-9:
-        sign = 0.0
-    else:
-        sign = 1.0 if tot_gamma > 0 else -1.0
+    if abs(tot_gamma) <= 1e-9: sign = 0.0
+    else: sign = 1.0 if tot_gamma > 0 else -1.0
         
     meta = _build_meta(ctx, "extract_gex_sign", {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
@@ -284,7 +259,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["gex"]})
             
             levels = build_gex_levels(payload)
-            # Level shape from analytics is (type, price, magnitude, details)
             for l_type, price, mag, details in levels:
                 meta = _build_meta(ctx, "build_gex_levels", details)
                 l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
@@ -298,5 +272,10 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             f_bundle = extract_dealer_greeks(payload, ctx)
             for k, v in f_bundle.features.items():
                 f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["greeks"]})
+                
+        elif "ohlc" in path:
+            f_bundle = extract_price_features(payload, ctx)
+            for k, v in f_bundle.features.items():
+                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["price"]})
 
     return f_rows, l_rows

@@ -10,8 +10,19 @@ class Prediction:
     prob_up: float
     prob_down: float
     prob_flat: float
+    model_name: str
+    model_version: str
     model_hash: str
     meta: Dict[str, Any]
+
+def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
+    """
+    Determines the discrete predicted label from continuous probabilities.
+    Exact Tie Rule: FLAT > UP > DOWN.
+    """
+    if prob_flat >= prob_up and prob_flat >= prob_down: return "FLAT"
+    if prob_up >= prob_down: return "UP"
+    return "DOWN"
 
 def bounded_additive_score(
     features: Dict[str, Optional[float]],
@@ -66,7 +77,6 @@ def bounded_additive_score(
     remaining = 1.0 - flat_prob
     
     # 5. Direction Logic (Strict Margin Enforcement)
-    # Must exceed neutral AND margin to lean
     if abs(raw_bias) < (neutral_threshold + direction_margin):
         p_up = remaining / 2.0
         p_down = remaining / 2.0
@@ -86,18 +96,13 @@ def bounded_additive_score(
     diff = 1.0 - total
     
     if abs(diff) > 1e-9:
-        if flat_prob >= p_up and flat_prob >= p_down:
-            flat_prob += diff
-        elif p_up >= p_down:
-            p_up += diff
-        else:
-            p_down += diff
+        if flat_prob >= p_up and flat_prob >= p_down: flat_prob += diff
+        elif p_up >= p_down: p_up += diff
+        else: p_down += diff
             
     # 7. Strong Audit Hash
-    # Includes all structural parameters, not just weights.
     config_state = {
-        "weights": weights,
-        "neutral_threshold": neutral_threshold,
+        "weights": weights, "neutral_threshold": neutral_threshold,
         "direction_margin": direction_margin,
         "flat_params": [min_flat_prob, max_flat_prob, flat_from_data_quality_scale],
         "conf_params": [min_confidence, confidence_cap],
@@ -111,6 +116,8 @@ def bounded_additive_score(
         prob_up=round(p_up, 4),
         prob_down=round(p_down, 4),
         prob_flat=round(flat_prob, 4),
+        model_name="phase0_additive",
+        model_version="1.0",
         model_hash=model_hash,
         meta={
             "coverage": round(coverage, 2),
