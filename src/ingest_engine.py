@@ -13,8 +13,10 @@ from .file_lock import FileLock, FileLockError
 from .scheduler import ET, UTC, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
-from .endpoint_rules import EmptyPayloadPolicy
+from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
+from .features import extract_all
 from .endpoint_truth import (
+    EndpointContext,
     EndpointPayloadClass, 
     FreshnessState, 
     MetaContract,
@@ -125,10 +127,13 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
     _validate_config(cfg)
     registry = load_api_catalog(catalog_path)
     plan_yaml = load_endpoint_plan("src/config/endpoint_plan.yaml")
+    
+    # Step 4 Requirement: Fail fast if an endpoint plan exists without a Truth Model rule
+    validate_plan_coverage(plan_yaml)
+    
     core, market = build_plan(cfg, plan_yaml)
     tickers = [t.upper() for t in cfg["ingestion"]["watchlist"]]
 
-    # Configurable stale cutoffs (with safe defaults)
     val_cfg = cfg.get("validation", {})
     fallback_max_age_seconds = int(val_cfg.get("fallback_max_age_minutes", 15)) * 60
     invalid_after_seconds = int(val_cfg.get("invalid_after_minutes", 60)) * 60
@@ -217,7 +222,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                     is_success_class = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
-                        (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA)
+                        (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy.name == "EMPTY_IS_DATA")
                     )
                     is_changed = (assessment.changed is True)
 
@@ -232,7 +237,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         invalid_after_seconds=invalid_after_seconds
                     )
                     
-                    # Post-resolution Lineage Invariants
                     enforced_freshness = resolved.freshness_state
                     enforced_reason = resolved.na_reason
 
@@ -243,7 +247,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     if enforced_reason and NaReasonCode.STALE_TOO_OLD.value in enforced_reason:
                         enforced_freshness = FreshnessState.ERROR
 
-                    # Incorporate diagnostic shape errors from assessment cleanly into lineage
                     if assessment.error_reason and not enforced_reason:
                         enforced_reason = assessment.error_reason
 
@@ -254,34 +257,64 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         
                     events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call, sig, assessment))
 
+                # Step 1 Requirement: Building the Deterministic Effective Payload Map
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
-                    valid = 0
-                    for (_, _, res, _, _, asmnt) in evs:
-                        if res.freshness_state == FreshnessState.FRESH:
-                            valid += 1
-                        elif res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None:
-                            # Strict cutoff: if it's STALE_TOO_OLD, the invariant forced it to ERROR, so it fails here.
-                            valid += 1
-                        elif res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
-                            valid += 1
+                    # Target only events that cleanly resolved and actually have a used_event_id
+                    active_used_ids = [
+                        str(res.used_event_id) for _, _, res, _, _, _ in evs 
+                        if res.used_event_id and res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID)
+                    ]
                     
-                    dq = (valid / len(evs)) if evs else 0.0
+                    # Fetch all payloads deterministically from the database in a single query
+                    payloads_from_db = db.get_payloads_by_event_ids(con, active_used_ids)
 
-                    snapshot_id = db.insert_snapshot(
-                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
-                        is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
-                        market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
-                    )
+                    effective_payloads: Dict[int, Any] = {}
+                    contexts: Dict[int, EndpointContext] = {}
 
                     source_endpoints = []
                     freshness_states = []
                     ages = []
+                    valid_count = 0
                     
                     for endpoint_id, event_id, res, call, sig, asmnt in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
+                        f_state = res.freshness_state
+                        n_reason = res.na_reason
+                        eff_payload = None
+
+                        if res.used_event_id and f_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID):
+                            eff_payload = payloads_from_db.get(str(res.used_event_id))
+                            
+                            if eff_payload is None:
+                                f_state = FreshnessState.ERROR
+                                n_reason = NaReasonCode.USED_EVENT_NOT_FOUND.value if str(res.used_event_id) not in payloads_from_db else NaReasonCode.PAYLOAD_JSON_INVALID.value
+
+                        effective_payloads[endpoint_id] = eff_payload
+                        
+                        ctx = EndpointContext(
+                            endpoint_id=endpoint_id,
+                            method=call.method,
+                            path=call.path,
+                            operation_id=op_id,
+                            signature=sig,
+                            used_event_id=res.used_event_id,
+                            payload_class=res.payload_class.name,
+                            freshness_state=f_state.value,
+                            stale_age_min=(res.stale_age_seconds // 60) if res.stale_age_seconds is not None else None,
+                            na_reason=n_reason
+                        )
+                        contexts[endpoint_id] = ctx
+
+                        if f_state == FreshnessState.FRESH:
+                            valid_count += 1
+                        elif f_state == FreshnessState.STALE_CARRY and res.used_event_id is not None:
+                            valid_count += 1
+                        elif f_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy.name == "EMPTY_IS_DATA":
+                            valid_count += 1
+                            
                         src_meta = {
                             "method": call.method,
                             "path": call.path,
@@ -293,23 +326,41 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         }
                         
                         source_endpoints.append(src_meta)
-                        freshness_states.append(res.freshness_state)
+                        freshness_states.append(f_state)
                         
                         if res.stale_age_seconds is not None:
                             ages.append(res.stale_age_seconds)
 
                         lineage_meta = MetaContract(
                             source_endpoints=[src_meta],
-                            freshness_state=res.freshness_state.name,
-                            stale_age_min=(res.stale_age_seconds // 60) if res.stale_age_seconds is not None else None,
-                            na_reason=res.na_reason
+                            freshness_state=f_state.name,
+                            stale_age_min=ctx.stale_age_min,
+                            na_reason=n_reason,
+                            details={}
                         )
 
                         db.insert_lineage(
-                            con, snapshot_id, endpoint_id, res.used_event_id,
-                            res.freshness_state.name, res.stale_age_seconds,
-                            res.payload_class.name, res.na_reason, asdict(lineage_meta)
+                            con, snapshot_id=None, endpoint_id=endpoint_id, used_event_id=res.used_event_id,
+                            freshness_state=f_state.name, data_age_seconds=res.stale_age_seconds,
+                            payload_class=res.payload_class.name, na_reason=n_reason, meta_json=asdict(lineage_meta)
                         )
+
+                    dq = (valid_count / len(evs)) if evs else 0.0
+
+                    snapshot_id = db.insert_snapshot(
+                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
+                        is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
+                        market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
+                    )
+
+                    # Update lineage rows with actual snapshot ID (if implemented correctly upstream in writer)
+                    con.execute("UPDATE snapshot_lineage SET snapshot_id = ? WHERE snapshot_id IS NULL", [str(snapshot_id)])
+
+                    # Extract features deterministically based SOLELY on the extracted payloads
+                    features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
+                    
+                    db.insert_features(con, snapshot_id, features_insert_list)
+                    db.insert_levels(con, snapshot_id, levels_insert_list)
 
                     worst_freshness = _get_worst_freshness(freshness_states).name
                     max_age_min = (max(ages) // 60) if ages else None
@@ -318,7 +369,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         source_endpoints=source_endpoints,
                         freshness_state=worst_freshness,
                         stale_age_min=max_age_min,
-                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY", "EMPTY_VALID") else NaReasonCode.DEPENDENCY_ERROR.value
+                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY", "EMPTY_VALID") else NaReasonCode.DEPENDENCY_ERROR.value,
+                        details={}
                     )
 
                     class MockPred:

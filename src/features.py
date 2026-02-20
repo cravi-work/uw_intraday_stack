@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from .na import safe_float, is_na, grab_list
+from .endpoint_truth import EndpointContext
 
 _grab_list = grab_list 
 _as_float = safe_float 
@@ -34,31 +35,64 @@ def merge_bundles(bundles: List[FeatureBundle]) -> FeatureBundle:
             m_out[ns_key] = ns_val
     return FeatureBundle(f_out, m_out)
 
+def _build_meta(ctx: EndpointContext, extractor_name: str, details: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Constructs the standardized Meta JSON schema required for downstream auditing."""
+    d = {"extractor": extractor_name}
+    if details:
+        d.update(details)
+        
+    return {
+        "source_endpoints": [{
+            "method": ctx.method,
+            "path": ctx.path,
+            "operation_id": ctx.operation_id,
+            "endpoint_id": ctx.endpoint_id,
+            "used_event_id": ctx.used_event_id,
+            "signature": ctx.signature
+        }],
+        "freshness_state": ctx.freshness_state,
+        "stale_age_min": ctx.stale_age_min,
+        "na_reason": ctx.na_reason,
+        "details": d
+    }
+
+def _build_error_meta(ctx: EndpointContext, extractor_name: str, na_reason: str) -> Dict[str, Any]:
+    """Overrides the metadata to explicitly indicate a deterministic failure state."""
+    meta = _build_meta(ctx, extractor_name)
+    meta["freshness_state"] = "ERROR"
+    meta["na_reason"] = na_reason
+    return meta
+
 # --- Extractors ---
 
-def extract_price_features(ohlc_payload: Any) -> FeatureBundle:
+def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", ctx.na_reason or "missing_dependency_payload")})
+        
     rows = grab_list(ohlc_payload)
     if not rows:
-        return FeatureBundle({"spot": None}, {"price": {"na_reason": "no_rows"}})
+        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", "no_rows")})
     
     last = rows[-1]
     close = safe_float(_find_first(last, ["close", "c", "price"]))
     ts = _find_first(last, ["t", "ts", "date"])
     
     if close is None:
-        return FeatureBundle({"spot": None}, {"price": {"na_reason": "missing_close_field"}})
+        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", "missing_close_field")})
         
-    return FeatureBundle({"spot": close}, {"price": {"last_ts": ts}})
+    return FeatureBundle({"spot": close}, {"price": _build_meta(ctx, "extract_price_features", {"last_ts": ts})})
+
 
 def extract_smart_whale_pressure(
     flow_payload: Any,
+    ctx: EndpointContext,
     min_premium: float = 10000.0,
     max_dte: float = 14.0,
     norm_scale: float = 500_000.0
 ) -> FeatureBundle:
     
-    if is_na(flow_payload):
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "missing_payload"}})
+    if is_na(flow_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", ctx.na_reason or "missing_dependency_payload")})
 
     trades = grab_list(flow_payload)
     
@@ -80,14 +114,15 @@ def extract_smart_whale_pressure(
     if not trades:
         # Case 1: Not a list at all
         if not is_list_container:
-            return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "unrecognized_schema"}})
+            return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_schema")})
             
         # Case 2: List exists but items are not dicts
         if raw_list and len(raw_list) > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "schema_non_dict_rows"}})
+             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "schema_non_dict_rows")})
              
-        # Case 3: Valid Empty List -> 0.0 (No Volume)
-        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": {"status": "no_volume", "n_trades": 0}})
+        # Case 3: Valid Empty List -> 0.0 (No Volume, safe empty state)
+        meta = _build_meta(ctx, "extract_smart_whale_pressure", {"status": "computed_zero_from_empty_valid", "n_trades": 0})
+        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
     # --- Processing ---
     whale_call = 0.0
@@ -95,7 +130,7 @@ def extract_smart_whale_pressure(
     
     # Counters
     valid_count = 0
-    parseable_count = 0 # NEW: Tracks trades that *could* be processed (even if filtered)
+    parseable_count = 0
     
     skip_missing_fields = 0
     skip_bad_type = 0
@@ -126,7 +161,6 @@ def extract_smart_whale_pressure(
             skip_bad_side += 1 
             continue
 
-        # If we got here, the row is PARSEABLE (schema matched).
         parseable_count += 1
 
         # 2. Logic Filters (Policy)
@@ -145,46 +179,44 @@ def extract_smart_whale_pressure(
 
     # --- Final Verdict ---
     if valid_count == 0:
-        # FIX: If we successfully parsed trades but they were all too small, return 0.0.
-        # This takes precedence over schema warnings like "skipped_bad_side".
         if parseable_count > 0:
-            return FeatureBundle(
-                {"smart_whale_pressure": 0.0}, 
-                {"flow": {
-                    "status": "filtered_zero", 
-                    "n_raw_trades": len(trades), 
-                    "parseable": parseable_count,
-                    "skipped_threshold": skip_threshold,
-                    "policy": {"min_prem": min_premium, "max_dte": max_dte}
-                }}
-            )
+            meta = _build_meta(ctx, "extract_smart_whale_pressure", {
+                "status": "filtered_zero", 
+                "n_raw_trades": len(trades), 
+                "parseable": parseable_count,
+                "skipped_threshold": skip_threshold,
+                "policy": {"min_prem": min_premium, "max_dte": max_dte}
+            })
+            return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
             
-        # If parseable_count == 0, it means the payload was technically a list of dicts,
-        # but completely garbage data (missing fields, bad types, etc.).
         if skip_missing_fields > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "missing_required_fields", "count": skip_missing_fields}})
+             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "missing_required_fields")})
         if skip_bad_type > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "unrecognized_put_call", "count": skip_bad_type}})
+             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_put_call")})
         if skip_bad_side > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "unrecognized_side_labels", "count": skip_bad_side}})
+             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_side_labels")})
              
-        # Fallback (should be unreachable given checks above)
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": {"na_reason": "no_valid_trades_unknown"}})
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "no_valid_trades_unknown")})
 
     net = whale_call - whale_put
-    return FeatureBundle(
-        {"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, 
-        {"flow": {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)}}
-    )
+    meta = _build_meta(ctx, "extract_smart_whale_pressure", {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
+    
+    return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
+
 
 def extract_dealer_greeks(
     greek_payload: Any,
+    ctx: EndpointContext,
     norm_scale: float = 1_000_000_000.0
 ) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_notional"]
+    
+    if is_na(greek_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", ctx.na_reason or "missing_dependency_payload")})
+
     rows = grab_list(greek_payload)
     if not rows:
-        return FeatureBundle({k: None for k in keys}, {"greeks": {"na_reason": "no_rows"}})
+        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", "no_rows")})
 
     latest = rows[-1]
     
@@ -196,16 +228,22 @@ def extract_dealer_greeks(
         if c is not None and p is not None: return c + p
         return None
 
+    meta = _build_meta(ctx, "extract_dealer_greeks", {"ts": latest.get("date"), "scale_used": norm_scale})
+    
     return FeatureBundle({
         "dealer_vanna": _normalize_signed(_sum(latest, "vanna"), scale=norm_scale),
         "dealer_charm": _normalize_signed(_sum(latest, "charm"), scale=norm_scale),
         "net_gamma_notional": _normalize_signed(_sum(latest, "gamma"), scale=norm_scale)
-    }, {"greeks": {"ts": latest.get("date"), "scale_used": norm_scale}})
+    }, {"greeks": meta})
 
-def extract_gex_sign(spot_exposures_payload: Any) -> FeatureBundle:
+
+def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", ctx.na_reason or "missing_dependency_payload")})
+
     rows = grab_list(spot_exposures_payload)
     if not rows:
-        return FeatureBundle({"net_gex_sign": None}, {"gex": {"na_reason": "no_rows"}})
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", "no_rows")})
     
     tot_gamma = 0.0
     valid_rows = 0
@@ -216,19 +254,31 @@ def extract_gex_sign(spot_exposures_payload: Any) -> FeatureBundle:
             valid_rows += 1
             
     if valid_rows == 0:
-        return FeatureBundle({"net_gex_sign": None}, {"gex": {"na_reason": "missing_gamma_fields"}})
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", "missing_gamma_fields")})
     
     if abs(tot_gamma) <= 1e-9:
         sign = 0.0
     else:
         sign = 1.0 if tot_gamma > 0 else -1.0
         
-    return FeatureBundle({"net_gex_sign": sign}, {"gex": {"total": tot_gamma, "n_strikes": valid_rows}})
+    meta = _build_meta(ctx, "extract_gex_sign", {"total": tot_gamma, "n_strikes": valid_rows})
+    return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
 # --- Consistent Stubs ---
-def extract_strike_flow_pressure(a, b): return FeatureBundle({"strike_flow_imbalance": None}, {"strike_flow": {"na_reason": "not_implemented"}})
-def extract_oi_shifts(a): return FeatureBundle({"net_oi_change": None}, {"oi": {"na_reason": "not_implemented"}})
-def extract_term_structure(a): return FeatureBundle({"term_structure_slope": None}, {"term_structure": {"na_reason": "not_implemented"}})
-def extract_lit_vs_dp_divergence(a, b): return FeatureBundle({"lit_vs_dp_divergence": None}, {"lit_dp": {"na_reason": "not_implemented"}})
-def extract_volatility_regime(a): return FeatureBundle({"iv_rank_regime": None}, {"vol": {"na_reason": "not_implemented"}})
-def extract_gamma_squeeze_fuel(a): return FeatureBundle({"gamma_squeeze_fuel": None}, {"squeeze": {"na_reason": "not_implemented"}})
+def extract_strike_flow_pressure(payload_a: Any, payload_b: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"strike_flow_imbalance": None}, {"strike_flow": _build_error_meta(ctx, "extract_strike_flow_pressure", "not_implemented")})
+
+def extract_oi_shifts(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"net_oi_change": None}, {"oi": _build_error_meta(ctx, "extract_oi_shifts", "not_implemented")})
+
+def extract_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"term_structure_slope": None}, {"term_structure": _build_error_meta(ctx, "extract_term_structure", "not_implemented")})
+
+def extract_lit_vs_dp_divergence(payload_a: Any, payload_b: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"lit_vs_dp_divergence": None}, {"lit_dp": _build_error_meta(ctx, "extract_lit_vs_dp_divergence", "not_implemented")})
+
+def extract_volatility_regime(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"iv_rank_regime": None}, {"vol": _build_error_meta(ctx, "extract_volatility_regime", "not_implemented")})
+
+def extract_gamma_squeeze_fuel(payload: Any, ctx: EndpointContext) -> FeatureBundle: 
+    return FeatureBundle({"gamma_squeeze_fuel": None}, {"squeeze": _build_error_meta(ctx, "extract_gamma_squeeze_fuel", "not_implemented")})
