@@ -213,14 +213,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                     attempt_ts_utc = to_utc_dt(
                         res.received_at_utc, 
-                        fallback=to_utc_dt(res.requested_at_utc, fallback=asof_utc)
+                        fallback=to_utc_dt(res.requested_at_utc, fallback=dt.datetime.now(UTC))
                     )
                     
                     assessment = classify_payload(res, prev_hash, call.method, call.path, sess)
                     if assessment.error_reason and not res.error_message:
                         res.error_message = assessment.error_reason
 
-                    is_success_class = (
+                    is_success = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
                         (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy.name == "EMPTY_IS_DATA")
                     )
@@ -228,7 +228,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                     db.upsert_endpoint_state(
                         con, tkr, endpoint_id, str(event_id), res, 
-                        attempt_ts_utc, is_success_class, is_changed
+                        attempt_ts_utc, is_success, is_changed
                     )
 
                     resolved = resolve_effective_payload(str(event_id), attempt_ts_utc, assessment, prev_state)
@@ -241,7 +241,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
-                    # DQ treats truthful Empty payloads as valid data freshness
                     valid = sum(
                         1 for (_, _, res, _, _) in evs 
                         if res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID)
@@ -261,30 +260,38 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     for endpoint_id, event_id, res, call, sig in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
-                        src_meta = {
+                        # Step 5.1: Build minimal dict required by MetaContract source_endpoints
+                        ep_info = {
                             "method": call.method,
                             "path": call.path,
                             "operation_id": op_id,
-                            "endpoint_id": endpoint_id,
-                            "signature": sig,
-                            "used_event_id": res.used_event_id
+                            "endpoint_id": endpoint_id
                         }
                         
-                        source_endpoints.append(src_meta)
+                        source_endpoints.append(ep_info)
                         freshness_states.append(res.freshness_state)
                         
                         if res.stale_age_seconds is not None:
                             ages.append(res.stale_age_seconds)
 
+                        # Step 5.2: Create and serialize the single endpoint MetaContract for lineage
+                        lineage_meta = MetaContract(
+                            source_endpoints=[ep_info],
+                            freshness_state=res.freshness_state.name,
+                            stale_age_min=(res.stale_age_seconds // 60) if res.stale_age_seconds is not None else None,
+                            na_reason=res.na_reason
+                        )
+
                         db.insert_lineage(
                             con, snapshot_id, endpoint_id, res.used_event_id,
                             res.freshness_state.name, res.stale_age_seconds,
-                            res.payload_class.name, res.na_reason, src_meta
+                            res.payload_class.name, res.na_reason, asdict(lineage_meta)
                         )
 
                     worst_freshness = _get_worst_freshness(freshness_states).name
                     max_age_min = (max(ages) // 60) if ages else None
                     
+                    # Step 5.3: Create aggregated MetaContract for Predictions
                     aggregated_meta = MetaContract(
                         source_endpoints=source_endpoints,
                         freshness_state=worst_freshness,

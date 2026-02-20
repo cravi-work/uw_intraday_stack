@@ -54,8 +54,18 @@ def to_utc_dt(x: Any, *, fallback: datetime.datetime) -> datetime.datetime:
     return fallback
 
 def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str, session_label: str) -> PayloadAssessment:
+    """
+    Evaluates the raw HTTP result and deterministically classifies it into an actionable
+    PayloadAssessment, resolving empty/stale/error semantics cleanly.
+    """
     if not getattr(res, "ok", False) or getattr(res, "payload_json", None) is None:
-        return PayloadAssessment(EndpointPayloadClass.ERROR, EmptyPayloadPolicy.EMPTY_INVALID, False, None, getattr(res, "error_message", "HTTP Error or Missing JSON"))
+        return PayloadAssessment(
+            payload_class=EndpointPayloadClass.ERROR, 
+            empty_policy=EmptyPayloadPolicy.EMPTY_INVALID, 
+            is_empty=False, 
+            changed=None, 
+            error_reason=getattr(res, "error_message", "HTTP Error or Missing JSON")
+        )
 
     pj = res.payload_json
     is_empty = False
@@ -69,48 +79,118 @@ def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str,
 
     policy = get_empty_policy(method, path, session_label)
 
+    # Evaluate empty payloads strictly against the session-aware policy
     if is_empty:
-        if policy != EmptyPayloadPolicy.EMPTY_INVALID:
+        if policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
             return PayloadAssessment(EndpointPayloadClass.SUCCESS_EMPTY_VALID, policy, True, False, None)
-        return PayloadAssessment(EndpointPayloadClass.ERROR, policy, True, None, "EMPTY_UNEXPECTED")
+        elif policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
+            return PayloadAssessment(EndpointPayloadClass.SUCCESS_EMPTY_VALID, policy, True, False, "EMPTY_MEANS_STALE")
+        else: # policy == EMPTY_INVALID
+            return PayloadAssessment(EndpointPayloadClass.ERROR, policy, True, None, "EMPTY_UNEXPECTED")
 
+    # "Stale" detection remains safely hash-based for non-empty payloads
     changed = (res.payload_hash != prev_hash)
     pclass = EndpointPayloadClass.SUCCESS_HAS_DATA if changed else EndpointPayloadClass.SUCCESS_STALE
-    return PayloadAssessment(pclass, policy, False, changed, None)
+    
+    return PayloadAssessment(
+        payload_class=pclass, 
+        empty_policy=policy, 
+        is_empty=False, 
+        changed=changed, 
+        error_reason=None
+    )
 
 def resolve_effective_payload(
     current_event_id: str, 
-    current_ts: datetime.datetime, 
+    current_ts_raw: Any, 
     assessment: PayloadAssessment, 
     prev_state: Optional[Dict[str, Any]]
 ) -> ResolvedLineage:
-    
+    """
+    Resolves the "Effective Payload" (whether to use the current event or carry-forward an older one)
+    based on the explicit emptiness rules and strict UTC-aware timestamp arithmetic.
+    """
+    current_ts = to_utc_dt(current_ts_raw, fallback=datetime.datetime.now(datetime.timezone.utc))
     pclass = assessment.payload_class
+    empty_policy = assessment.empty_policy
 
+    # Rule 1: Good fresh data -> use it.
     if pclass == EndpointPayloadClass.SUCCESS_HAS_DATA:
-        return ResolvedLineage(current_event_id, FreshnessState.FRESH, 0, pclass, None)
+        return ResolvedLineage(
+            used_event_id=current_event_id, 
+            freshness_state=FreshnessState.FRESH, 
+            stale_age_seconds=0, 
+            payload_class=pclass, 
+            na_reason=None
+        )
     
+    # Rule 2: Unchanged non-empty data -> carry forward the last change ID.
     if pclass == EndpointPayloadClass.SUCCESS_STALE:
         used_id = prev_state["last_change_event_id"] if prev_state and prev_state.get("last_change_event_id") else current_event_id
         prev_change_ts = to_utc_dt(prev_state.get("last_change_ts_utc"), fallback=current_ts) if prev_state else current_ts
         age = max(0, int((current_ts - prev_change_ts).total_seconds()))
-        return ResolvedLineage(used_id, FreshnessState.STALE_CARRY, age, pclass, None)
+        return ResolvedLineage(
+            used_event_id=used_id, 
+            freshness_state=FreshnessState.STALE_CARRY, 
+            stale_age_seconds=age, 
+            payload_class=pclass, 
+            na_reason=None
+        )
 
+    # Rule 3 & 4: Empty Valid rules
     if pclass == EndpointPayloadClass.SUCCESS_EMPTY_VALID:
-        if assessment.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
-            return ResolvedLineage(current_event_id, FreshnessState.EMPTY_VALID, 0, pclass, None)
-        elif assessment.empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
+        
+        # Rule 3: Empty is Truthful Data (e.g. Alerts/Tape) -> use current event
+        if empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
+            return ResolvedLineage(
+                used_event_id=current_event_id, 
+                freshness_state=FreshnessState.EMPTY_VALID, 
+                stale_age_seconds=0, 
+                payload_class=pclass, 
+                na_reason=None
+            )
+            
+        # Rule 4: Empty Means Stale (e.g. Premarket Options) -> Carry-forward last success
+        elif empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
             if prev_state and prev_state.get("last_success_event_id"):
                 prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
                 age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-                return ResolvedLineage(prev_state["last_success_event_id"], FreshnessState.STALE_CARRY, age, pclass, f"CARRY_FORWARD_{pclass.name}")
+                return ResolvedLineage(
+                    used_event_id=prev_state["last_success_event_id"], 
+                    freshness_state=FreshnessState.STALE_CARRY, 
+                    stale_age_seconds=age, 
+                    payload_class=pclass, 
+                    na_reason="CARRY_FORWARD_EMPTY_MEANS_STALE"
+                )
             else:
-                return ResolvedLineage(None, FreshnessState.EMPTY_VALID, None, pclass, "NO_PRIOR_SUCCESS")
+                return ResolvedLineage(
+                    used_event_id=None, 
+                    freshness_state=FreshnessState.EMPTY_VALID, 
+                    stale_age_seconds=None, 
+                    payload_class=pclass, 
+                    na_reason="EMPTY_MEANS_STALE_NO_PRIOR"
+                )
 
-    # ERROR
-    if prev_state and prev_state.get("last_success_event_id"):
-        prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
-        age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-        return ResolvedLineage(prev_state["last_success_event_id"], FreshnessState.STALE_CARRY, age, pclass, "CARRY_FORWARD_ERROR")
-    
-    return ResolvedLineage(None, FreshnessState.ERROR, None, pclass, "NO_PRIOR_SUCCESS")
+    # Rule 5: ERROR conditions -> Attempt carry-forward
+    if pclass == EndpointPayloadClass.ERROR:
+        if prev_state and prev_state.get("last_success_event_id"):
+            prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
+            age = max(0, int((current_ts - prev_success_ts).total_seconds()))
+            return ResolvedLineage(
+                used_event_id=prev_state["last_success_event_id"], 
+                freshness_state=FreshnessState.STALE_CARRY, 
+                stale_age_seconds=age, 
+                payload_class=pclass, 
+                na_reason="CARRY_FORWARD_ERROR"
+            )
+        else:
+            return ResolvedLineage(
+                used_event_id=None, 
+                freshness_state=FreshnessState.ERROR, 
+                stale_age_seconds=None, 
+                payload_class=pclass, 
+                na_reason="NO_PRIOR_SUCCESS"
+            )
+            
+    # Fallback (Should never be hit, but safe default)
+    return ResolvedLineage(None, FreshnessState.ERROR, None, pclass, "UNRESOLVED")

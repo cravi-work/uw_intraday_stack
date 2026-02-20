@@ -2,15 +2,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import os
-import uuid
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 import duckdb
 
 from .api_catalog_loader import EndpointRegistry
-from .time_utils import to_utc_dt
+from .endpoint_truth import to_utc_dt
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -178,12 +177,14 @@ class DbWriter:
         self._migrate_additive(con)
 
     def _migrate_additive(self, con: duckdb.DuckDBPyConnection):
+        """Exhaustively verify and add missing columns to prevent crashes on existing DBs."""
         def _add(tbl, col, typ):
             cols = [r[1] for r in con.execute(f"PRAGMA table_info('{tbl}')").fetchall()]
             if col not in cols: 
                 logger.info(f"Migrating {tbl}: Adding {col} {typ}")
                 con.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
 
+        # Core Snapshot & Prediction expansions
         _add("snapshots", "is_early_close", "BOOLEAN")
         _add("snapshots", "market_close_utc", "TIMESTAMP")
         _add("snapshots", "post_end_utc", "TIMESTAMP")
@@ -192,15 +193,23 @@ class DbWriter:
         _add("predictions", "horizon_kind", "TEXT DEFAULT 'FIXED'")
         _add("predictions", "horizon_seconds", "INTEGER")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
+        _add("predictions", "meta_json", "JSON")
+        
+        # Endpoint State Extensions (Ensuring backwards compatibility for missing Change Tracking)
+        _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
+        _add("endpoint_state", "last_change_event_id", "UUID")
+        
+        # Endpoint State Attempt Logging (Phase 0 Truth Model)
         _add("endpoint_state", "last_attempt_event_id", "UUID")
         _add("endpoint_state", "last_attempt_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_attempt_http_status", "INTEGER")
         _add("endpoint_state", "last_attempt_error_type", "TEXT")
         _add("endpoint_state", "last_attempt_error_msg", "TEXT")
+        
+        # Snapshot Lineage Extensions (Phase 0 Truth Model)
         _add("snapshot_lineage", "payload_class", "TEXT")
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
-        _add("predictions", "meta_json", "JSON")
 
     def insert_snapshot(
         self, 
@@ -376,7 +385,11 @@ class DbWriter:
             "last_change_event_id": str(row[4]) if row[4] else None
         }
 
-    def upsert_endpoint_state(self, con, ticker: str, endpoint_id: int, event_id: str, res: Any, attempt_ts_utc: datetime, is_success_class: bool, changed: bool):
+    # Strictly matches the requested signature
+    def upsert_endpoint_state(
+        self, con, ticker: str, endpoint_id: int, event_id: str, 
+        res: Any, attempt_ts_utc: datetime, is_success_class: bool, changed: bool
+    ) -> None:
         con.execute(
             "INSERT OR IGNORE INTO endpoint_state (ticker, endpoint_id) VALUES (?,?)", 
             [ticker, endpoint_id]
@@ -427,7 +440,10 @@ class DbWriter:
             [[str(snapshot_id), l["level_type"], l["price"], l["magnitude"], json.dumps(l.get("meta", {}))] for l in levels]
         )
         
-    def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json):
+    def insert_lineage(
+        self, con, snapshot_id, endpoint_id, used_event_id, 
+        freshness_state, data_age_seconds, payload_class, na_reason, meta_json
+    ):
         con.execute(
             """
             INSERT INTO snapshot_lineage (
