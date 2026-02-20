@@ -18,12 +18,32 @@ ALWAYS_EMPTY_IS_DATA_PATHS = {
     "/api/lit-flow/{ticker}"
 }
 
-# Endpoints where empty is data in REG, but means STALE in PRE/AFT/CLOSED (Options feeds)
+# Endpoints where empty is data in REG, but means STALE in PRE/AFT/CLOSED (Options volume feeds)
 SESSION_AWARE_FLOW_PATHS = {
     "/api/stock/{ticker}/flow-per-strike",
     "/api/stock/{ticker}/flow-per-strike-intraday",
     "/api/stock/{ticker}/flow-recent",
     "/api/stock/{ticker}/net-prem-ticks"
+}
+
+# Structural Options endpoints: should NEVER be empty in REG (Error), but are STALE in PRE/AFT
+SESSION_AWARE_OPTIONS_PATHS = {
+    "/api/stock/{ticker}/oi-per-strike",
+    "/api/stock/{ticker}/oi-change",
+    "/api/stock/{ticker}/option/volume-oi-expiry",
+    "/api/stock/{ticker}/option-chains",
+    "/api/stock/{ticker}/option-contracts",
+    "/api/stock/{ticker}/volatility/term-structure",
+    "/api/stock/{ticker}/interpolated-iv",
+    "/api/stock/{ticker}/iv-rank",
+    "/api/stock/{ticker}/historical-risk-reversal-skew",
+    "/api/stock/{ticker}/greek-exposure",
+    "/api/stock/{ticker}/greek-exposure/strike",
+    "/api/stock/{ticker}/greek-exposure/expiry",
+    "/api/stock/{ticker}/spot-exposures",
+    "/api/stock/{ticker}/spot-exposures/strike",
+    "/api/stock/{ticker}/spot-exposures/expiry-strike",
+    "/api/stock/{ticker}/max-pain"
 }
 
 def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayloadPolicy:
@@ -41,6 +61,12 @@ def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayload
         if session_label in ("PRE", "AFT", "CLOSED"):
             return EmptyPayloadPolicy.EMPTY_MEANS_STALE
         return EmptyPayloadPolicy.EMPTY_IS_DATA
+
+    if path in SESSION_AWARE_OPTIONS_PATHS:
+        if session_label in ("PRE", "AFT", "CLOSED"):
+            return EmptyPayloadPolicy.EMPTY_MEANS_STALE
+        # During REG, these structural endpoints must fail-closed if empty
+        return EmptyPayloadPolicy.EMPTY_INVALID
 
     # Fail closed: If not explicitly handled, an empty payload is an error.
     return EmptyPayloadPolicy.EMPTY_INVALID

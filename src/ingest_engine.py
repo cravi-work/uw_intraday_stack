@@ -17,7 +17,9 @@ from .endpoint_rules import EmptyPayloadPolicy
 from .endpoint_truth import (
     EndpointPayloadClass, 
     FreshnessState, 
-    MetaContract, 
+    MetaContract,
+    NaReasonCode,
+    PayloadAssessment,
     classify_payload, 
     resolve_effective_payload, 
     to_utc_dt
@@ -66,10 +68,8 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
         
     core = _parse(plan_yaml.get("plans", {}).get("default", []))
     market = []
-    
     if cfg["ingestion"].get("enable_market_context"):
         market = _parse(plan_yaml.get("plans", {}).get("market_context", []), True)
-        
     return core, market
 
 def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -77,13 +77,10 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
         if isinstance(v, str):
             return v.replace("{ticker}", ticker).replace("{date}", date_str)
         return v
-        
     path_params = {k: _sub(v) for k, v in call.path_params.items()}
     if "{ticker}" in call.path:
         path_params["ticker"] = ticker
-        
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
-    
     return path_params, query_params
 
 async def fetch_all(
@@ -107,7 +104,6 @@ async def fetch_all(
         for c in core:
             pp, qp = _expand(c, tkr, date_str)
             tasks.append(_one(tkr, c, pp, qp))
-            
     for c in market:
         pp, qp = _expand(c, "", date_str)
         tasks.append(_one("__MARKET__", c, pp, qp))
@@ -170,12 +166,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
             circuit_half_open_max_calls=cb.get("half_open_max_calls", net.get("circuit_half_open_max_calls", 3))
         ) as client:
             return await fetch_all(
-                client, 
-                tickers, 
-                asof_et.date().isoformat(), 
-                core, 
-                market, 
-                max_concurrency=net.get("max_concurrency", 20)
+                client, tickers, asof_et.date().isoformat(), core, market, max_concurrency=net.get("max_concurrency", 20)
             )
 
     fetch_results = asyncio.run(_run_fetch())
@@ -199,7 +190,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     hours.is_early_close, cfg_ver, registry.catalog_hash, notes=run_notes
                 )
 
-                events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any, PlannedCall, str]]] = {t: [] for t in tickers}
+                events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any, PlannedCall, str, PayloadAssessment]]] = {t: [] for t in tickers}
 
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
@@ -221,13 +212,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     if assessment.error_reason and not res.error_message:
                         res.error_message = assessment.error_reason
 
-                    # Correctly classify empty data for updating state
                     is_success_class = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
                         (assessment.payload_class == EndpointPayloadClass.SUCCESS_EMPTY_VALID and assessment.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA)
                     )
-                    
-                    # Update transition states correctly even for empty-but-valid transitions
                     is_changed = (assessment.changed is True)
 
                     db.upsert_endpoint_state(
@@ -237,32 +225,37 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
 
                     resolved = resolve_effective_payload(str(event_id), attempt_ts_utc, assessment, prev_state)
                     
-                    # Enforce Lineage Invariants post-resolution
+                    # Double-lock lineage invariants (in case resolver missed something)
                     enforced_freshness = resolved.freshness_state
                     enforced_reason = resolved.na_reason
-                    
+
                     if enforced_freshness == FreshnessState.STALE_CARRY and not resolved.used_event_id:
                         enforced_freshness = FreshnessState.ERROR
-                        enforced_reason = "NO_PRIOR_SUCCESS"
-                        
-                    if enforced_freshness == FreshnessState.EMPTY_VALID and assessment.empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
-                        if not enforced_reason:
-                            enforced_reason = "NO_PRIOR_SUCCESS"
-                            
+                        enforced_reason = NaReasonCode.NO_PRIOR_SUCCESS.value
+
+                    if assessment.empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE and enforced_freshness == FreshnessState.EMPTY_VALID:
+                        enforced_freshness = FreshnessState.ERROR
+                        enforced_reason = NaReasonCode.NO_PRIOR_SUCCESS.value
+
                     resolved = replace(resolved, freshness_state=enforced_freshness, na_reason=enforced_reason)
 
                     if tkr not in events_by_ticker:
                         events_by_ticker[tkr] = []
                         
-                    events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call, sig))
+                    events_by_ticker[tkr].append((endpoint_id, event_id, resolved, call, sig, assessment))
 
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
-                    valid = sum(
-                        1 for (_, _, res, _, _) in evs 
-                        if res.freshness_state in (FreshnessState.FRESH, FreshnessState.STALE_CARRY, FreshnessState.EMPTY_VALID)
-                    )
+                    valid = 0
+                    for (_, _, res, _, _, asmnt) in evs:
+                        if res.freshness_state == FreshnessState.FRESH:
+                            valid += 1
+                        elif res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None:
+                            valid += 1
+                        elif res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
+                            valid += 1
+                    
                     dq = (valid / len(evs)) if evs else 0.0
 
                     snapshot_id = db.insert_snapshot(
@@ -275,7 +268,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                     freshness_states = []
                     ages = []
                     
-                    for endpoint_id, event_id, res, call, sig in evs:
+                    for endpoint_id, event_id, res, call, sig, asmnt in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
                         src_meta = {
@@ -313,7 +306,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str) -> None:
                         source_endpoints=source_endpoints,
                         freshness_state=worst_freshness,
                         stale_age_min=max_age_min,
-                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY", "EMPTY_VALID") else "DEPENDENCY_ERROR"
+                        na_reason=None if worst_freshness in ("FRESH", "STALE_CARRY", "EMPTY_VALID") else NaReasonCode.DEPENDENCY_ERROR.value
                     )
 
                     class MockPred:

@@ -18,6 +18,13 @@ class FreshnessState(Enum):
     EMPTY_VALID = "EMPTY_VALID"
     ERROR = "ERROR"
 
+class NaReasonCode(str, Enum):
+    NO_PRIOR_SUCCESS = "NO_PRIOR_SUCCESS"
+    CARRY_FORWARD_ERROR = "CARRY_FORWARD_ERROR"
+    CARRY_FORWARD_EMPTY_MEANS_STALE = "CARRY_FORWARD_EMPTY_MEANS_STALE"
+    DEPENDENCY_ERROR = "DEPENDENCY_ERROR"
+    UNRESOLVED = "UNRESOLVED"
+
 @dataclass(frozen=True)
 class PayloadAssessment:
     payload_class: EndpointPayloadClass
@@ -53,6 +60,18 @@ def to_utc_dt(x: Any, *, fallback: datetime.datetime) -> datetime.datetime:
         return x.astimezone(datetime.timezone.utc)
     return fallback
 
+def _enforce_invariants(res: ResolvedLineage) -> ResolvedLineage:
+    """Strictly guarantees no STALE_CARRY ever escapes without a valid used_event_id."""
+    if res.freshness_state == FreshnessState.STALE_CARRY and not res.used_event_id:
+        return ResolvedLineage(
+            used_event_id=None,
+            freshness_state=FreshnessState.ERROR,
+            stale_age_seconds=None,
+            payload_class=res.payload_class,
+            na_reason=NaReasonCode.NO_PRIOR_SUCCESS.value
+        )
+    return res
+
 def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str, session_label: str) -> PayloadAssessment:
     if not getattr(res, "ok", False) or getattr(res, "payload_json", None) is None:
         return PayloadAssessment(
@@ -73,28 +92,18 @@ def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str,
         if "results" in pj and not pj["results"]: is_empty = True
 
     policy = get_empty_policy(method, path, session_label)
-    
-    # Evaluate changed boolean early so empty-but-valid transitions can trigger a change timestamp update
     computed_changed = True if prev_hash is None else (res.payload_hash != prev_hash)
 
     if is_empty:
         if policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
             return PayloadAssessment(EndpointPayloadClass.SUCCESS_EMPTY_VALID, policy, True, computed_changed, None)
         elif policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
-            # changed=False because EMPTY_MEANS_STALE must not overwrite last_success/last_change
             return PayloadAssessment(EndpointPayloadClass.SUCCESS_EMPTY_VALID, policy, True, False, "EMPTY_MEANS_STALE")
-        else: # policy == EMPTY_INVALID
+        else:
             return PayloadAssessment(EndpointPayloadClass.ERROR, policy, True, None, "EMPTY_UNEXPECTED")
 
     pclass = EndpointPayloadClass.SUCCESS_HAS_DATA if computed_changed else EndpointPayloadClass.SUCCESS_STALE
-    
-    return PayloadAssessment(
-        payload_class=pclass, 
-        empty_policy=policy, 
-        is_empty=False, 
-        changed=computed_changed, 
-        error_reason=None
-    )
+    return PayloadAssessment(pclass, policy, False, computed_changed, None)
 
 def resolve_effective_payload(
     current_event_id: str, 
@@ -102,80 +111,79 @@ def resolve_effective_payload(
     assessment: PayloadAssessment, 
     prev_state: Optional[Dict[str, Any]]
 ) -> ResolvedLineage:
-    
     current_ts = to_utc_dt(current_ts_raw, fallback=datetime.datetime.now(datetime.timezone.utc))
     pclass = assessment.payload_class
     empty_policy = assessment.empty_policy
 
     if pclass == EndpointPayloadClass.SUCCESS_HAS_DATA:
-        return ResolvedLineage(
+        return _enforce_invariants(ResolvedLineage(
             used_event_id=current_event_id, 
             freshness_state=FreshnessState.FRESH, 
             stale_age_seconds=0, 
             payload_class=pclass, 
             na_reason=None
-        )
+        ))
     
     if pclass == EndpointPayloadClass.SUCCESS_STALE:
         used_id = prev_state["last_change_event_id"] if prev_state and prev_state.get("last_change_event_id") else current_event_id
         prev_change_ts = to_utc_dt(prev_state.get("last_change_ts_utc"), fallback=current_ts) if prev_state else current_ts
         age = max(0, int((current_ts - prev_change_ts).total_seconds()))
-        return ResolvedLineage(
+        return _enforce_invariants(ResolvedLineage(
             used_event_id=used_id, 
             freshness_state=FreshnessState.STALE_CARRY, 
             stale_age_seconds=age, 
             payload_class=pclass, 
             na_reason=None
-        )
+        ))
 
     if pclass == EndpointPayloadClass.SUCCESS_EMPTY_VALID:
         if empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
-            return ResolvedLineage(
+            return _enforce_invariants(ResolvedLineage(
                 used_event_id=current_event_id, 
                 freshness_state=FreshnessState.EMPTY_VALID, 
                 stale_age_seconds=0, 
                 payload_class=pclass, 
                 na_reason=None
-            )
+            ))
             
         elif empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
             if prev_state and prev_state.get("last_success_event_id"):
                 prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
                 age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-                return ResolvedLineage(
+                return _enforce_invariants(ResolvedLineage(
                     used_event_id=prev_state["last_success_event_id"], 
                     freshness_state=FreshnessState.STALE_CARRY, 
                     stale_age_seconds=age, 
                     payload_class=pclass, 
-                    na_reason=f"CARRY_FORWARD_{pclass.name}"
-                )
+                    na_reason=NaReasonCode.CARRY_FORWARD_EMPTY_MEANS_STALE.value
+                ))
             else:
-                return ResolvedLineage(
+                return _enforce_invariants(ResolvedLineage(
                     used_event_id=None, 
-                    freshness_state=FreshnessState.EMPTY_VALID, 
+                    freshness_state=FreshnessState.ERROR, 
                     stale_age_seconds=None, 
                     payload_class=pclass, 
-                    na_reason="NO_PRIOR_SUCCESS"
-                )
+                    na_reason=NaReasonCode.NO_PRIOR_SUCCESS.value
+                ))
 
     if pclass == EndpointPayloadClass.ERROR:
         if prev_state and prev_state.get("last_success_event_id"):
             prev_success_ts = to_utc_dt(prev_state.get("last_success_ts_utc"), fallback=current_ts)
             age = max(0, int((current_ts - prev_success_ts).total_seconds()))
-            return ResolvedLineage(
+            return _enforce_invariants(ResolvedLineage(
                 used_event_id=prev_state["last_success_event_id"], 
                 freshness_state=FreshnessState.STALE_CARRY, 
                 stale_age_seconds=age, 
                 payload_class=pclass, 
-                na_reason="CARRY_FORWARD_ERROR"
-            )
+                na_reason=NaReasonCode.CARRY_FORWARD_ERROR.value
+            ))
         else:
-            return ResolvedLineage(
+            return _enforce_invariants(ResolvedLineage(
                 used_event_id=None, 
                 freshness_state=FreshnessState.ERROR, 
                 stale_age_seconds=None, 
                 payload_class=pclass, 
-                na_reason="NO_PRIOR_SUCCESS"
-            )
+                na_reason=NaReasonCode.NO_PRIOR_SUCCESS.value
+            ))
             
-    return ResolvedLineage(None, FreshnessState.ERROR, None, pclass, "UNRESOLVED")
+    return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.UNRESOLVED.value))
