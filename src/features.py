@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping
 from dataclasses import dataclass
+import math
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
 from .analytics import build_gex_levels
@@ -23,6 +24,30 @@ class LevelRow(TypedDict):
 class FeatureBundle:
     features: Dict[str, Optional[float]]
     meta: Dict[str, Any]
+
+@dataclass
+class FeatureCandidate:
+    feature_key: str
+    feature_value: Optional[float]
+    meta_json: Dict[str, Any]
+    freshness_rank: int
+    stale_age: int
+    path_priority: int
+    endpoint_id: int
+    is_none: bool
+
+PATH_PRIORITY = {
+    "/api/stock/{ticker}/spot-exposures": 1,
+    "/api/stock/{ticker}/spot-exposures/strike": 2,
+    "/api/stock/{ticker}/spot-exposures/expiry-strike": 3,
+    "/api/stock/{ticker}/flow-recent": 1,
+    "/api/stock/{ticker}/flow-per-strike-intraday": 2,
+    "/api/stock/{ticker}/flow-per-strike": 3,
+    "/api/stock/{ticker}/greek-exposure": 1,
+    "/api/stock/{ticker}/greek-exposure/strike": 2,
+    "/api/stock/{ticker}/greek-exposure/expiry": 3,
+    "/api/stock/{ticker}/ohlc/{candle_size}": 1
+}
 
 def _find_first(obj: Any, keys: List[str]) -> Any:
     if not isinstance(obj, dict): return None
@@ -49,9 +74,7 @@ def merge_bundles(bundles: List[FeatureBundle]) -> FeatureBundle:
 
 def _build_meta(ctx: EndpointContext, extractor_name: str, details: Dict[str, Any] = None) -> Dict[str, Any]:
     d = {"extractor": extractor_name}
-    if details:
-        d.update(details)
-        
+    if details: d.update(details)
     return {
         "source_endpoints": [{
             "method": ctx.method,
@@ -73,8 +96,6 @@ def _build_error_meta(ctx: EndpointContext, extractor_name: str, na_reason: str)
     meta["na_reason"] = na_reason
     return meta
 
-# --- Extractors ---
-
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", ctx.na_reason or "missing_dependency_payload")})
@@ -92,9 +113,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         
     return FeatureBundle({"spot": close}, {"price": _build_meta(ctx, "extract_price_features", {"last_ts": ts})})
 
-def extract_smart_whale_pressure(
-    flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0
-) -> FeatureBundle:
+def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", ctx.na_reason or "missing_dependency_payload")})
 
@@ -118,7 +137,6 @@ def extract_smart_whale_pressure(
             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_schema")})
         if raw_list and len(raw_list) > 0:
              return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "schema_non_dict_rows")})
-             
         meta = _build_meta(ctx, "extract_smart_whale_pressure", {"status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
@@ -180,7 +198,6 @@ def extract_smart_whale_pressure(
         if skip_missing_fields > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "missing_required_fields")})
         if skip_bad_type > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_put_call")})
         if skip_bad_side > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "unrecognized_side_labels")})
-             
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", "no_valid_trades_unknown")})
 
     net = whale_call - whale_put
@@ -189,7 +206,6 @@ def extract_smart_whale_pressure(
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_notional"]
-    
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", ctx.na_reason or "missing_dependency_payload")})
 
@@ -198,7 +214,6 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", "no_rows")})
 
     latest = rows[-1]
-    
     def _sum(row, metric):
         t = safe_float(_find_first(row, [metric, f"total_{metric}", f"{metric}_exposure"]))
         if t is not None: return t
@@ -238,8 +253,6 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         
     meta = _build_meta(ctx, "extract_gex_sign", {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
-
-# --- Central Extraction Orchestrator Registry ---
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
@@ -282,54 +295,66 @@ PRESENCE_ONLY_ENDPOINTS = {
 }
 
 def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, EndpointContext]) -> Tuple[List[FeatureRow], List[LevelRow]]:
-    by_path = {}
-    for eid, ctx in contexts.items():
-        by_path.setdefault(ctx.path, []).append((eid, effective_payloads.get(eid), ctx))
-        
     def rank_freshness(fs: str) -> int:
         return {"FRESH": 1, "STALE_CARRY": 2, "EMPTY_VALID": 3, "ERROR": 4}.get(fs, 5)
 
-    for path in by_path:
-        by_path[path].sort(key=lambda x: (
-            rank_freshness(x[2].freshness_state),
-            x[2].stale_age_min if x[2].stale_age_min is not None else 999999,
-            x[0]
-        ))
-
-    f_rows: List[FeatureRow] = []
+    candidates: List[FeatureCandidate] = []
     l_rows: List[LevelRow] = []
 
-    for path, endpoints in by_path.items():
-        best_eid, payload, ctx = endpoints[0]
-
-        routing_key = EXTRACTOR_REGISTRY.get(path)
-
+    for eid, ctx in contexts.items():
+        payload = effective_payloads.get(eid)
+        routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
+        
         if routing_key == "GEX":
             f_bundle = extract_gex_sign(payload, ctx)
             for k, v in f_bundle.features.items():
-                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["gex"]})
-            
+                candidates.append(FeatureCandidate(k, v, f_bundle.meta.get("gex", {}), rank_freshness(ctx.freshness_state), ctx.stale_age_min or 999999, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             levels = build_gex_levels(payload)
             for l_type, price, mag, details in levels:
-                meta = _build_meta(ctx, "build_gex_levels", details)
-                l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+                l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": _build_meta(ctx, "build_gex_levels", details)})
                 
         elif routing_key == "FLOW":
             f_bundle = extract_smart_whale_pressure(payload, ctx)
             for k, v in f_bundle.features.items():
-                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["flow"]})
+                candidates.append(FeatureCandidate(k, v, f_bundle.meta.get("flow", {}), rank_freshness(ctx.freshness_state), ctx.stale_age_min or 999999, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "GREEKS":
             f_bundle = extract_dealer_greeks(payload, ctx)
             for k, v in f_bundle.features.items():
-                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["greeks"]})
+                candidates.append(FeatureCandidate(k, v, f_bundle.meta.get("greeks", {}), rank_freshness(ctx.freshness_state), ctx.stale_age_min or 999999, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "PRICE":
             f_bundle = extract_price_features(payload, ctx)
             for k, v in f_bundle.features.items():
-                f_rows.append({"feature_key": k, "feature_value": v, "meta_json": f_bundle.meta["price"]})
+                candidates.append(FeatureCandidate(k, v, f_bundle.meta.get("price", {}), rank_freshness(ctx.freshness_state), ctx.stale_age_min or 999999, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
-        elif path not in PRESENCE_ONLY_ENDPOINTS:
-            raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS. Update src/features.py.")
+        elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
+            raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")
+
+    # Deduplicate candidates using institutional strict ranking
+    grouped: Dict[str, List[FeatureCandidate]] = {}
+    for c in candidates: grouped.setdefault(c.feature_key, []).append(c)
+
+    f_rows: List[FeatureRow] = []
+    for f_key, group in grouped.items():
+        group.sort(key=lambda x: (x.is_none, x.freshness_rank, x.stale_age, x.path_priority, x.endpoint_id))
+        
+        best = group[0]
+        
+        # Conflict detection: same rank, different non-None values
+        for other in group[1:]:
+            if (other.is_none == best.is_none and other.freshness_rank == best.freshness_rank and 
+                other.stale_age == best.stale_age and other.path_priority == best.path_priority):
+                if best.feature_value is not None and other.feature_value is not None:
+                    if not math.isclose(best.feature_value, other.feature_value, abs_tol=1e-9):
+                        raise RuntimeError(f"FEATURE_CONFLICT:{f_key} - Endpoint {best.endpoint_id} vs {other.endpoint_id} generated divergent values at equal rank.")
+                    
+        meta = best.meta_json
+        if len(group) > 1:
+            meta.setdefault("details", {})["shadowed_candidates"] = [
+                {"endpoint_id": c.endpoint_id, "is_none": c.is_none, "freshness_rank": c.freshness_rank} for c in group[1:]
+            ]
+            
+        f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
 
     return f_rows, l_rows

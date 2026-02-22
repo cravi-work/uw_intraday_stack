@@ -25,16 +25,23 @@ CREATE TABLE IF NOT EXISTS meta_runs (run_id UUID PRIMARY KEY, started_at_utc TI
 CREATE TABLE IF NOT EXISTS snapshots (snapshot_id UUID PRIMARY KEY, run_id UUID REFERENCES meta_runs(run_id), asof_ts_utc TIMESTAMP NOT NULL, ticker TEXT NOT NULL, session_label TEXT, is_trading_day BOOLEAN, is_early_close BOOLEAN, data_quality_score DOUBLE, market_close_utc TIMESTAMP, post_end_utc TIMESTAMP, seconds_to_close INTEGER, created_at_utc TIMESTAMP DEFAULT current_timestamp, UNIQUE(ticker, asof_ts_utc));
 CREATE TABLE IF NOT EXISTS meta_config (config_version INTEGER PRIMARY KEY, config_hash TEXT NOT NULL, config_yaml TEXT NOT NULL, created_at_utc TIMESTAMP DEFAULT current_timestamp);
 CREATE TABLE IF NOT EXISTS dim_endpoints (endpoint_id INTEGER PRIMARY KEY, method TEXT, path TEXT, signature TEXT UNIQUE, params_hash TEXT, params_json JSON);
-CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias TEXT, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON);
+
+-- bias is now DOUBLE. UNIQUE constraints added to dedupe features and lineage.
+CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias DOUBLE, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
-CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON);
+CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON, UNIQUE(snapshot_id, feature_key));
 CREATE TABLE IF NOT EXISTS derived_levels (snapshot_id UUID, level_type TEXT, price DOUBLE, magnitude DOUBLE, meta_json JSON);
-CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID, endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER, payload_class TEXT, na_reason TEXT, meta_json JSON);
+CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID, endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER, payload_class TEXT, na_reason TEXT, meta_json JSON, UNIQUE(snapshot_id, endpoint_id));
 CREATE TABLE IF NOT EXISTS endpoint_state (ticker TEXT, endpoint_id INTEGER, last_success_event_id UUID, last_success_ts_utc TIMESTAMP, last_payload_hash TEXT, last_change_ts_utc TIMESTAMP, last_change_event_id UUID, last_attempt_event_id UUID, last_attempt_ts_utc TIMESTAMP, last_attempt_http_status INTEGER, last_attempt_error_type TEXT, last_attempt_error_msg TEXT, PRIMARY KEY (ticker, endpoint_id));
 CREATE TABLE IF NOT EXISTS raw_http_events (event_id UUID PRIMARY KEY, run_id UUID, requested_at_utc TIMESTAMP, received_at_utc TIMESTAMP, ticker TEXT, endpoint_id INTEGER, http_status INTEGER, latency_ms INTEGER, payload_hash TEXT, payload_json JSON, is_retry BOOLEAN, error_type TEXT, error_msg TEXT, circuit_state_json JSON);
 CREATE TABLE IF NOT EXISTS config_history (config_version VARCHAR, ingested_at_utc TIMESTAMP, yaml_content VARCHAR);
 CREATE TABLE IF NOT EXISTS dim_tickers (ticker TEXT PRIMARY KEY);
+
+-- Hot-path indexes
+CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_asof ON snapshots(ticker, asof_ts_utc);
+CREATE INDEX IF NOT EXISTS idx_features_snap ON features(snapshot_id, feature_key);
+CREATE INDEX IF NOT EXISTS idx_lineage_snap ON snapshot_lineage(snapshot_id);
 """
 
 class DbWriter:
@@ -79,9 +86,15 @@ class DbWriter:
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
 
+        # Type migration for predictions.bias (TEXT -> DOUBLE)
+        pred_cols = {r[1]: r[2] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
+        if pred_cols.get('bias') in ['VARCHAR', 'TEXT']:
+            logger.info("Migrating predictions.bias from TEXT to DOUBLE...")
+            con.execute("ALTER TABLE predictions ALTER bias TYPE DOUBLE USING TRY_CAST(bias AS DOUBLE)")
+            con.execute("UPDATE predictions SET meta_json = json_insert(COALESCE(meta_json, '{}'), '$.migration_note', 'bias_cast_failed') WHERE bias IS NULL AND meta_json NOT LIKE '%bias_cast_failed%'")
+
     @contextlib.contextmanager
     def writer(self):
-        """Enforces true ACID transaction guarantees. Reverts all partial inserts upon failure."""
         con = self._connect_new()
         con.execute("BEGIN TRANSACTION")
         try:
@@ -222,7 +235,7 @@ class DbWriter:
     def insert_features(self, con, snapshot_id, features_with_meta: List[Dict[str, Any]]):
         for f in features_with_meta:
             con.execute(
-                "INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json) VALUES (?,?,?,?)", 
+                "INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json) VALUES (?,?,?,?) ON CONFLICT (snapshot_id, feature_key) DO UPDATE SET feature_value = excluded.feature_value, meta_json = excluded.meta_json", 
                 [str(snapshot_id), f["feature_key"], f["feature_value"], json.dumps(f["meta_json"])]
             )
             
@@ -235,8 +248,8 @@ class DbWriter:
         
     def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json):
         con.execute(
-            """INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json) VALUES (?,?,?,?,?,?,?,?)""", 
-            [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds, payload_class, na_reason, json.dumps(meta_json) if meta_json else None]
+            """INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (snapshot_id, endpoint_id) DO UPDATE SET used_event_id = excluded.used_event_id, freshness_state = excluded.freshness_state, data_age_seconds = excluded.data_age_seconds, payload_class = excluded.payload_class, na_reason = excluded.na_reason, meta_json = excluded.meta_json""", 
+            [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds, payload_class, na_reason, json.dumps(meta_json) if meta_json else "{}"]
         )
             
     def end_run(self, con, run_id):

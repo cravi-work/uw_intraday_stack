@@ -20,14 +20,17 @@ def test_safe_closed_on_missing_calendar(monkeypatch):
     import src.scheduler
     monkeypatch.setattr(src.scheduler, "HAS_CALENDAR", False)
     
+    # Use a hardcoded weekday (e.g., Wednesday) so the test doesn't fail if run on a weekend
+    test_date = dt.date(2023, 11, 15)
+    
     # Default behavior: Raise Error
     with pytest.raises(RuntimeError):
-        get_market_hours(dt.date.today(), MOCK_CFG)
+        get_market_hours(test_date, MOCK_CFG)
     
     # Configured Fallback: Return Degraded
     cfg_allow = MOCK_CFG.copy()
     cfg_allow["allow_degraded_calendar"] = True
-    hours = get_market_hours(dt.date.today(), cfg_allow)
+    hours = get_market_hours(test_date, cfg_allow)
     assert hours.reason == "DEGRADED_NO_CALENDAR"
 
 def test_to_close_targets_correct_boundary():
@@ -53,6 +56,8 @@ def test_ingest_cap_logic():
 def test_sanity_checks():
     bad_cfg = MOCK_CFG.copy()
     bad_cfg["ingest_start_et"] = "19:00" # After ingest end
+    test_date = dt.date(2023, 11, 15)
+    
     # [Review Item 4] Fix: Match the actual error message substring or type
     with pytest.raises(ValueError, match="ingest_start must be before ingest_end"):
-        get_market_hours(dt.date.today(), bad_cfg)
+        get_market_hours(test_date, bad_cfg)

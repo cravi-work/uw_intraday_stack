@@ -18,6 +18,12 @@ def _ensure_utc(dt_val: Optional[datetime]) -> Optional[datetime]:
 
 def _is_valid_prob(p: Any) -> bool:
     return isinstance(p, (float, int)) and math.isfinite(p) and 0.0 <= p <= 1.0
+    
+def _is_valid_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
+def _record_validation_skip(con: duckdb.DuckDBPyConnection, prediction_id: str, reason: str):
+    con.execute("UPDATE predictions SET meta_json = json_insert(COALESCE(meta_json, '{}'), '$.validation_error', ?) WHERE prediction_id = ?", [reason, prediction_id])
 
 def realized_label(start_price: float, realized_price: float, flat_threshold_pct: float) -> str:
     if start_price <= 0: return "SKIPPED"
@@ -41,10 +47,7 @@ class ValidationResult:
     updated: int
     skipped: int
 
-def validate_pending(
-    con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_threshold_pct: float, tolerance_minutes: int,
-) -> ValidationResult:
-    
+def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_threshold_pct: float, tolerance_minutes: int) -> ValidationResult:
     tol = timedelta(minutes=int(tolerance_minutes))
     now_utc = _ensure_utc(now_utc)
 
@@ -64,46 +67,50 @@ def validate_pending(
     update_sql = "UPDATE predictions SET " + ", ".join(set_parts) + " WHERE prediction_id = ?"
 
     for (prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds, start_price, prob_up, prob_down, prob_flat, ticker, asof_ts_utc) in rows:
+        pid = str(prediction_id)
         asof_ts_utc = _ensure_utc(asof_ts_utc)
         if asof_ts_utc is None:
             skipped += 1
             continue
         
-        # STRICT VECTOR VALIDATION
         valid_probs = _is_valid_prob(prob_up) and _is_valid_prob(prob_down) and _is_valid_prob(prob_flat)
         if valid_probs:
             prob_sum = float(prob_up) + float(prob_down) + float(prob_flat)
-            if not math.isclose(prob_sum, 1.0, abs_tol=1e-3):
-                valid_probs = False
+            if not math.isclose(prob_sum, 1.0, abs_tol=1e-3): valid_probs = False
 
         if not valid_probs:
-            con.execute("UPDATE predictions SET meta_json = json_insert(meta_json, '$.validation_error', 'validation_skipped_invalid_probs') WHERE prediction_id = ?", [str(prediction_id)])
-            skipped += 1
-            continue
+            _record_validation_skip(con, pid, "validation_skipped_invalid_probs")
+            skipped += 1; continue
+
+        if horizon_kind not in ["FIXED", "TO_CLOSE"]:
+            _record_validation_skip(con, pid, "invalid_horizon_kind")
+            skipped += 1; continue
 
         if horizon_kind == "TO_CLOSE":
-            if horizon_seconds is None: 
-                skipped += 1
-                continue
+            if not _is_valid_num(horizon_seconds) or horizon_seconds <= 0:
+                _record_validation_skip(con, pid, "invalid_to_close_horizon_seconds")
+                skipped += 1; continue
             target_ts = asof_ts_utc + timedelta(seconds=int(horizon_seconds))
         else:
-            if horizon_minutes is None:
-                skipped += 1
-                continue
+            if not _is_valid_num(horizon_minutes) or horizon_minutes <= 0:
+                _record_validation_skip(con, pid, "invalid_fixed_horizon_minutes")
+                skipped += 1; continue
             target_ts = asof_ts_utc + timedelta(minutes=int(horizon_minutes))
             
-        if target_ts > now_utc:
-            continue
+        if target_ts > now_utc: continue
 
         if start_price is not None:
             start_spot = float(start_price)
         else:
             start_spot_row = con.execute("SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1", [str(snapshot_id)]).fetchone()
             if not start_spot_row or start_spot_row[0] is None:
-                con.execute("UPDATE predictions SET meta_json = json_insert(meta_json, '$.validation_error', 'missing_start_price') WHERE prediction_id = ?", [str(prediction_id)])
-                skipped += 1
-                continue
+                _record_validation_skip(con, pid, "missing_start_price")
+                skipped += 1; continue
             start_spot = float(start_spot_row[0])
+
+        if not _is_valid_num(start_spot) or start_spot <= 0:
+            _record_validation_skip(con, pid, "invalid_start_price")
+            skipped += 1; continue
 
         realized_snap_row = con.execute(
             """SELECT snapshot_id, asof_ts_utc FROM snapshots
@@ -111,27 +118,30 @@ def validate_pending(
                ORDER BY asof_ts_utc ASC LIMIT 1""", [ticker, target_ts, asof_ts_utc]).fetchone()
                  
         if not realized_snap_row:
-            skipped += 1
-            continue
+            _record_validation_skip(con, pid, "no_realized_snapshot")
+            skipped += 1; continue
 
         realized_snapshot_id, realized_asof = realized_snap_row
         realized_asof = _ensure_utc(realized_asof)
 
         if realized_asof is None or (realized_asof - target_ts) > tol:
-            skipped += 1
-            continue
+            _record_validation_skip(con, pid, "realized_snapshot_outside_tolerance")
+            skipped += 1; continue
 
         realized_spot_row = con.execute("SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1", [str(realized_snapshot_id)]).fetchone()
         if not realized_spot_row or realized_spot_row[0] is None:
-            skipped += 1
-            continue
+            _record_validation_skip(con, pid, "missing_realized_spot")
+            skipped += 1; continue
             
         realized_spot = float(realized_spot_row[0])
+        if not _is_valid_num(realized_spot) or realized_spot <= 0:
+            _record_validation_skip(con, pid, "invalid_realized_price")
+            skipped += 1; continue
 
         label = realized_label(start_spot, realized_spot, float(flat_threshold_pct))
         if label == "SKIPPED":
-            skipped += 1
-            continue
+            _record_validation_skip(con, pid, "invalid_realized_label_result")
+            skipped += 1; continue
 
         pu, pd, pf = float(prob_up), float(prob_down), float(prob_flat)
         bs = brier_3class(pu, pd, pf, label)
@@ -140,7 +150,7 @@ def validate_pending(
         params = []
         if has_outcome_price: params.append(realized_spot)
         pred_lbl = predicted_class(pu, pd, pf)
-        params.extend([realized_asof, label, bs, ll, True, bool(pred_lbl == label), str(prediction_id)])
+        params.extend([realized_asof, label, bs, ll, True, bool(pred_lbl == label), pid])
 
         con.execute(update_sql, params)
         updated += 1

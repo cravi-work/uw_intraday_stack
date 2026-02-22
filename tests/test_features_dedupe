@@ -1,0 +1,17 @@
+import pytest
+from src.features import extract_all
+from src.endpoint_truth import EndpointContext
+
+def test_feature_deduplication_ranking():
+    """Asserts feature duplication is natively ranked and shadow-annotated."""
+    ctx_loser = EndpointContext(1, "GET", "/api/stock/{ticker}/greek-exposure", None, "sig1", "uuid1", "SUCCESS_HAS_DATA", "STALE_CARRY", 30, None)
+    ctx_winner = EndpointContext(2, "GET", "/api/stock/{ticker}/greek-exposure", None, "sig2", "uuid2", "SUCCESS_HAS_DATA", "FRESH", 0, None)
+    
+    payloads = {1: [{"dealer_vanna": 100}], 2: [{"dealer_vanna": 200}]}
+    contexts = {1: ctx_loser, 2: ctx_winner}
+    
+    f_rows, _ = extract_all(payloads, contexts)
+    vanna = next(f for f in f_rows if f["feature_key"] == "dealer_vanna")
+    
+    assert vanna["feature_value"] == 200.0 / 1_000_000_000.0 # FRESH wins
+    assert "shadowed_candidates" in vanna["meta_json"]["details"]

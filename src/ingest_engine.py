@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import math
 import uuid
 from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +16,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
-from .models import bounded_additive_score
+from .models import bounded_additive_score, Prediction
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -124,6 +125,10 @@ def _get_worst_freshness(states: List[FreshnessState]) -> FreshnessState:
         return min(states, key=lambda s: order[s])
     return FreshnessState.ERROR
 
+def _is_valid_num(v: Any) -> bool:
+    """Helper to ensure derived outputs are strictly mathematically finite."""
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
 def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) -> None:
     _validate_config(cfg)
     registry = load_api_catalog(catalog_path)
@@ -184,6 +189,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     try:
         with FileLock(cfg["storage"]["cycle_lock_path"]):
+            # db.writer() provides a strict BEGIN...COMMIT / ROLLBACK transaction boundary
             with db.writer() as con:
                 db.ensure_schema(con)
                 db.upsert_tickers(con, tickers)
@@ -266,11 +272,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                 for tkr in tickers:
                     evs = events_by_ticker.get(tkr, [])
                     
-                    # 1. Evaluate Lineage & Quality First
                     valid_count = sum(1 for _, _, res, _, _, asmnt in evs if res.freshness_state == FreshnessState.FRESH or (res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None) or (res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy.name == "EMPTY_IS_DATA"))
                     dq = (valid_count / len(evs)) if evs else 0.0
 
-                    # 2. Insert Snapshot 
                     snapshot_id = db.insert_snapshot(
                         con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
                         is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
@@ -286,12 +290,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     effective_payloads: Dict[int, Any] = {}
                     contexts: Dict[int, EndpointContext] = {}
-
-                    source_endpoints = []
-                    freshness_states = []
-                    ages = []
                     
-                    # 3. Construct Contexts and write scoped Lineage directly
                     for endpoint_id, event_id, res, call, sig, asmnt in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
                         
@@ -320,7 +319,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             na_reason=n_reason
                         )
                         contexts[endpoint_id] = ctx
-                            
+
                         src_meta = {
                             "method": call.method,
                             "path": call.path,
@@ -330,12 +329,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             "used_event_id": res.used_event_id,
                             "missing_keys": asmnt.missing_keys
                         }
-                        
-                        source_endpoints.append(src_meta)
-                        freshness_states.append(f_state)
-                        
-                        if res.stale_age_seconds is not None:
-                            ages.append(res.stale_age_seconds)
 
                         lineage_meta = MetaContract(
                             source_endpoints=[src_meta],
@@ -353,26 +346,50 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
-                    # ... [Validation Gate] ...
+                    # --- Strict Validation Gate ---
                     valid_features = []
                     valid_levels = []
                     malformed_count = 0
+                    seen_keys = set()
                     
                     for f in features_insert_list:
                         if isinstance(f, dict) and "feature_key" in f and "meta_json" in f:
+                            f_key = f["feature_key"]
+                            f_val = f.get("feature_value")
+                            
+                            if f_val is not None and not _is_valid_num(f_val):
+                                logger.warning(f"Malformed feature row (non-finite value): {f}")
+                                malformed_count += 1
+                                continue
+                                
+                            if f_key in seen_keys:
+                                # This triggers a hard rollback on the transaction inside db.writer()
+                                raise RuntimeError(f"Duplicate feature key detected in insert list: {f_key}")
+                            seen_keys.add(f_key)
+                                
                             meta = f["meta_json"]
                             if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
-                                valid_features.append(f) # Notice: We append even if feature_value is None.
+                                valid_features.append(f) # Append explicitly even if feature_value is None
                                 continue
+                        
                         logger.warning(f"Malformed feature row skipped: {f}")
                         malformed_count += 1
 
                     for l in levels_insert_list:
                         if isinstance(l, dict) and "level_type" in l and "meta_json" in l:
+                            p = l.get("price")
+                            m = l.get("magnitude")
+                            
+                            if (p is not None and not _is_valid_num(p)) or (m is not None and not _is_valid_num(m)):
+                                logger.warning(f"Malformed level row (non-finite value): {l}")
+                                malformed_count += 1
+                                continue
+                                
                             meta = l["meta_json"]
                             if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
-                                valid_levels.append(l) # Append even if price/magnitude is None.
+                                valid_levels.append(l) 
                                 continue
+                        
                         logger.warning(f"Malformed level row skipped: {l}")
                         malformed_count += 1
 
@@ -389,12 +406,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     start_price = feat_dict.get("spot") 
 
                     if start_price is None:
-                        # Deterministic NA prediction fallback if dependency fails
-                        from .models import Prediction
+                        # Deterministic NA prediction fallback if structural dependency fails
                         pred = Prediction(
                             bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0, 
                             model_name="NA", model_version="NA", model_hash="NA", 
-                            meta={"na_reason": "missing_spot_dependency"}
+                            meta={"na_reason": "missing_spot_dependency", "missing_dependencies": ["spot"]}
                         )
                         is_mock_flag = True
                     else:
@@ -432,7 +448,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     except FileLockError:
         logger.warning("Skipping cycle: lock held")
-
 
 class IngestionEngine:
     def __init__(self, *, cfg: Dict[str, Any], catalog_path: str, config_path: str = "src/config/config.yaml"):
