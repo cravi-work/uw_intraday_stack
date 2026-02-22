@@ -1,11 +1,24 @@
 from typing import Dict, Any, List, Optional, Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
 
 PredictionLabel = Literal["UP", "DOWN", "FLAT"]
 HorizonKind = Literal["FIXED", "TO_CLOSE"]
+SessionState = Literal["PREMARKET", "RTH", "AFTERHOURS", "CLOSED"]
+DataQualityState = Literal["VALID", "STALE", "PARTIAL", "INVALID"]
+DecisionState = Literal["LONG", "SHORT", "NEUTRAL", "NO_TRADE"]
+RiskGateStatus = Literal["PASS", "BLOCKED", "DEGRADED"]
+
+@dataclass
+class DecisionGate:
+    data_quality_state: DataQualityState
+    risk_gate_status: RiskGateStatus
+    decision_state: DecisionState
+    blocked_reasons: List[str] = field(default_factory=list)
+    degraded_reasons: List[str] = field(default_factory=list)
+    validation_eligible: bool = True
 
 @dataclass
 class Prediction:
@@ -18,6 +31,7 @@ class Prediction:
     model_version: str
     model_hash: str
     meta: Dict[str, Any]
+    gate: DecisionGate
 
 def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> PredictionLabel:
     """
@@ -40,6 +54,7 @@ def bounded_additive_score(
     features: Dict[str, Optional[float]],
     data_quality_score: float,
     weights: Dict[str, float],
+    gate: DecisionGate,
     confidence_cap: float = 1.0,
     min_confidence: float = 0.0,
     neutral_threshold: float = 0.15,
@@ -49,6 +64,16 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
+    # 1. Critical Risk Block Path
+    if gate.risk_gate_status == "BLOCKED":
+        gate.decision_state = "NO_TRADE"
+        return Prediction(
+            bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0,
+            model_name="phase0_additive", model_version="1.0", model_hash="BLOCKED",
+            meta={"coverage": 0.0, "dq_eff": 0.0, "missing_keys": list(weights.keys())},
+            gate=gate
+        )
+
     score_sum = 0.0
     total_weight = 0.0
     present_weight = 0.0
@@ -79,12 +104,15 @@ def bounded_additive_score(
     if abs(raw_bias) < (neutral_threshold + direction_margin):
         p_up = remaining / 2.0
         p_down = remaining / 2.0
+        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "NEUTRAL"
     elif raw_bias > 0:
         p_up = remaining * (0.5 + (raw_bias / 2.0))
         p_down = remaining - p_up
+        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "LONG"
     else:
         p_down = remaining * (0.5 + (abs(raw_bias) / 2.0))
         p_up = remaining - p_down
+        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "SHORT"
 
     p_up, p_down, flat_prob = round(p_up, 4), round(p_down, 4), round(flat_prob, 4)
     
@@ -107,5 +135,6 @@ def bounded_additive_score(
         bias=raw_bias, confidence=confidence, prob_up=round(p_up, 4),
         prob_down=round(p_down, 4), prob_flat=round(flat_prob, 4),
         model_name="phase0_additive", model_version="1.0", model_hash=model_hash,
-        meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys}
+        meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys},
+        gate=gate
     )

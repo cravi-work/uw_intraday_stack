@@ -16,7 +16,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
-from .models import bounded_additive_score, Prediction
+from .models import bounded_additive_score, Prediction, DecisionGate
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -185,11 +185,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
             )
 
     fetch_results = asyncio.run(_run_fetch())
+    
+    # Pre-sort fetches to deterministically handle out-of-order execution packets within identical run cycles
+    fetch_results.sort(key=lambda x: x[4].requested_at_utc if x[4].requested_at_utc is not None else 0.0)
+
     db = DbWriter(cfg["storage"]["duckdb_path"], cfg["storage"]["writer_lock_path"])
 
     try:
         with FileLock(cfg["storage"]["cycle_lock_path"]):
-            # db.writer() provides a strict BEGIN...COMMIT / ROLLBACK transaction boundary
             with db.writer() as con:
                 db.ensure_schema(con)
                 db.upsert_tickers(con, tickers)
@@ -212,11 +215,25 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                 )
 
                 events_by_ticker: Dict[str, List[Tuple[int, uuid.UUID, Any, PlannedCall, str, PayloadAssessment]]] = {t: [] for t in tickers}
+                max_seen_ts = {}
 
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
-                    prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     
+                    # Deterministic Ordering: Drop Out-Of-Order packets from mutating system state
+                    ev_key = (tkr, endpoint_id)
+                    if ev_key in max_seen_ts and res.requested_at_utc < max_seen_ts[ev_key]:
+                        logger.warning(f"Out of order packet dropped from state mutation: {ev_key}")
+                        db.insert_raw_event(
+                            con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
+                            res.status_code, res.latency_ms, res.payload_hash, res.payload_json,
+                            True, "OutOfOrder", "Dropped from state mutation due to latency shift", cb,
+                        )
+                        continue
+                        
+                    max_seen_ts[ev_key] = max(max_seen_ts.get(ev_key, 0.0), res.requested_at_utc)
+                    
+                    prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     prev_hash = prev_state.last_payload_hash if prev_state else None
                     
                     event_id = db.insert_raw_event(
@@ -290,6 +307,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     effective_payloads: Dict[int, Any] = {}
                     contexts: Dict[int, EndpointContext] = {}
+
+                    source_endpoints = []
+                    freshness_states = []
+                    ages = []
                     
                     for endpoint_id, event_id, res, call, sig, asmnt in evs:
                         op_id = registry.get(call.method, call.path).operation_id if registry.has(call.method, call.path) else None
@@ -319,7 +340,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             na_reason=n_reason
                         )
                         contexts[endpoint_id] = ctx
-
+                            
                         src_meta = {
                             "method": call.method,
                             "path": call.path,
@@ -329,6 +350,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             "used_event_id": res.used_event_id,
                             "missing_keys": asmnt.missing_keys
                         }
+                        
+                        source_endpoints.append(src_meta)
+                        freshness_states.append(f_state)
+                        
+                        if res.stale_age_seconds is not None:
+                            ages.append(res.stale_age_seconds)
 
                         lineage_meta = MetaContract(
                             source_endpoints=[src_meta],
@@ -363,13 +390,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 continue
                                 
                             if f_key in seen_keys:
-                                # This triggers a hard rollback on the transaction inside db.writer()
                                 raise RuntimeError(f"Duplicate feature key detected in insert list: {f_key}")
                             seen_keys.add(f_key)
                                 
                             meta = f["meta_json"]
                             if isinstance(meta, dict) and all(k in meta for k in ["source_endpoints", "freshness_state", "stale_age_min", "na_reason", "details"]):
-                                valid_features.append(f) # Append explicitly even if feature_value is None
+                                valid_features.append(f)
                                 continue
                         
                         logger.warning(f"Malformed feature row skipped: {f}")
@@ -401,22 +427,25 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
-                    # --- Prediction Execution ---
+                    # --- Prediction Execution (Risk Gate Integrated) ---
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in valid_features}
                     start_price = feat_dict.get("spot") 
 
+                    gate = DecisionGate(data_quality_state="VALID", risk_gate_status="PASS", decision_state="NEUTRAL")
+
                     if start_price is None:
-                        # Deterministic NA prediction fallback if structural dependency fails
-                        pred = Prediction(
-                            bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0, 
-                            model_name="NA", model_version="NA", model_hash="NA", 
-                            meta={"na_reason": "missing_spot_dependency", "missing_dependencies": ["spot"]}
-                        )
-                        is_mock_flag = True
-                    else:
-                        weights = cfg.get("validation", {}).get("model_weights", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
-                        pred = bounded_additive_score(feat_dict, dq, weights)
-                        is_mock_flag = False
+                        gate.data_quality_state = "INVALID"
+                        gate.risk_gate_status = "BLOCKED"
+                        gate.decision_state = "NO_TRADE"
+                        gate.blocked_reasons.append("missing_critical_feature_spot")
+                        gate.validation_eligible = False
+                    elif dq < 0.5:
+                        gate.data_quality_state = "PARTIAL"
+                        gate.risk_gate_status = "DEGRADED"
+                        gate.degraded_reasons.append(f"low_data_quality_score_{dq:.2f}")
+
+                    weights = cfg.get("validation", {}).get("model_weights", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
+                    pred = bounded_additive_score(feat_dict, dq, weights, gate=gate)
 
                     for h in cfg["validation"]["horizons_minutes"]:
                         db.insert_prediction(
@@ -427,7 +456,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "bias": pred.bias, "confidence": pred.confidence, 
                                 "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
-                                "is_mock": is_mock_flag, "meta_json": pred.meta
+                                "is_mock": not pred.gate.validation_eligible, "meta_json": pred.meta,
+                                "decision_state": pred.gate.decision_state, "risk_gate_status": pred.gate.risk_gate_status,
+                                "data_quality_state": pred.gate.data_quality_state, "blocked_reasons": pred.gate.blocked_reasons,
+                                "degraded_reasons": pred.gate.degraded_reasons, "validation_eligible": pred.gate.validation_eligible
                             }
                         )
 
@@ -440,7 +472,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "bias": pred.bias, "confidence": pred.confidence, 
                                 "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
-                                "is_mock": is_mock_flag, "meta_json": pred.meta
+                                "is_mock": not pred.gate.validation_eligible, "meta_json": pred.meta,
+                                "decision_state": pred.gate.decision_state, "risk_gate_status": pred.gate.risk_gate_status,
+                                "data_quality_state": pred.gate.data_quality_state, "blocked_reasons": pred.gate.blocked_reasons,
+                                "degraded_reasons": pred.gate.degraded_reasons, "validation_eligible": pred.gate.validation_eligible
                             }
                         )
 

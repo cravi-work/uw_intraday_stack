@@ -26,8 +26,7 @@ CREATE TABLE IF NOT EXISTS snapshots (snapshot_id UUID PRIMARY KEY, run_id UUID 
 CREATE TABLE IF NOT EXISTS meta_config (config_version INTEGER PRIMARY KEY, config_hash TEXT NOT NULL, config_yaml TEXT NOT NULL, created_at_utc TIMESTAMP DEFAULT current_timestamp);
 CREATE TABLE IF NOT EXISTS dim_endpoints (endpoint_id INTEGER PRIMARY KEY, method TEXT, path TEXT, signature TEXT UNIQUE, params_hash TEXT, params_json JSON);
 
--- bias is now DOUBLE. UNIQUE constraints added to dedupe features and lineage.
-CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias DOUBLE, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON);
+CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias DOUBLE, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON, decision_state TEXT NOT NULL DEFAULT 'UNKNOWN', risk_gate_status TEXT NOT NULL DEFAULT 'UNKNOWN', data_quality_state TEXT NOT NULL DEFAULT 'UNKNOWN', blocked_reasons_json JSON, degraded_reasons_json JSON, validation_eligible BOOLEAN NOT NULL DEFAULT TRUE);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON, UNIQUE(snapshot_id, feature_key));
@@ -38,7 +37,6 @@ CREATE TABLE IF NOT EXISTS raw_http_events (event_id UUID PRIMARY KEY, run_id UU
 CREATE TABLE IF NOT EXISTS config_history (config_version VARCHAR, ingested_at_utc TIMESTAMP, yaml_content VARCHAR);
 CREATE TABLE IF NOT EXISTS dim_tickers (ticker TEXT PRIMARY KEY);
 
--- Hot-path indexes
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_asof ON snapshots(ticker, asof_ts_utc);
 CREATE INDEX IF NOT EXISTS idx_features_snap ON features(snapshot_id, feature_key);
 CREATE INDEX IF NOT EXISTS idx_lineage_snap ON snapshot_lineage(snapshot_id);
@@ -75,6 +73,12 @@ class DbWriter:
         _add("predictions", "outcome_price", "DOUBLE")
         _add("predictions", "is_correct", "BOOLEAN")
         _add("predictions", "meta_json", "JSON")
+        _add("predictions", "decision_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "risk_gate_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "data_quality_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "blocked_reasons_json", "JSON")
+        _add("predictions", "degraded_reasons_json", "JSON")
+        _add("predictions", "validation_eligible", "BOOLEAN NOT NULL DEFAULT TRUE")
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
         _add("endpoint_state", "last_attempt_event_id", "UUID")
@@ -86,7 +90,6 @@ class DbWriter:
         _add("snapshot_lineage", "na_reason", "TEXT")
         _add("snapshot_lineage", "meta_json", "JSON")
 
-        # Type migration for predictions.bias (TEXT -> DOUBLE)
         pred_cols = {r[1]: r[2] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
         if pred_cols.get('bias') in ['VARCHAR', 'TEXT']:
             logger.info("Migrating predictions.bias from TEXT to DOUBLE...")
@@ -154,9 +157,9 @@ class DbWriter:
         )
         pid = uuid.uuid4()
         con.execute(
-            """INSERT INTO predictions (prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, start_price, bias, confidence, prob_up, prob_down, prob_flat, model_name, model_version, model_hash, is_mock, meta_json) 
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), json.dumps(p.get("meta_json", {}))]
+            """INSERT INTO predictions (prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, start_price, bias, confidence, prob_up, prob_down, prob_flat, model_name, model_version, model_hash, is_mock, meta_json, decision_state, risk_gate_status, data_quality_state, blocked_reasons_json, degraded_reasons_json, validation_eligible) 
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), json.dumps(p.get("meta_json", {})), p.get("decision_state", "UNKNOWN"), p.get("risk_gate_status", "UNKNOWN"), p.get("data_quality_state", "UNKNOWN"), json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), p.get("validation_eligible", True)]
         )
         return pid
 

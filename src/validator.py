@@ -55,7 +55,9 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
         """SELECT p.prediction_id, p.snapshot_id, p.horizon_kind, p.horizon_minutes, p.horizon_seconds, 
                   p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc
            FROM predictions p JOIN snapshots s ON s.snapshot_id = p.snapshot_id
-           WHERE p.realized_at_utc IS NULL"""
+           WHERE p.realized_at_utc IS NULL 
+             AND p.validation_eligible = TRUE 
+             AND p.decision_state != 'NO_TRADE'"""
     ).fetchall()
 
     updated, skipped = 0, 0
