@@ -17,7 +17,6 @@ def _clamp_prob(p: float, eps: float = 1e-12) -> float:
 
 
 def _ensure_utc(dt_val: Optional[datetime]) -> Optional[datetime]:
-    """Ensure a datetime is timezone-aware (UTC)."""
     if dt_val is None:
         return None
     if dt_val.tzinfo is None:
@@ -26,17 +25,14 @@ def _ensure_utc(dt_val: Optional[datetime]) -> Optional[datetime]:
 
 
 def _is_valid_prob(p: Any) -> bool:
-    """Ensure probability is a mathematically finite float between 0 and 1."""
     return isinstance(p, (float, int)) and math.isfinite(p) and 0.0 <= p <= 1.0
 
 
 def _is_valid_num(v: Any) -> bool:
-    """Ensure price/value is a mathematically finite number."""
     return isinstance(v, (int, float)) and math.isfinite(v)
 
 
 def _record_validation_skip(con: duckdb.DuckDBPyConnection, prediction_id: str, reason: str) -> None:
-    """Explicitly records why a prediction was skipped to prevent silent failures."""
     con.execute(
         "UPDATE predictions SET meta_json = json_insert(COALESCE(meta_json, '{}'), '$.validation_error', ?) WHERE prediction_id = ?",
         [reason, prediction_id]
@@ -83,7 +79,6 @@ def validate_pending(
     tol = timedelta(minutes=int(tolerance_minutes))
     now_utc = _ensure_utc(now_utc)
 
-    # STRICT HYGIENE: Only validate eligible predictions that actually yielded a signal.
     rows = con.execute(
         f"""SELECT p.prediction_id, p.snapshot_id, p.horizon_kind, p.horizon_minutes, p.horizon_seconds, 
                   p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc, p.decision_state
@@ -141,7 +136,6 @@ def validate_pending(
             skipped += 1
             continue
 
-        # EXACT HORIZON TARGETING
         if horizon_kind == "TO_CLOSE":
             if not _is_valid_num(horizon_seconds) or horizon_seconds <= 0:
                 _record_validation_skip(con, pid, "invalid_to_close_horizon_seconds")
@@ -158,7 +152,6 @@ def validate_pending(
         if target_ts > now_utc:
             continue
 
-        # START PRICE RESOLUTION
         if start_price is not None:
             start_spot = float(start_price)
         else:
@@ -224,7 +217,6 @@ def validate_pending(
             skipped += 1
             continue
 
-        # FINAL METRICS CALCULATION
         pu = float(prob_up)
         pd = float(prob_down)
         pf = float(prob_flat)

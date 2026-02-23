@@ -68,7 +68,6 @@ def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
 
 
 def _parse_strict_ts(row: dict, key: str) -> float:
-    """Helper to deterministically extract explicit timestamps."""
     ts_val = row.get(key)
     if isinstance(ts_val, (int, float)): 
         return float(ts_val)
@@ -131,8 +130,6 @@ def _build_error_meta(
     meta["na_reason"] = na_reason
     return meta
 
-
-# --- Extractors ---
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {

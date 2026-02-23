@@ -31,6 +31,7 @@ from .endpoint_truth import (
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(frozen=True)
 class PlannedCall:
     name: str
@@ -39,6 +40,7 @@ class PlannedCall:
     path_params: Dict[str, Any]
     query_params: Dict[str, Any]
     is_market: bool
+
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
     req = ["ingestion", "storage", "system", "network", "validation"]
@@ -56,6 +58,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         raise KeyError("Missing ingestion.cadence_minutes")
     if "horizons_minutes" not in cfg["validation"]:
         raise KeyError("Missing validation.horizons_minutes")
+
 
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
     def _parse(l, market: bool = False) -> List[PlannedCall]:
@@ -76,6 +79,7 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
         market = _parse(plan_yaml.get("plans", {}).get("market_context", []), True)
     return core, market
 
+
 def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     def _sub(v):
         if isinstance(v, str):
@@ -86,6 +90,7 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
         path_params["ticker"] = ticker
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
     return path_params, query_params
+
 
 async def fetch_all(
     client: UwClient, 
@@ -114,6 +119,7 @@ async def fetch_all(
 
     return await asyncio.gather(*tasks)
 
+
 def _get_worst_freshness(states: List[FreshnessState]) -> FreshnessState:
     order = {
         FreshnessState.ERROR: 0, 
@@ -125,9 +131,11 @@ def _get_worst_freshness(states: List[FreshnessState]) -> FreshnessState:
         return min(states, key=lambda s: order[s])
     return FreshnessState.ERROR
 
+
 def _is_valid_num(v: Any) -> bool:
     """Helper to ensure derived outputs are strictly mathematically finite."""
     return isinstance(v, (int, float)) and math.isfinite(v)
+
 
 def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) -> None:
     _validate_config(cfg)
@@ -160,7 +168,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     sess_str = hours.get_session_label(asof_et)
     
-    # Try converting the string label securely to the Enum
     try:
         session_enum = SessionState(sess_str)
     except ValueError:
@@ -447,9 +454,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             if delta_sec > alignment_tolerance_sec:
                                 alignment_violations.append(f"{f['feature_key']}_delta_{int(delta_sec)}s")
 
-                    # Map our strict feature dependencies
-                    if "spot" not in feat_dict or feat_dict["spot"] is None: critical_missing += 1
-                    if "net_gex_sign" not in feat_dict or feat_dict["net_gex_sign"] is None: critical_missing += 1
+                    if "spot" not in feat_dict or feat_dict["spot"] is None: 
+                        critical_missing += 1
+                    if "net_gex_sign" not in feat_dict or feat_dict["net_gex_sign"] is None: 
+                        critical_missing += 1
 
                     source_ts_min = min(ts_list) if ts_list else None
                     source_ts_max = max(ts_list) if ts_list else None

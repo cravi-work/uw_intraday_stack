@@ -5,13 +5,11 @@ import hashlib
 import json
 import math
 
-
 class SessionState(str, Enum):
     PREMARKET = "PREMARKET"
     RTH = "RTH"
     AFTERHOURS = "AFTERHOURS"
     CLOSED = "CLOSED"
-
 
 class DataQualityState(str, Enum):
     VALID = "VALID"
@@ -20,13 +18,11 @@ class DataQualityState(str, Enum):
     INVALID = "INVALID"
     DEGRADED = "DEGRADED"
 
-
 class SignalState(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
     NEUTRAL = "NEUTRAL"
     NO_SIGNAL = "NO_SIGNAL"
-
 
 class ConfidenceState(str, Enum):
     HIGH = "HIGH"
@@ -35,17 +31,14 @@ class ConfidenceState(str, Enum):
     DEGRADED = "DEGRADED"
     UNKNOWN = "UNKNOWN"
 
-
 class RiskGateStatus(str, Enum):
     PASS = "PASS"
     BLOCKED = "BLOCKED"
     DEGRADED = "DEGRADED"
 
-
 class HorizonKind(str, Enum):
     FIXED = "FIXED"
     TO_CLOSE = "TO_CLOSE"
-
 
 @dataclass(frozen=True)
 class DecisionGate:
@@ -59,7 +52,6 @@ class DecisionGate:
     validation_eligible: bool = True
 
     def block(self, reason: str, invalid: bool = False) -> 'DecisionGate':
-        """Returns a new blocked DecisionGate instance without mutating the original."""
         return replace(
             self,
             risk_gate_status=RiskGateStatus.BLOCKED,
@@ -70,7 +62,6 @@ class DecisionGate:
         )
 
     def degrade(self, reason: str, partial: bool = False) -> 'DecisionGate':
-        """Returns a new degraded DecisionGate instance without mutating the original."""
         new_status = RiskGateStatus.DEGRADED if self.risk_gate_status == RiskGateStatus.PASS else self.risk_gate_status
         return replace(
             self,
@@ -79,27 +70,23 @@ class DecisionGate:
             degraded_reasons=self.degraded_reasons + (reason,)
         )
 
-
 @dataclass(frozen=True)
 class Prediction:
     bias: float
     confidence: float
     confidence_state: ConfidenceState
-    prob_up: float
-    prob_down: float
-    prob_flat: float
+    prob_up: Optional[float]
+    prob_down: Optional[float]
+    prob_flat: Optional[float]
     model_name: str
     model_version: str
     model_hash: str
     meta: Dict[str, Any]
     gate: DecisionGate
 
-
-def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
-    """
-    Determines the discrete predicted label from continuous probabilities.
-    Exact Tie Rule: FLAT > UP > DOWN.
-    """
+def predicted_class(prob_up: Optional[float], prob_down: Optional[float], prob_flat: Optional[float]) -> str:
+    if prob_up is None or prob_down is None or prob_flat is None:
+        return "FLAT"
     try:
         if math.isnan(prob_up) or math.isnan(prob_down) or math.isnan(prob_flat):
             return "FLAT"
@@ -111,7 +98,6 @@ def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
     if prob_up >= prob_down: 
         return "UP"
     return "DOWN"
-
 
 def bounded_additive_score(
     features: Dict[str, Optional[float]],
@@ -127,16 +113,15 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
-    # Critical Risk Block Path
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
         return Prediction(
             bias=0.0, 
             confidence=0.0, 
             confidence_state=ConfidenceState.UNKNOWN,
-            prob_up=0.0, 
-            prob_down=0.0, 
-            prob_flat=1.0,
+            prob_up=None, 
+            prob_down=None, 
+            prob_flat=None,
             model_name="phase0_additive", 
             model_version="1.0", 
             model_hash="BLOCKED",
