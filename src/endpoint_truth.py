@@ -49,6 +49,8 @@ class EndpointContext:
     freshness_state: str
     stale_age_min: Optional[int]
     na_reason: Optional[str]
+    endpoint_asof_ts_utc: Optional[datetime.datetime] = None
+    alignment_delta_sec: Optional[int] = None
 
 @dataclass(frozen=True)
 class PayloadAssessment:
@@ -159,20 +161,16 @@ def classify_payload(res: Any, prev_hash: Optional[str], method: str, path: str,
     return PayloadAssessment(pclass, policy, False, computed_changed, None)
 
 def _get_carry_forward_target(prev_state: Optional[EndpointStateRow], current_ts: datetime.datetime) -> Tuple[Optional[str], Optional[int]]:
-    """Prioritizes the exact timestamp of payload transformation (last_change), otherwise falls back to last fetch."""
     if not prev_state:
         return None, None
-    
     if prev_state.last_change_event_id and prev_state.last_change_ts_utc:
         prev_change_ts = to_utc_dt(prev_state.last_change_ts_utc, fallback=current_ts)
         age = max(0, int((current_ts - prev_change_ts).total_seconds()))
         return prev_state.last_change_event_id, age
-        
     if prev_state.last_success_event_id and prev_state.last_success_ts_utc:
         prev_success_ts = to_utc_dt(prev_state.last_success_ts_utc, fallback=current_ts)
         age = max(0, int((current_ts - prev_success_ts).total_seconds()))
         return prev_state.last_success_event_id, age
-        
     return None, None
 
 def resolve_effective_payload(

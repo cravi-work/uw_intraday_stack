@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS snapshots (snapshot_id UUID PRIMARY KEY, run_id UUID 
 CREATE TABLE IF NOT EXISTS meta_config (config_version INTEGER PRIMARY KEY, config_hash TEXT NOT NULL, config_yaml TEXT NOT NULL, created_at_utc TIMESTAMP DEFAULT current_timestamp);
 CREATE TABLE IF NOT EXISTS dim_endpoints (endpoint_id INTEGER PRIMARY KEY, method TEXT, path TEXT, signature TEXT UNIQUE, params_hash TEXT, params_json JSON);
 
-CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias DOUBLE, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON, decision_state TEXT NOT NULL DEFAULT 'UNKNOWN', risk_gate_status TEXT NOT NULL DEFAULT 'UNKNOWN', data_quality_state TEXT NOT NULL DEFAULT 'UNKNOWN', blocked_reasons_json JSON, degraded_reasons_json JSON, validation_eligible BOOLEAN NOT NULL DEFAULT TRUE);
+CREATE TABLE IF NOT EXISTS predictions (prediction_id UUID PRIMARY KEY, snapshot_id UUID REFERENCES snapshots(snapshot_id), horizon_minutes INTEGER, horizon_kind TEXT DEFAULT 'FIXED', horizon_seconds INTEGER, start_price DOUBLE, bias DOUBLE, confidence DOUBLE, prob_up DOUBLE, prob_down DOUBLE, prob_flat DOUBLE, model_name TEXT, model_version TEXT, model_hash TEXT, is_mock BOOLEAN DEFAULT FALSE, outcome_realized BOOLEAN DEFAULT FALSE, realized_at_utc TIMESTAMP, outcome_price DOUBLE, outcome_label TEXT, brier_score DOUBLE, log_loss DOUBLE, is_correct BOOLEAN, meta_json JSON, decision_state TEXT NOT NULL DEFAULT 'UNKNOWN', risk_gate_status TEXT NOT NULL DEFAULT 'UNKNOWN', data_quality_state TEXT NOT NULL DEFAULT 'UNKNOWN', blocked_reasons_json JSON, degraded_reasons_json JSON, validation_eligible BOOLEAN NOT NULL DEFAULT TRUE, gate_json JSON);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON, UNIQUE(snapshot_id, feature_key));
@@ -79,6 +79,7 @@ class DbWriter:
         _add("predictions", "blocked_reasons_json", "JSON")
         _add("predictions", "degraded_reasons_json", "JSON")
         _add("predictions", "validation_eligible", "BOOLEAN NOT NULL DEFAULT TRUE")
+        _add("predictions", "gate_json", "JSON")
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
         _add("endpoint_state", "last_attempt_event_id", "UUID")
@@ -115,7 +116,6 @@ class DbWriter:
         placeholders = ','.join(['?'] * len(event_ids))
         query = f"SELECT event_id, payload_json FROM raw_http_events WHERE event_id IN ({placeholders})"
         rows = con.execute(query, event_ids).fetchall()
-        
         res = {}
         for row in rows:
             eid, pj = str(row[0]), row[1]
@@ -125,16 +125,12 @@ class DbWriter:
             else: res[eid] = None
         return res
 
-    def insert_snapshot(
-        self, con, *, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close: bool, 
-        data_quality_score, market_close_utc: Optional[datetime], post_end_utc: Optional[datetime], seconds_to_close: Optional[int]
-    ) -> str:
+    def insert_snapshot(self, con, *, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close: bool, data_quality_score, market_close_utc: Optional[datetime], post_end_utc: Optional[datetime], seconds_to_close: Optional[int]) -> str:
         row = con.execute("SELECT snapshot_id FROM snapshots WHERE ticker=? AND asof_ts_utc=?", [ticker.upper(), asof_ts_utc]).fetchone()
         if row: return str(row[0])
         snapshot_id = uuid.uuid4()
         con.execute(
-            """INSERT INTO snapshots (snapshot_id, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close, data_quality_score, market_close_utc, post_end_utc, seconds_to_close, created_at_utc) 
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", 
+            """INSERT INTO snapshots (snapshot_id, run_id, asof_ts_utc, ticker, session_label, is_trading_day, is_early_close, data_quality_score, market_close_utc, post_end_utc, seconds_to_close, created_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", 
             [str(snapshot_id), str(run_id), asof_ts_utc, ticker.upper(), session_label, is_trading_day, is_early_close, data_quality_score, market_close_utc, post_end_utc, seconds_to_close, datetime.now(UTC)]
         )
         return str(snapshot_id)
@@ -157,9 +153,8 @@ class DbWriter:
         )
         pid = uuid.uuid4()
         con.execute(
-            """INSERT INTO predictions (prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, start_price, bias, confidence, prob_up, prob_down, prob_flat, model_name, model_version, model_hash, is_mock, meta_json, decision_state, risk_gate_status, data_quality_state, blocked_reasons_json, degraded_reasons_json, validation_eligible) 
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), json.dumps(p.get("meta_json", {})), p.get("decision_state", "UNKNOWN"), p.get("risk_gate_status", "UNKNOWN"), p.get("data_quality_state", "UNKNOWN"), json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), p.get("validation_eligible", True)]
+            """INSERT INTO predictions (prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, start_price, bias, confidence, prob_up, prob_down, prob_flat, model_name, model_version, model_hash, is_mock, meta_json, decision_state, risk_gate_status, data_quality_state, blocked_reasons_json, degraded_reasons_json, validation_eligible, gate_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), json.dumps(p.get("meta_json", {})), p.get("decision_state", "UNKNOWN"), p.get("risk_gate_status", "UNKNOWN"), p.get("data_quality_state", "UNKNOWN"), json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), p.get("validation_eligible", True), json.dumps(p.get("gate_json", {}))]
         )
         return pid
 
@@ -176,8 +171,7 @@ class DbWriter:
         safe_rec = to_utc_dt(rec_at, fallback=safe_req)
         eid = uuid.uuid4()
         con.execute(
-            """INSERT INTO raw_http_events (event_id, run_id, requested_at_utc, received_at_utc, ticker, endpoint_id, http_status, latency_ms, payload_hash, payload_json, is_retry, error_type, error_msg, circuit_state_json) 
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
+            """INSERT INTO raw_http_events (event_id, run_id, requested_at_utc, received_at_utc, ticker, endpoint_id, http_status, latency_ms, payload_hash, payload_json, is_retry, error_type, error_msg, circuit_state_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
             [str(eid), str(run_id), safe_req, safe_rec, ticker, endpoint_id, status, lat, ph, json.dumps(pj) if pj is not None else None, retry, etype, emsg, json.dumps(circ) if circ else None]
         )
         return eid
@@ -185,8 +179,7 @@ class DbWriter:
     def begin_run(self, con, asof_ts_utc, session_label, is_trading_day, is_early_close, config_version, api_catalog_hash, notes=""):
         run_id = uuid.uuid4()
         con.execute(
-            """INSERT INTO meta_runs (run_id, started_at_utc, ended_at_utc, asof_ts_utc, session_label, is_trading_day, is_early_close, config_version, api_catalog_hash, notes) 
-               VALUES (?,?,?,?,?,?,?,?,?,?)""", 
+            """INSERT INTO meta_runs (run_id, started_at_utc, ended_at_utc, asof_ts_utc, session_label, is_trading_day, is_early_close, config_version, api_catalog_hash, notes) VALUES (?,?,?,?,?,?,?,?,?,?)""", 
             [str(run_id), datetime.now(UTC), None, asof_ts_utc, session_label, is_trading_day, is_early_close, config_version, api_catalog_hash, notes]
         )
         return run_id
@@ -202,58 +195,26 @@ class DbWriter:
         con.executemany("INSERT OR IGNORE INTO dim_tickers (ticker) VALUES (?)", [[t.upper()] for t in tickers])
 
     def get_endpoint_state(self, con, ticker: str, endpoint_id: int) -> Optional[EndpointStateRow]:
-        row = con.execute(
-            """
-            SELECT last_success_event_id, last_success_ts_utc, last_payload_hash, 
-                   last_change_ts_utc, last_change_event_id 
-            FROM endpoint_state 
-            WHERE ticker=? AND endpoint_id=?
-            """, 
-            [ticker, endpoint_id]
-        ).fetchone()
-        
-        if not row: 
-            return None
-            
-        return EndpointStateRow(
-            last_success_event_id=str(row[0]) if row[0] else None,
-            last_success_ts_utc=row[1],
-            last_payload_hash=row[2],
-            last_change_ts_utc=row[3],
-            last_change_event_id=str(row[4]) if row[4] else None
-        )
+        row = con.execute("SELECT last_success_event_id, last_success_ts_utc, last_payload_hash, last_change_ts_utc, last_change_event_id FROM endpoint_state WHERE ticker=? AND endpoint_id=?", [ticker, endpoint_id]).fetchone()
+        if not row: return None
+        return EndpointStateRow(last_success_event_id=str(row[0]) if row[0] else None, last_success_ts_utc=row[1], last_payload_hash=row[2], last_change_ts_utc=row[3], last_change_event_id=str(row[4]) if row[4] else None)
 
     def upsert_endpoint_state(self, con, ticker: str, endpoint_id: int, event_id: str, res: Any, attempt_ts_utc: datetime, is_success_class: bool, changed: bool) -> None:
         con.execute("INSERT OR IGNORE INTO endpoint_state (ticker, endpoint_id) VALUES (?,?)", [ticker, endpoint_id])
-        con.execute(
-            """UPDATE endpoint_state SET last_attempt_event_id=?, last_attempt_ts_utc=?, last_attempt_http_status=?, last_attempt_error_type=?, last_attempt_error_msg=? WHERE ticker=? AND endpoint_id=?""",
-            [str(event_id), attempt_ts_utc, res.status_code, res.error_type, res.error_message, ticker, endpoint_id]
-        )
+        con.execute("UPDATE endpoint_state SET last_attempt_event_id=?, last_attempt_ts_utc=?, last_attempt_http_status=?, last_attempt_error_type=?, last_attempt_error_msg=? WHERE ticker=? AND endpoint_id=?", [str(event_id), attempt_ts_utc, res.status_code, res.error_type, res.error_message, ticker, endpoint_id])
         if is_success_class:
-            con.execute(
-                """UPDATE endpoint_state SET last_success_event_id=?, last_success_ts_utc=?, last_payload_hash=?, last_change_ts_utc=CASE WHEN ? THEN ? ELSE last_change_ts_utc END, last_change_event_id=CASE WHEN ? THEN ? ELSE last_change_event_id END WHERE ticker=? AND endpoint_id=?""",
-                [str(event_id), attempt_ts_utc, res.payload_hash, changed, attempt_ts_utc, changed, str(event_id), ticker, endpoint_id]
-            )
+            con.execute("UPDATE endpoint_state SET last_success_event_id=?, last_success_ts_utc=?, last_payload_hash=?, last_change_ts_utc=CASE WHEN ? THEN ? ELSE last_change_ts_utc END, last_change_event_id=CASE WHEN ? THEN ? ELSE last_change_event_id END WHERE ticker=? AND endpoint_id=?", [str(event_id), attempt_ts_utc, res.payload_hash, changed, attempt_ts_utc, changed, str(event_id), ticker, endpoint_id])
 
     def insert_features(self, con, snapshot_id, features_with_meta: List[Dict[str, Any]]):
         for f in features_with_meta:
-            con.execute(
-                "INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json) VALUES (?,?,?,?) ON CONFLICT (snapshot_id, feature_key) DO UPDATE SET feature_value = excluded.feature_value, meta_json = excluded.meta_json", 
-                [str(snapshot_id), f["feature_key"], f["feature_value"], json.dumps(f["meta_json"])]
-            )
+            con.execute("INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json) VALUES (?,?,?,?) ON CONFLICT (snapshot_id, feature_key) DO UPDATE SET feature_value = excluded.feature_value, meta_json = excluded.meta_json", [str(snapshot_id), f["feature_key"], f["feature_value"], json.dumps(f["meta_json"])])
             
     def insert_levels(self, con, snapshot_id, levels: List[Dict[str, Any]]):
         if not levels: return
-        con.executemany(
-            "INSERT INTO derived_levels (snapshot_id, level_type, price, magnitude, meta_json) VALUES (?,?,?,?,?)", 
-            [[str(snapshot_id), l["level_type"], l["price"], l["magnitude"], json.dumps(l.get("meta_json", {}))] for l in levels]
-        )
+        con.executemany("INSERT INTO derived_levels (snapshot_id, level_type, price, magnitude, meta_json) VALUES (?,?,?,?,?)", [[str(snapshot_id), l["level_type"], l["price"], l["magnitude"], json.dumps(l.get("meta_json", {}))] for l in levels])
         
     def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json):
-        con.execute(
-            """INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (snapshot_id, endpoint_id) DO UPDATE SET used_event_id = excluded.used_event_id, freshness_state = excluded.freshness_state, data_age_seconds = excluded.data_age_seconds, payload_class = excluded.payload_class, na_reason = excluded.na_reason, meta_json = excluded.meta_json""", 
-            [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds, payload_class, na_reason, json.dumps(meta_json) if meta_json else "{}"]
-        )
+        con.execute("INSERT INTO snapshot_lineage (snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (snapshot_id, endpoint_id) DO UPDATE SET used_event_id = excluded.used_event_id, freshness_state = excluded.freshness_state, data_age_seconds = excluded.data_age_seconds, payload_class = excluded.payload_class, na_reason = excluded.na_reason, meta_json = excluded.meta_json", [str(snapshot_id), endpoint_id, str(used_event_id) if used_event_id else None, freshness_state, data_age_seconds, payload_class, na_reason, json.dumps(meta_json) if meta_json else "{}"])
             
     def end_run(self, con, run_id):
         con.execute("UPDATE meta_runs SET ended_at_utc=? WHERE run_id=?", [datetime.now(UTC), str(run_id)])

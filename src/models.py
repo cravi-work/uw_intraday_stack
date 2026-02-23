@@ -1,5 +1,5 @@
-from typing import Dict, Any, List, Optional, Literal
-from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Literal, Tuple
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -11,16 +11,36 @@ DataQualityState = Literal["VALID", "STALE", "PARTIAL", "INVALID"]
 DecisionState = Literal["LONG", "SHORT", "NEUTRAL", "NO_TRADE"]
 RiskGateStatus = Literal["PASS", "BLOCKED", "DEGRADED"]
 
-@dataclass
+@dataclass(frozen=True)
 class DecisionGate:
     data_quality_state: DataQualityState
     risk_gate_status: RiskGateStatus
     decision_state: DecisionState
-    blocked_reasons: List[str] = field(default_factory=list)
-    degraded_reasons: List[str] = field(default_factory=list)
+    blocked_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    degraded_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    alignment_violations: Tuple[str, ...] = field(default_factory=tuple)
+    critical_endpoints_missing: Tuple[int, ...] = field(default_factory=tuple)
     validation_eligible: bool = True
 
-@dataclass
+    def block(self, reason: str, invalid: bool = False) -> 'DecisionGate':
+        return replace(
+            self,
+            risk_gate_status="BLOCKED",
+            decision_state="NO_TRADE",
+            data_quality_state="INVALID" if invalid else self.data_quality_state,
+            blocked_reasons=self.blocked_reasons + (reason,),
+            validation_eligible=False
+        )
+
+    def degrade(self, reason: str, partial: bool = False) -> 'DecisionGate':
+        return replace(
+            self,
+            risk_gate_status="DEGRADED" if self.risk_gate_status == "PASS" else self.risk_gate_status,
+            data_quality_state="PARTIAL" if partial else self.data_quality_state,
+            degraded_reasons=self.degraded_reasons + (reason,)
+        )
+
+@dataclass(frozen=True)
 class Prediction:
     bias: float
     confidence: float
@@ -34,18 +54,12 @@ class Prediction:
     gate: DecisionGate
 
 def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> PredictionLabel:
-    """
-    Determines the discrete predicted label from continuous probabilities.
-    Exact Tie Rule: FLAT > UP > DOWN.
-    Gracefully falls back to FLAT if probabilities are invalid (NaN/None).
-    """
     try:
         if math.isnan(prob_up) or math.isnan(prob_down) or math.isnan(prob_flat):
             return "FLAT"
     except TypeError:
         return "FLAT"
 
-    # Deterministic resolution order for ties
     if prob_flat >= prob_up and prob_flat >= prob_down: return "FLAT"
     if prob_up >= prob_down: return "UP"
     return "DOWN"
@@ -64,9 +78,9 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
-    # 1. Critical Risk Block Path
+    # Critical Risk Block Path
     if gate.risk_gate_status == "BLOCKED":
-        gate.decision_state = "NO_TRADE"
+        gate = replace(gate, decision_state="NO_TRADE")
         return Prediction(
             bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0,
             model_name="phase0_additive", model_version="1.0", model_hash="BLOCKED",
@@ -104,15 +118,15 @@ def bounded_additive_score(
     if abs(raw_bias) < (neutral_threshold + direction_margin):
         p_up = remaining / 2.0
         p_down = remaining / 2.0
-        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "NEUTRAL"
+        gate = replace(gate, decision_state="NEUTRAL" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
     elif raw_bias > 0:
         p_up = remaining * (0.5 + (raw_bias / 2.0))
         p_down = remaining - p_up
-        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "LONG"
+        gate = replace(gate, decision_state="LONG" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
     else:
         p_down = remaining * (0.5 + (abs(raw_bias) / 2.0))
         p_up = remaining - p_down
-        if gate.risk_gate_status != "BLOCKED": gate.decision_state = "SHORT"
+        gate = replace(gate, decision_state="SHORT" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
 
     p_up, p_down, flat_prob = round(p_up, 4), round(p_down, 4), round(flat_prob, 4)
     
