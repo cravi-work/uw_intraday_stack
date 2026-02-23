@@ -1,6 +1,7 @@
 from __future__ import annotations
 import copy
 import datetime
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from dataclasses import dataclass
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
 from .analytics import build_gex_levels
+
+logger = logging.getLogger(__name__)
 
 _grab_list = grab_list 
 _as_float = safe_float 
@@ -467,3 +470,5 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
         f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
 
     return f_rows, l_rows
+
+logger.info("Features module initialized successfully", extra={"event": "module_init", "module": "features"})

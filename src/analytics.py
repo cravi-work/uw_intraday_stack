@@ -1,5 +1,8 @@
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 from .na import safe_float, grab_list
+
+logger = logging.getLogger(__name__)
 
 def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
     """
@@ -44,3 +47,5 @@ def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[
         }))
         
     return levels
+
+logger.info("Analytics module initialized successfully", extra={"event": "module_init", "module": "analytics"})
