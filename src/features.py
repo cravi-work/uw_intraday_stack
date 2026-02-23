@@ -51,27 +51,23 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/ohlc/{candle_size}": 1
 }
 
-def _find_first(obj: Any, keys: List[str]) -> Any:
-    if not isinstance(obj, dict): return None
-    for k in keys:
-        if k in obj: return obj[k]
-    return None
-
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
-    if scale == 0: return None 
+    if scale == 0: 
+        return None 
     val = safe_float(x)
-    if val is None: return None
+    if val is None or not math.isfinite(val): 
+        return None
     return max(-1.0, min(1.0, val / scale))
 
-def _parse_ts(row: dict) -> float:
-    """Helper to deterministically extract timestamps for payload sorting."""
-    ts_val = _find_first(row, ["t", "ts", "date", "timestamp", "time"])
+def _parse_strict_ts(row: dict, key: str) -> float:
+    """Helper to deterministically extract explicit timestamps."""
+    ts_val = row.get(key)
     if isinstance(ts_val, (int, float)): 
         return float(ts_val)
     if isinstance(ts_val, str):
         try:
             return datetime.datetime.fromisoformat(ts_val.replace('Z', '+00:00')).timestamp()
-        except Exception:
+        except ValueError:
             pass
     return 0.0
 
@@ -130,97 +126,77 @@ def _build_error_meta(
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "spot",
-        "fields_used": ["close", "c", "price", "t", "ts", "date"],
-        "units_expected": "USD (or base)",
-        "normalization": "direct scale (none)",
-        "session_applicability": "RTH/PRE/AFT (market time)",
-        "quality_policy": "None on missing/empty/error"
+        "fields_used": ["close", "t"],
+        "units_expected": "USD",
+        "normalization": "none",
+        "session_applicability": "PRE/RTH/AFT",
+        "quality_policy": "None if missing required explicit keys"
     }
     
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, ctx.na_reason or "missing_dependency_payload")})
+        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, ctx.na_reason or "missing_dependency")})
         
     rows = grab_list(ohlc_payload)
     if not rows:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "no_rows")})
     
-    # FIX: Timestamp-aware selection instead of blind `rows[-1]`
-    latest_row = max(rows, key=_parse_ts)
+    # Sort strictly by timestamp instead of relying on array order
+    latest_row = max(rows, key=lambda r: _parse_strict_ts(r, "t"))
     
-    close = safe_float(_find_first(latest_row, ["close", "c", "price"]))
-    ts = _find_first(latest_row, ["t", "ts", "date", "time"])
-    
-    if close is None:
-        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "missing_close_field")})
+    if "close" not in latest_row:
+        return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "missing_explicit_close_field")})
         
-    return FeatureBundle({"spot": close}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": ts})})
+    close_val = safe_float(latest_row["close"])
+    return FeatureBundle({"spot": close_val}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": latest_row.get("t")})})
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     lineage = {
         "metric_name": "smart_whale_pressure",
-        "fields_used": ["premium", "dte", "side", "put_call", "cost", "value", "exp_days", "sentiment", "type", "option_type", "right"],
+        "fields_used": ["premium", "dte", "side", "put_call"],
         "units_expected": "Net Premium Flow (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
-        "session_applicability": "RTH Options Regime",
-        "quality_policy": "None on bad schema/fields. filtered_zero returns None to prevent fake neutral confidence."
+        "session_applicability": "RTH",
+        "quality_policy": "None on filtered zeros to avoid false baseline certainty"
     }
     
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency_payload")})
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency")})
 
     trades = grab_list(flow_payload)
-    raw_list = None
-    is_list_container = False
-    
-    if isinstance(flow_payload, list):
-        is_list_container = True
-        raw_list = flow_payload
-    elif isinstance(flow_payload, dict):
-        for k in ["data", "trades", "results", "history", "items"]:
-            val = flow_payload.get(k)
-            if val is not None and isinstance(val, list):
-                is_list_container = True
-                raw_list = val
-                break
-    
+    if not trades and isinstance(flow_payload, dict) and "data" in flow_payload:
+        trades = flow_payload["data"]
+        
     if not trades:
-        if not is_list_container:
-            return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "unrecognized_schema")})
-        if raw_list and len(raw_list) > 0:
-             return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
-             
-        # Empty valid: there are genuinely no trades today.
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
     whale_call, whale_put = 0.0, 0.0
-    valid_count, parseable_count, skip_missing_fields, skip_bad_type, skip_bad_side, skip_threshold = 0, 0, 0, 0, 0, 0
+    valid_count, skip_missing_fields, skip_bad_type, skip_bad_side, skip_threshold = 0, 0, 0, 0, 0
     
-    # FIX: Expanded and strictly guarded normalizations
     pc_map = {"C": "CALL", "CALL": "CALL", "CALLS": "CALL", "P": "PUT", "PUT": "PUT", "PUTS": "PUT"}
     side_map = {"ASK": "BULL", "BUY": "BULL", "BULLISH": "BULL", "BOT": "BULL", "BID": "BEAR", "SELL": "BEAR", "BEARISH": "BEAR", "SOLD": "BEAR"}
     
     for t in trades:
-        prem = safe_float(_find_first(t, ["premium", "total_premium", "cost", "value"]))
-        dte = safe_float(_find_first(t, ["dte", "exp_days"]))
-        side_raw = _find_first(t, ["side", "sentiment", "type"])
-        pc_raw = _find_first(t, ["put_call", "option_type", "right"])
+        # Strict explicit key access
+        prem = safe_float(t.get("premium"))
+        dte = safe_float(t.get("dte"))
+        side_raw = t.get("side")
+        pc_raw = t.get("put_call")
         
         if prem is None or dte is None or is_na(side_raw) or is_na(pc_raw):
             skip_missing_fields += 1
             continue
             
         pc_norm = pc_map.get(str(pc_raw).upper().strip())
+        side_norm = side_map.get(str(side_raw).upper().strip())
+        
         if not pc_norm:
             skip_bad_type += 1
             continue
-            
-        side_norm = side_map.get(str(side_raw).upper().strip())
         if not side_norm:
             skip_bad_side += 1 
             continue
 
-        parseable_count += 1
         if prem < min_premium or dte > max_dte:
             skip_threshold += 1
             continue
@@ -234,32 +210,25 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
             else: whale_put -= prem
 
     if valid_count == 0:
-        if parseable_count > 0:
-            # FIX: Return None for policy-filtered emptiness to prevent false neutral baseline
-            meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {
-                "status": "filtered_zero_treated_as_unknown", "n_raw_trades": len(trades), "parseable": parseable_count,
-                "skipped_threshold": skip_threshold, "policy": {"min_prem": min_premium, "max_dte": max_dte},
-                "confidence_impact": "DEGRADED"
-            })
-            meta["freshness_state"] = "EMPTY_VALID"
-            meta["na_reason"] = "no_trades_met_policy_thresholds"
-            return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
-            
-        if skip_missing_fields > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "missing_required_fields")})
-        if skip_bad_type > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "unrecognized_put_call")})
-        if skip_bad_side > 0: return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "unrecognized_side_labels")})
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "no_valid_trades_unknown")})
+        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {
+            "status": "filtered_zero_treated_as_unknown", 
+            "n_raw_trades": len(trades), 
+            "skipped_threshold": skip_threshold, 
+            "confidence_impact": "DEGRADED"
+        })
+        meta["freshness_state"] = "EMPTY_VALID"
+        meta["na_reason"] = "no_trades_met_policy_thresholds"
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
     net = whale_call - whale_put
     meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
-    # FIX: Explicit separation of exposure vs raw variants
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
     lineage = {
         "metric_name": "dealer_greeks",
-        "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "total_gamma_exposure"],
+        "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date"],
         "units_expected": "Notional Exposure (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "PRE/RTH",
@@ -267,43 +236,34 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     }
     
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency_payload")})
+        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency")})
 
     rows = grab_list(greek_payload)
     if not rows:
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, "no_rows")})
 
-    # FIX: Timestamp-aware selection
-    latest = max(rows, key=_parse_ts)
+    latest = max(rows, key=lambda r: _parse_strict_ts(r, "date"))
     
-    def _sum_exp(row, metric):
-        t = safe_float(_find_first(row, [f"{metric}_exposure", f"total_{metric}_exposure"]))
-        if t is not None: return t
-        c = safe_float(_find_first(row, [f"call_{metric}_exposure", f"calls_{metric}_exposure"]))
-        p = safe_float(_find_first(row, [f"put_{metric}_exposure", f"puts_{metric}_exposure"]))
-        if c is not None and p is not None: return c + p
-        return None
-
     meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {"ts": latest.get("date"), "scale_used": norm_scale})
     
     return FeatureBundle({
-        "dealer_vanna": _normalize_signed(_sum_exp(latest, "vanna"), scale=norm_scale),
-        "dealer_charm": _normalize_signed(_sum_exp(latest, "charm"), scale=norm_scale),
-        "net_gamma_exposure_notional": _normalize_signed(_sum_exp(latest, "gamma"), scale=norm_scale)
+        "dealer_vanna": _normalize_signed(safe_float(latest.get("vanna_exposure")), scale=norm_scale),
+        "dealer_charm": _normalize_signed(safe_float(latest.get("charm_exposure")), scale=norm_scale),
+        "net_gamma_exposure_notional": _normalize_signed(safe_float(latest.get("gamma_exposure")), scale=norm_scale)
     }, {"greeks": meta})
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "net_gex_sign",
-        "fields_used": ["gamma_exposure", "gex", "total_gamma_exposure"],
+        "fields_used": ["gamma_exposure"],
         "units_expected": "Sign (+1.0, 0.0, -1.0)",
         "normalization": "Directional sign clamping",
         "session_applicability": "PRE/RTH",
-        "quality_policy": "None on missing or purely raw gamma (non-exposure) inputs"
+        "quality_policy": "None on missing exposure fields"
     }
     
     if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency_payload")})
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency")})
 
     rows = grab_list(spot_exposures_payload)
     if not rows:
@@ -312,8 +272,7 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     tot_gamma = 0.0
     valid_rows = 0
     for r in rows:
-        # FIX: Narrowed aliases strictly to exposure types to prevent mathematically invalid sign regimes
-        g = safe_float(_find_first(r, ["gamma_exposure", "gex", "total_gamma_exposure"]))
+        g = safe_float(r.get("gamma_exposure"))
         if g is not None:
             tot_gamma += g
             valid_rows += 1
@@ -321,13 +280,13 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     if valid_rows == 0:
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "missing_gamma_exposure_fields")})
     
-    if abs(tot_gamma) <= 1e-9: sign = 0.0
-    else: sign = 1.0 if tot_gamma > 0 else -1.0
+    if abs(tot_gamma) <= 1e-9: 
+        sign = 0.0
+    else: 
+        sign = 1.0 if tot_gamma > 0 else -1.0
         
     meta = _build_meta(ctx, "extract_gex_sign", lineage, {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
-
-# --- Central Extraction Orchestrator Registry ---
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
@@ -380,7 +339,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
         payload = effective_payloads.get(eid)
         routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
         
-        # FIX: The `ctx.stale_age_min` bug is resolved by explicit None handling inside candidate mapping.
+        # Explicit None handling prevents younger data from losing priority
         safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
         
         if routing_key == "GEX":
@@ -388,7 +347,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             
-            # FIX: Explicit guard checking schema readiness before pushing into analytics
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
                 levels = build_gex_levels(payload)
                 for l_type, price, mag, details in levels:
@@ -429,7 +387,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     if not math.isclose(best.feature_value, other.feature_value, abs_tol=1e-9):
                         raise RuntimeError(f"FEATURE_CONFLICT:{f_key} - Endpoint {best.endpoint_id} vs {other.endpoint_id} generated divergent values at equal rank.")
                     
-        # FIX: Deep-copying before appending shadow mutations eliminates sibling bleeding.
+        # Deep copy protects siblings from cross-pollution
         meta = copy.deepcopy(best.meta_json)
         if len(group) > 1:
             meta.setdefault("details", {})["shadowed_candidates"] = [

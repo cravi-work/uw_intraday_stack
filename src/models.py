@@ -1,21 +1,43 @@
-from typing import Dict, Any, List, Optional, Literal, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field, replace
+from enum import Enum
 import hashlib
 import json
 import math
 
-PredictionLabel = Literal["UP", "DOWN", "FLAT"]
-HorizonKind = Literal["FIXED", "TO_CLOSE"]
-SessionState = Literal["PREMARKET", "RTH", "AFTERHOURS", "CLOSED"]
-DataQualityState = Literal["VALID", "STALE", "PARTIAL", "INVALID"]
-DecisionState = Literal["LONG", "SHORT", "NEUTRAL", "NO_TRADE"]
-RiskGateStatus = Literal["PASS", "BLOCKED", "DEGRADED"]
+class SessionState(str, Enum):
+    PREMARKET = "PREMARKET"
+    RTH = "RTH"
+    AFTERHOURS = "AFTERHOURS"
+    CLOSED = "CLOSED"
+
+class DataQualityState(str, Enum):
+    VALID = "VALID"
+    STALE = "STALE"
+    PARTIAL = "PARTIAL"
+    INVALID = "INVALID"
+    DEGRADED = "DEGRADED"
+
+class SignalState(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    NEUTRAL = "NEUTRAL"
+    NO_SIGNAL = "NO_SIGNAL"
+
+class RiskGateStatus(str, Enum):
+    PASS = "PASS"
+    BLOCKED = "BLOCKED"
+    DEGRADED = "DEGRADED"
+
+class HorizonKind(str, Enum):
+    FIXED = "FIXED"
+    TO_CLOSE = "TO_CLOSE"
 
 @dataclass(frozen=True)
 class DecisionGate:
     data_quality_state: DataQualityState
     risk_gate_status: RiskGateStatus
-    decision_state: DecisionState
+    decision_state: SignalState
     blocked_reasons: Tuple[str, ...] = field(default_factory=tuple)
     degraded_reasons: Tuple[str, ...] = field(default_factory=tuple)
     alignment_violations: Tuple[str, ...] = field(default_factory=tuple)
@@ -23,20 +45,23 @@ class DecisionGate:
     validation_eligible: bool = True
 
     def block(self, reason: str, invalid: bool = False) -> 'DecisionGate':
+        """Returns a new blocked DecisionGate instance without mutating the original."""
         return replace(
             self,
-            risk_gate_status="BLOCKED",
-            decision_state="NO_TRADE",
-            data_quality_state="INVALID" if invalid else self.data_quality_state,
+            risk_gate_status=RiskGateStatus.BLOCKED,
+            decision_state=SignalState.NO_SIGNAL,
+            data_quality_state=DataQualityState.INVALID if invalid else self.data_quality_state,
             blocked_reasons=self.blocked_reasons + (reason,),
             validation_eligible=False
         )
 
     def degrade(self, reason: str, partial: bool = False) -> 'DecisionGate':
+        """Returns a new degraded DecisionGate instance without mutating the original."""
+        new_status = RiskGateStatus.DEGRADED if self.risk_gate_status == RiskGateStatus.PASS else self.risk_gate_status
         return replace(
             self,
-            risk_gate_status="DEGRADED" if self.risk_gate_status == "PASS" else self.risk_gate_status,
-            data_quality_state="PARTIAL" if partial else self.data_quality_state,
+            risk_gate_status=new_status,
+            data_quality_state=DataQualityState.PARTIAL if partial else self.data_quality_state,
             degraded_reasons=self.degraded_reasons + (reason,)
         )
 
@@ -53,15 +78,21 @@ class Prediction:
     meta: Dict[str, Any]
     gate: DecisionGate
 
-def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> PredictionLabel:
+def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
+    """
+    Determines the discrete predicted label from continuous probabilities.
+    Exact Tie Rule: FLAT > UP > DOWN.
+    """
     try:
         if math.isnan(prob_up) or math.isnan(prob_down) or math.isnan(prob_flat):
             return "FLAT"
     except TypeError:
         return "FLAT"
 
-    if prob_flat >= prob_up and prob_flat >= prob_down: return "FLAT"
-    if prob_up >= prob_down: return "UP"
+    if prob_flat >= prob_up and prob_flat >= prob_down: 
+        return "FLAT"
+    if prob_up >= prob_down: 
+        return "UP"
     return "DOWN"
 
 def bounded_additive_score(
@@ -78,9 +109,8 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
-    # Critical Risk Block Path
-    if gate.risk_gate_status == "BLOCKED":
-        gate = replace(gate, decision_state="NO_TRADE")
+    if gate.risk_gate_status == RiskGateStatus.BLOCKED:
+        gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
         return Prediction(
             bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0,
             model_name="phase0_additive", model_version="1.0", model_hash="BLOCKED",
@@ -96,7 +126,7 @@ def bounded_additive_score(
     for key, w in weights.items():
         val = features.get(key)
         total_weight += abs(w)
-        if val is not None:
+        if val is not None and math.isfinite(val):
             score_sum += val * w
             present_weight += abs(w)
         else:
@@ -118,15 +148,17 @@ def bounded_additive_score(
     if abs(raw_bias) < (neutral_threshold + direction_margin):
         p_up = remaining / 2.0
         p_down = remaining / 2.0
-        gate = replace(gate, decision_state="NEUTRAL" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
+        new_signal = SignalState.NEUTRAL
     elif raw_bias > 0:
         p_up = remaining * (0.5 + (raw_bias / 2.0))
         p_down = remaining - p_up
-        gate = replace(gate, decision_state="LONG" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
+        new_signal = SignalState.LONG
     else:
         p_down = remaining * (0.5 + (abs(raw_bias) / 2.0))
         p_up = remaining - p_down
-        gate = replace(gate, decision_state="SHORT" if gate.risk_gate_status != "BLOCKED" else gate.decision_state)
+        new_signal = SignalState.SHORT
+
+    gate = replace(gate, decision_state=new_signal if gate.risk_gate_status != RiskGateStatus.BLOCKED else gate.decision_state)
 
     p_up, p_down, flat_prob = round(p_up, 4), round(p_down, 4), round(flat_prob, 4)
     
