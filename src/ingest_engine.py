@@ -16,7 +16,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
-from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState
+from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState, SessionState
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -158,7 +158,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
         logger.info("Outside ingest window", extra={"json": {"asof_et": asof_et.isoformat()}})
         return
 
-    sess = hours.get_session_label(asof_et)
+    sess_str = hours.get_session_label(asof_et)
+    session_enum = SessionState(sess_str)
     close_utc = hours.market_close_et.astimezone(UTC) if hours.market_close_et else None
     post_utc = hours.post_end_et.astimezone(UTC) if hours.post_end_et else None
     sec_to_close = hours.seconds_to_close(asof_et)
@@ -206,12 +207,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                 cfg_ver = db.insert_config(con, cfg_text)
 
-                run_notes = f"SESS={sess}"
+                run_notes = f"SESS={sess_str}"
                 if hours.reason != "NORMAL":
                     run_notes += f"; {hours.reason}"
                     
                 run_id = db.begin_run(
-                    con, asof_utc, sess, hours.is_trading_day, 
+                    con, asof_utc, sess_str, hours.is_trading_day, 
                     hours.is_early_close, cfg_ver, registry.catalog_hash, notes=run_notes
                 )
 
@@ -247,7 +248,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         fallback=to_utc_dt(res.requested_at_utc, fallback=dt.datetime.now(UTC))
                     )
                     
-                    assessment = classify_payload(res, prev_hash, call.method, call.path, sess)
+                    assessment = classify_payload(res, prev_hash, call.method, call.path, sess_str)
 
                     is_success_class = (
                         assessment.payload_class in (EndpointPayloadClass.SUCCESS_HAS_DATA, EndpointPayloadClass.SUCCESS_STALE) or 
@@ -293,7 +294,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     dq = (valid_count / len(evs)) if evs else 0.0
 
                     snapshot_id = db.insert_snapshot(
-                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess,
+                        con, run_id=run_id, asof_ts_utc=asof_utc, ticker=tkr, session_label=sess_str,
                         is_trading_day=True, is_early_close=hours.is_early_close, data_quality_score=dq,
                         market_close_utc=close_utc, post_end_utc=post_utc, seconds_to_close=sec_to_close,
                     )
@@ -368,7 +369,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     features_insert_list, levels_insert_list = extract_all(effective_payloads, contexts)
                     
-                    # --- Strict Validation Gate ---
                     valid_features = []
                     valid_levels = []
                     malformed_count = 0
@@ -422,7 +422,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
-                    # --- Prediction Execution (Risk Gate Integrated) ---
+                    # --- Cross-Endpoint Alignment Gate ---
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in valid_features}
                     start_price = feat_dict.get("spot") 
 
@@ -432,24 +432,26 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         decision_state=SignalState.NEUTRAL
                     )
 
-                    # Cross-Endpoint Timestamp Alignment Gate
                     for ctx in contexts.values():
-                        if ctx.alignment_delta_sec is not None and ctx.alignment_delta_sec > alignment_tolerance_sec:
-                            base_gate = base_gate.degrade(f"alignment_tolerance_exceeded_ep_{ctx.endpoint_id}", partial=True)
+                        if ctx.endpoint_asof_ts_utc is None:
+                            base_gate = base_gate.degrade(f"missing_inner_ts_ep_{ctx.endpoint_id}", partial=True)
+                        elif ctx.alignment_delta_sec is not None and ctx.alignment_delta_sec > alignment_tolerance_sec:
+                            base_gate = base_gate.block(f"misaligned_endpoint_{ctx.endpoint_id}", invalid=True)
+
+                    if session_enum == SessionState.CLOSED:
+                        base_gate = base_gate.block("session_closed", invalid=True)
 
                     if start_price is None:
                         base_gate = base_gate.block("missing_critical_feature_spot", invalid=True)
                     elif dq < 0.5:
                         base_gate = base_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
 
-                    # Horizon-specific score/prediction paths
-                    # (Requires users to add a dictionary of weights mapping to each config window if preferred)
                     horizon_weights_cfg = cfg.get("validation", {}).get("horizon_weights", {})
+                    default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
 
                     for h in cfg["validation"]["horizons_minutes"]:
                         h_str = str(h)
-                        # Default to baseline weights if explicit horizon-tailored weights aren't supplied yet
-                        weights = horizon_weights_cfg.get(h_str, {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
+                        weights = horizon_weights_cfg.get(h_str, default_weights)
                         
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=base_gate)
                         
@@ -463,6 +465,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
                                 "is_mock": not pred.gate.validation_eligible, "meta_json": pred.meta,
                                 "decision_state": pred.gate.decision_state.value, "risk_gate_status": pred.gate.risk_gate_status.value,
+                                "confidence_state": getattr(pred, "confidence_state", ConfidenceState.UNKNOWN).value,
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate)
@@ -470,7 +473,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         )
 
                     if sec_to_close is not None and sec_to_close > 0:
-                        weights = horizon_weights_cfg.get("to_close", {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5})
+                        weights = horizon_weights_cfg.get("to_close", default_weights)
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=base_gate)
                         
                         db.insert_prediction(
@@ -483,6 +486,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
                                 "is_mock": not pred.gate.validation_eligible, "meta_json": pred.meta,
                                 "decision_state": pred.gate.decision_state.value, "risk_gate_status": pred.gate.risk_gate_status.value,
+                                "confidence_state": getattr(pred, "confidence_state", ConfidenceState.UNKNOWN).value,
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate)

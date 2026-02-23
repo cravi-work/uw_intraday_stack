@@ -5,11 +5,13 @@ import hashlib
 import json
 import math
 
+
 class SessionState(str, Enum):
     PREMARKET = "PREMARKET"
     RTH = "RTH"
     AFTERHOURS = "AFTERHOURS"
     CLOSED = "CLOSED"
+
 
 class DataQualityState(str, Enum):
     VALID = "VALID"
@@ -18,20 +20,32 @@ class DataQualityState(str, Enum):
     INVALID = "INVALID"
     DEGRADED = "DEGRADED"
 
+
 class SignalState(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
     NEUTRAL = "NEUTRAL"
     NO_SIGNAL = "NO_SIGNAL"
 
+
+class ConfidenceState(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    DEGRADED = "DEGRADED"
+    UNKNOWN = "UNKNOWN"
+
+
 class RiskGateStatus(str, Enum):
     PASS = "PASS"
     BLOCKED = "BLOCKED"
     DEGRADED = "DEGRADED"
 
+
 class HorizonKind(str, Enum):
     FIXED = "FIXED"
     TO_CLOSE = "TO_CLOSE"
+
 
 @dataclass(frozen=True)
 class DecisionGate:
@@ -65,10 +79,12 @@ class DecisionGate:
             degraded_reasons=self.degraded_reasons + (reason,)
         )
 
+
 @dataclass(frozen=True)
 class Prediction:
     bias: float
     confidence: float
+    confidence_state: ConfidenceState
     prob_up: float
     prob_down: float
     prob_flat: float
@@ -77,6 +93,7 @@ class Prediction:
     model_hash: str
     meta: Dict[str, Any]
     gate: DecisionGate
+
 
 def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
     """
@@ -95,6 +112,7 @@ def predicted_class(prob_up: float, prob_down: float, prob_flat: float) -> str:
         return "UP"
     return "DOWN"
 
+
 def bounded_additive_score(
     features: Dict[str, Optional[float]],
     data_quality_score: float,
@@ -112,8 +130,15 @@ def bounded_additive_score(
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
         return Prediction(
-            bias=0.0, confidence=0.0, prob_up=0.0, prob_down=0.0, prob_flat=1.0,
-            model_name="phase0_additive", model_version="1.0", model_hash="BLOCKED",
+            bias=0.0, 
+            confidence=0.0, 
+            confidence_state=ConfidenceState.UNKNOWN,
+            prob_up=0.0, 
+            prob_down=0.0, 
+            prob_flat=1.0,
+            model_name="phase0_additive", 
+            model_version="1.0", 
+            model_hash="BLOCKED",
             meta={"coverage": 0.0, "dq_eff": 0.0, "missing_keys": list(weights.keys())},
             gate=gate
         )
@@ -160,16 +185,30 @@ def bounded_additive_score(
 
     gate = replace(gate, decision_state=new_signal if gate.risk_gate_status != RiskGateStatus.BLOCKED else gate.decision_state)
 
+    if confidence >= 0.7:
+        conf_state = ConfidenceState.HIGH
+    elif confidence >= 0.4:
+        conf_state = ConfidenceState.MEDIUM
+    else:
+        conf_state = ConfidenceState.LOW
+
+    if gate.risk_gate_status == RiskGateStatus.DEGRADED:
+        conf_state = ConfidenceState.DEGRADED
+
     p_up, p_down, flat_prob = round(p_up, 4), round(p_down, 4), round(flat_prob, 4)
     
     diff = 1.0 - (p_up + p_down + flat_prob)
     if abs(diff) > 1e-9:
-        if flat_prob >= p_up and flat_prob >= p_down: flat_prob += diff
-        elif p_up >= p_down: p_up += diff
-        else: p_down += diff
+        if flat_prob >= p_up and flat_prob >= p_down: 
+            flat_prob += diff
+        elif p_up >= p_down: 
+            p_up += diff
+        else: 
+            p_down += diff
             
     config_state = {
-        "weights": weights, "neutral_threshold": neutral_threshold,
+        "weights": weights, 
+        "neutral_threshold": neutral_threshold,
         "direction_margin": direction_margin,
         "flat_params": [min_flat_prob, max_flat_prob, flat_from_data_quality_scale],
         "conf_params": [min_confidence, confidence_cap],
@@ -178,9 +217,15 @@ def bounded_additive_score(
     model_hash = hashlib.sha256(json.dumps(config_state, sort_keys=True).encode()).hexdigest()[:16]
 
     return Prediction(
-        bias=raw_bias, confidence=confidence, prob_up=round(p_up, 4),
-        prob_down=round(p_down, 4), prob_flat=round(flat_prob, 4),
-        model_name="phase0_additive", model_version="1.0", model_hash=model_hash,
+        bias=raw_bias, 
+        confidence=confidence, 
+        confidence_state=conf_state,
+        prob_up=round(p_up, 4),
+        prob_down=round(p_down, 4), 
+        prob_flat=round(flat_prob, 4),
+        model_name="phase0_additive", 
+        model_version="1.0", 
+        model_hash=model_hash,
         meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys},
         gate=gate
     )

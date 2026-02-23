@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     decision_state TEXT NOT NULL DEFAULT 'UNKNOWN', 
     risk_gate_status TEXT NOT NULL DEFAULT 'UNKNOWN', 
     data_quality_state TEXT NOT NULL DEFAULT 'UNKNOWN', 
+    confidence_state TEXT NOT NULL DEFAULT 'UNKNOWN',
     blocked_reasons_json JSON, 
     degraded_reasons_json JSON, 
     validation_eligible BOOLEAN NOT NULL DEFAULT TRUE, 
@@ -63,7 +64,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON, UNIQUE(snapshot_id, feature_key));
 CREATE TABLE IF NOT EXISTS derived_levels (snapshot_id UUID, level_type TEXT, price DOUBLE, magnitude DOUBLE, meta_json JSON);
 
--- FIX: snapshot_id is strictly NOT NULL to prevent orphaned lineage links and corruption.
+-- MANDATORY P2 BLOCKER FIX: snapshot_id UUID NOT NULL
 CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID NOT NULL REFERENCES snapshots(snapshot_id), endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER, payload_class TEXT, na_reason TEXT, meta_json JSON, UNIQUE(snapshot_id, endpoint_id));
 CREATE TABLE IF NOT EXISTS endpoint_state (ticker TEXT, endpoint_id INTEGER, last_success_event_id UUID, last_success_ts_utc TIMESTAMP, last_payload_hash TEXT, last_change_ts_utc TIMESTAMP, last_change_event_id UUID, last_attempt_event_id UUID, last_attempt_ts_utc TIMESTAMP, last_attempt_http_status INTEGER, last_attempt_error_type TEXT, last_attempt_error_msg TEXT, PRIMARY KEY (ticker, endpoint_id));
 CREATE TABLE IF NOT EXISTS raw_http_events (event_id UUID PRIMARY KEY, run_id UUID, requested_at_utc TIMESTAMP, received_at_utc TIMESTAMP, ticker TEXT, endpoint_id INTEGER, http_status INTEGER, latency_ms INTEGER, payload_hash TEXT, payload_json JSON, is_retry BOOLEAN, error_type TEXT, error_msg TEXT, circuit_state_json JSON);
@@ -109,6 +110,7 @@ class DbWriter:
         _add("predictions", "decision_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
         _add("predictions", "risk_gate_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
         _add("predictions", "data_quality_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "confidence_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
         _add("predictions", "blocked_reasons_json", "JSON")
         _add("predictions", "degraded_reasons_json", "JSON")
         _add("predictions", "validation_eligible", "BOOLEAN NOT NULL DEFAULT TRUE")
@@ -199,15 +201,16 @@ class DbWriter:
                 prediction_id, snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, 
                 start_price, bias, confidence, prob_up, prob_down, prob_flat, 
                 model_name, model_version, model_hash, is_mock, meta_json, 
-                decision_state, risk_gate_status, data_quality_state, 
+                decision_state, risk_gate_status, data_quality_state, confidence_state,
                 blocked_reasons_json, degraded_reasons_json, validation_eligible, gate_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, 
                 p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], 
                 p["model_name"], p["model_version"], p["model_hash"], p.get("is_mock", False), 
                 json.dumps(p.get("meta_json", {})), p.get("decision_state", "UNKNOWN"), 
                 p.get("risk_gate_status", "UNKNOWN"), p.get("data_quality_state", "UNKNOWN"), 
+                p.get("confidence_state", "UNKNOWN"),
                 json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), 
                 p.get("validation_eligible", True), json.dumps(p.get("gate_json", {}))
             ]

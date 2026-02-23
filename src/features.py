@@ -4,6 +4,7 @@ import datetime
 import math
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping
 from dataclasses import dataclass
+
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
 from .analytics import build_gex_levels
@@ -11,10 +12,12 @@ from .analytics import build_gex_levels
 _grab_list = grab_list 
 _as_float = safe_float 
 
+
 class FeatureRow(TypedDict):
     feature_key: str
     feature_value: Optional[float]
     meta_json: Dict[str, Any]
+
 
 class LevelRow(TypedDict):
     level_type: str
@@ -22,10 +25,12 @@ class LevelRow(TypedDict):
     magnitude: Optional[float]
     meta_json: Dict[str, Any]
 
+
 @dataclass
 class FeatureBundle:
     features: Dict[str, Optional[float]]
     meta: Dict[str, Any]
+
 
 @dataclass
 class FeatureCandidate:
@@ -37,6 +42,7 @@ class FeatureCandidate:
     path_priority: int
     endpoint_id: int
     is_none: bool
+
 
 PATH_PRIORITY = {
     "/api/stock/{ticker}/spot-exposures": 1,
@@ -51,11 +57,6 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/ohlc/{candle_size}": 1
 }
 
-def _find_first(obj: Any, keys: List[str]) -> Any:
-    if not isinstance(obj, dict): return None
-    for k in keys:
-        if k in obj: return obj[k]
-    return None
 
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if scale == 0: 
@@ -65,7 +66,9 @@ def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
         return None
     return max(-1.0, min(1.0, val / scale))
 
+
 def _parse_strict_ts(row: dict, key: str) -> float:
+    """Helper to deterministically extract explicit timestamps."""
     ts_val = row.get(key)
     if isinstance(ts_val, (int, float)): 
         return float(ts_val)
@@ -75,6 +78,7 @@ def _parse_strict_ts(row: dict, key: str) -> float:
         except ValueError:
             pass
     return 0.0
+
 
 def _build_meta(
     ctx: EndpointContext, 
@@ -115,6 +119,7 @@ def _build_meta(
         "details": d
     }
 
+
 def _build_error_meta(
     ctx: EndpointContext, 
     extractor_name: str, 
@@ -125,6 +130,9 @@ def _build_error_meta(
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
     return meta
+
+
+# --- Extractors ---
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -151,6 +159,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     close_val = safe_float(latest_row["close"])
     return FeatureBundle({"spot": close_val}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": latest_row.get("t")})})
 
+
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     lineage = {
         "metric_name": "smart_whale_pressure",
@@ -168,13 +177,12 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
     if not trades and isinstance(flow_payload, dict) and "data" in flow_payload:
         trades = flow_payload["data"]
         
-    # FIX: Block malformed strings/arrays from penetrating the schema
     if trades and not all(isinstance(t, dict) for t in trades):
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
     if not trades:
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"status": "computed_zero_from_empty_valid", "n_trades": 0})
-        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
     whale_call, whale_put = 0.0, 0.0
     valid_count, skip_missing_fields, skip_bad_type, skip_bad_side, skip_threshold = 0, 0, 0, 0, 0
@@ -208,11 +216,15 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
             
         valid_count += 1
         if side_norm == "BULL":
-            if pc_norm == "CALL": whale_call += prem
-            else: whale_put += prem
+            if pc_norm == "CALL": 
+                whale_call += prem
+            else: 
+                whale_put += prem
         elif side_norm == "BEAR":
-            if pc_norm == "CALL": whale_call -= prem
-            else: whale_put -= prem
+            if pc_norm == "CALL": 
+                whale_call -= prem
+            else: 
+                whale_put -= prem
 
     if valid_count == 0:
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {
@@ -228,6 +240,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
     net = whale_call - whale_put
     meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
+
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
@@ -256,6 +269,7 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "dealer_charm": _normalize_signed(safe_float(latest.get("charm_exposure")), scale=norm_scale),
         "net_gamma_exposure_notional": _normalize_signed(safe_float(latest.get("gamma_exposure")), scale=norm_scale)
     }, {"greeks": meta})
+
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -292,6 +306,7 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         
     meta = _build_meta(ctx, "extract_gex_sign", lineage, {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
+
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
@@ -332,6 +347,7 @@ PRESENCE_ONLY_ENDPOINTS = {
     "/api/stock/{ticker}/net-prem-ticks",
     "/api/stock/{ticker}/stock-volume-price-levels"
 }
+
 
 def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, EndpointContext]) -> Tuple[List[FeatureRow], List[LevelRow]]:
     def rank_freshness(fs: str) -> int:
