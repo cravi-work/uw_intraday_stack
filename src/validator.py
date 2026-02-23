@@ -1,10 +1,13 @@
 from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
+
 import duckdb
-from .models import predicted_class, HorizonKind, SignalState
+
+from .models import predicted_class, SignalState
 
 UTC = timezone.utc
 
@@ -14,30 +17,38 @@ def _clamp_prob(p: float, eps: float = 1e-12) -> float:
 
 
 def _ensure_utc(dt_val: Optional[datetime]) -> Optional[datetime]:
-    if dt_val is None: return None
-    if dt_val.tzinfo is None: return dt_val.replace(tzinfo=UTC)
+    """Ensure a datetime is timezone-aware (UTC)."""
+    if dt_val is None:
+        return None
+    if dt_val.tzinfo is None:
+        return dt_val.replace(tzinfo=UTC)
     return dt_val
 
 
 def _is_valid_prob(p: Any) -> bool:
+    """Ensure probability is a mathematically finite float between 0 and 1."""
     return isinstance(p, (float, int)) and math.isfinite(p) and 0.0 <= p <= 1.0
-    
+
 
 def _is_valid_num(v: Any) -> bool:
+    """Ensure price/value is a mathematically finite number."""
     return isinstance(v, (int, float)) and math.isfinite(v)
 
 
-def _record_validation_skip(con: duckdb.DuckDBPyConnection, prediction_id: str, reason: str):
+def _record_validation_skip(con: duckdb.DuckDBPyConnection, prediction_id: str, reason: str) -> None:
+    """Explicitly records why a prediction was skipped to prevent silent failures."""
     con.execute(
-        "UPDATE predictions SET meta_json = json_insert(COALESCE(meta_json, '{}'), '$.validation_error', ?) WHERE prediction_id = ?", 
+        "UPDATE predictions SET meta_json = json_insert(COALESCE(meta_json, '{}'), '$.validation_error', ?) WHERE prediction_id = ?",
         [reason, prediction_id]
     )
 
 
 def realized_label(start_price: float, realized_price: float, flat_threshold_pct: float) -> str:
-    if start_price <= 0: return "SKIPPED"
+    if start_price <= 0:
+        return "SKIPPED"
     pct = (realized_price - start_price) / start_price
-    if abs(pct) < flat_threshold_pct: return "FLAT"
+    if abs(pct) < flat_threshold_pct:
+        return "FLAT"
     return "UP" if pct > 0 else "DOWN"
 
 
@@ -50,7 +61,8 @@ def brier_3class(prob_up: float, prob_down: float, prob_flat: float, label: str)
 
 def logloss_3class(prob_up: float, prob_down: float, prob_flat: float, label: str) -> float:
     p = {"UP": prob_up, "DOWN": prob_down, "FLAT": prob_flat}.get(label)
-    if p is None: return float("nan")
+    if p is None:
+        return float("nan")
     return -math.log(_clamp_prob(p))
 
 
@@ -60,32 +72,49 @@ class ValidationResult:
     skipped: int
 
 
-def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_threshold_pct: float, tolerance_minutes: int) -> ValidationResult:
+def validate_pending(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    now_utc: datetime,
+    flat_threshold_pct: float,
+    tolerance_minutes: int,
+) -> ValidationResult:
+    
     tol = timedelta(minutes=int(tolerance_minutes))
     now_utc = _ensure_utc(now_utc)
 
-    # Added SignalState NO_SIGNAL exclusion.
+    # STRICT HYGIENE: Only validate eligible predictions that actually yielded a signal.
     rows = con.execute(
         f"""SELECT p.prediction_id, p.snapshot_id, p.horizon_kind, p.horizon_minutes, p.horizon_seconds, 
-                  p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc
-           FROM predictions p JOIN snapshots s ON s.snapshot_id = p.snapshot_id
-           WHERE p.realized_at_utc IS NULL 
-             AND p.validation_eligible = TRUE 
-             AND p.decision_state != '{SignalState.NO_SIGNAL.value}'"""
+                  p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc, p.decision_state
+           FROM predictions p 
+           JOIN snapshots s ON s.snapshot_id = p.snapshot_id
+           WHERE p.realized_at_utc IS NULL
+             AND p.validation_eligible = TRUE"""
     ).fetchall()
 
-    updated, skipped = 0, 0
+    updated = 0
+    skipped = 0
+
     cols_pred = [r[1] for r in con.execute("PRAGMA table_info('predictions')").fetchall()]
     has_outcome_price = "outcome_price" in cols_pred
 
     set_parts = ["realized_at_utc = ?", "outcome_label = ?", "brier_score = ?", "log_loss = ?", "outcome_realized = ?", "is_correct = ?"]
-    if has_outcome_price: set_parts.insert(0, "outcome_price = ?")
+    if has_outcome_price:
+        set_parts.insert(0, "outcome_price = ?")
+        
     update_sql = "UPDATE predictions SET " + ", ".join(set_parts) + " WHERE prediction_id = ?"
 
-    for (prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds, start_price, prob_up, prob_down, prob_flat, ticker, asof_ts_utc) in rows:
+    for (prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds, start_price, prob_up, prob_down, prob_flat, ticker, asof_ts_utc, decision_state) in rows:
         pid = str(prediction_id)
         asof_ts_utc = _ensure_utc(asof_ts_utc)
+        
         if asof_ts_utc is None:
+            skipped += 1
+            continue
+
+        if decision_state == SignalState.NO_SIGNAL.value:
+            _record_validation_skip(con, pid, "SKIP_NO_SIGNAL")
             skipped += 1
             continue
         
@@ -112,6 +141,7 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
             skipped += 1
             continue
 
+        # EXACT HORIZON TARGETING
         if horizon_kind == "TO_CLOSE":
             if not _is_valid_num(horizon_seconds) or horizon_seconds <= 0:
                 _record_validation_skip(con, pid, "invalid_to_close_horizon_seconds")
@@ -125,17 +155,23 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
                 continue
             target_ts = asof_ts_utc + timedelta(minutes=int(horizon_minutes))
             
-        if target_ts > now_utc: 
+        if target_ts > now_utc:
             continue
 
+        # START PRICE RESOLUTION
         if start_price is not None:
             start_spot = float(start_price)
         else:
-            start_spot_row = con.execute("SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1", [str(snapshot_id)]).fetchone()
+            start_spot_row = con.execute(
+                "SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1",
+                [str(snapshot_id)]
+            ).fetchone()
+            
             if not start_spot_row or start_spot_row[0] is None:
                 _record_validation_skip(con, pid, "missing_start_price")
                 skipped += 1
                 continue
+                
             start_spot = float(start_spot_row[0])
 
         if not _is_valid_num(start_spot) or start_spot <= 0:
@@ -143,10 +179,14 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
             skipped += 1
             continue
 
+        # LEAKAGE-FREE REALIZED PRICE TARGETING
         realized_snap_row = con.execute(
-            """SELECT snapshot_id, asof_ts_utc FROM snapshots
+            """SELECT snapshot_id, asof_ts_utc 
+               FROM snapshots
                WHERE ticker = ? AND asof_ts_utc >= ? AND asof_ts_utc > ?
-               ORDER BY asof_ts_utc ASC LIMIT 1""", [ticker, target_ts, asof_ts_utc]).fetchone()
+               ORDER BY asof_ts_utc ASC LIMIT 1""", 
+            [ticker, target_ts, asof_ts_utc]
+        ).fetchone()
                  
         if not realized_snap_row:
             _record_validation_skip(con, pid, "no_realized_snapshot")
@@ -161,13 +201,18 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
             skipped += 1
             continue
 
-        realized_spot_row = con.execute("SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1", [str(realized_snapshot_id)]).fetchone()
+        realized_spot_row = con.execute(
+            "SELECT feature_value FROM features WHERE snapshot_id = ? AND feature_key = 'spot' LIMIT 1",
+            [str(realized_snapshot_id)]
+        ).fetchone()
+        
         if not realized_spot_row or realized_spot_row[0] is None:
             _record_validation_skip(con, pid, "missing_realized_spot")
             skipped += 1
             continue
             
         realized_spot = float(realized_spot_row[0])
+        
         if not _is_valid_num(realized_spot) or realized_spot <= 0:
             _record_validation_skip(con, pid, "invalid_realized_price")
             skipped += 1
@@ -179,12 +224,17 @@ def validate_pending(con: duckdb.DuckDBPyConnection, *, now_utc: datetime, flat_
             skipped += 1
             continue
 
-        pu, pd, pf = float(prob_up), float(prob_down), float(prob_flat)
+        # FINAL METRICS CALCULATION
+        pu = float(prob_up)
+        pd = float(prob_down)
+        pf = float(prob_flat)
         bs = brier_3class(pu, pd, pf, label)
         ll = logloss_3class(pu, pd, pf, label)
 
         params = []
-        if has_outcome_price: params.append(realized_spot)
+        if has_outcome_price:
+            params.append(realized_spot)
+            
         pred_lbl = predicted_class(pu, pd, pf)
         params.extend([realized_asof, label, bs, ll, True, bool(pred_lbl == label), pid])
 

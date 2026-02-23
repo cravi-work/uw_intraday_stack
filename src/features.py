@@ -99,8 +99,8 @@ def _build_meta(
         "normalization": lineage.get("normalization", "none"),
         "session_applicability": lineage.get("session_applicability", "PRE/RTH/AFT"),
         "quality_policy": lineage.get("quality_policy", "None on missing"),
-        "endpoint_asof_ts_utc": ctx.endpoint_asof_ts_utc.isoformat() if getattr(ctx, "endpoint_asof_ts_utc", None) else None,
-        "alignment_delta_sec": getattr(ctx, "alignment_delta_sec", None)
+        "criticality": lineage.get("criticality", "NON_CRITICAL"),
+        "effective_ts_utc": details.get("effective_ts_utc") if details and "effective_ts_utc" in details else None
     }
     
     return {
@@ -141,7 +141,8 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         "units_expected": "USD",
         "normalization": "none",
         "session_applicability": "PRE/RTH/AFT",
-        "quality_policy": "None if missing required explicit keys"
+        "quality_policy": "None if missing required explicit keys",
+        "criticality": "CRITICAL"
     }
     
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
@@ -153,11 +154,18 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     
     latest_row = max(rows, key=lambda r: _parse_strict_ts(r, "t"))
     
-    if "close" not in latest_row:
+    close_val = latest_row.get("close")
+    t_val = latest_row.get("t")
+    
+    if close_val is None:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "missing_explicit_close_field")})
         
-    close_val = safe_float(latest_row["close"])
-    return FeatureBundle({"spot": close_val}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": latest_row.get("t")})})
+    close_float = safe_float(close_val)
+    ts_float = _parse_strict_ts(latest_row, "t")
+    
+    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
+    
+    return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": t_val, "effective_ts_utc": eff_ts})})
 
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
@@ -167,7 +175,8 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         "units_expected": "Net Premium Flow (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "RTH",
-        "quality_policy": "None on filtered zeros to avoid false baseline certainty"
+        "quality_policy": "None on filtered zeros to avoid false baseline certainty",
+        "criticality": "NON_CRITICAL"
     }
     
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
@@ -250,7 +259,8 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "units_expected": "Notional Exposure (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "PRE/RTH",
-        "quality_policy": "None on missing"
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
     }
     
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
@@ -262,7 +272,10 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
 
     latest = max(rows, key=lambda r: _parse_strict_ts(r, "date"))
     
-    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {"ts": latest.get("date"), "scale_used": norm_scale})
+    ts_float = _parse_strict_ts(latest, "date")
+    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
+    
+    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {"ts": latest.get("date"), "scale_used": norm_scale, "effective_ts_utc": eff_ts})
     
     return FeatureBundle({
         "dealer_vanna": _normalize_signed(safe_float(latest.get("vanna_exposure")), scale=norm_scale),
@@ -278,7 +291,8 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         "units_expected": "Sign (+1.0, 0.0, -1.0)",
         "normalization": "Directional sign clamping",
         "session_applicability": "PRE/RTH",
-        "quality_policy": "None on missing exposure fields"
+        "quality_policy": "None on missing exposure fields",
+        "criticality": "CRITICAL"
     }
     
     if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
@@ -320,6 +334,7 @@ EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/greek-exposure/expiry": "GREEKS",
     "/api/stock/{ticker}/ohlc/{candle_size}": "PRICE",
 }
+
 
 PRESENCE_ONLY_ENDPOINTS = {
     "/api/stock/{ticker}/option/volume-oi-expiry",

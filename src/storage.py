@@ -57,7 +57,12 @@ CREATE TABLE IF NOT EXISTS predictions (
     blocked_reasons_json JSON, 
     degraded_reasons_json JSON, 
     validation_eligible BOOLEAN NOT NULL DEFAULT TRUE, 
-    gate_json JSON
+    gate_json JSON,
+    alignment_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    source_ts_min_utc TIMESTAMP NULL,
+    source_ts_max_utc TIMESTAMP NULL,
+    critical_missing_count INTEGER NOT NULL DEFAULT 0,
+    decision_window_id TEXT NOT NULL DEFAULT 'UNKNOWN'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, horizon_kind, horizon_minutes, horizon_seconds);
 
@@ -115,6 +120,12 @@ class DbWriter:
         _add("predictions", "degraded_reasons_json", "JSON")
         _add("predictions", "validation_eligible", "BOOLEAN NOT NULL DEFAULT TRUE")
         _add("predictions", "gate_json", "JSON")
+        _add("predictions", "alignment_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "source_ts_min_utc", "TIMESTAMP NULL")
+        _add("predictions", "source_ts_max_utc", "TIMESTAMP NULL")
+        _add("predictions", "critical_missing_count", "INTEGER NOT NULL DEFAULT 0")
+        _add("predictions", "decision_window_id", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
         _add("endpoint_state", "last_attempt_event_id", "UUID")
@@ -202,8 +213,9 @@ class DbWriter:
                 start_price, bias, confidence, prob_up, prob_down, prob_flat, 
                 model_name, model_version, model_hash, is_mock, meta_json, 
                 decision_state, risk_gate_status, data_quality_state, confidence_state,
-                blocked_reasons_json, degraded_reasons_json, validation_eligible, gate_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                blocked_reasons_json, degraded_reasons_json, validation_eligible, gate_json,
+                alignment_status, source_ts_min_utc, source_ts_max_utc, critical_missing_count, decision_window_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 str(pid), snapshot_id, horizon_minutes, horizon_kind, horizon_seconds, 
                 p.get("start_price"), p.get("bias"), p["confidence"], p["prob_up"], p["prob_down"], p["prob_flat"], 
@@ -212,7 +224,9 @@ class DbWriter:
                 p.get("risk_gate_status", "UNKNOWN"), p.get("data_quality_state", "UNKNOWN"), 
                 p.get("confidence_state", "UNKNOWN"),
                 json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), 
-                p.get("validation_eligible", True), json.dumps(p.get("gate_json", {}))
+                p.get("validation_eligible", True), json.dumps(p.get("gate_json", {})),
+                p.get("alignment_status", "UNKNOWN"), p.get("source_ts_min_utc"), p.get("source_ts_max_utc"),
+                p.get("critical_missing_count", 0), p.get("decision_window_id", "UNKNOWN")
             ]
         )
         return pid

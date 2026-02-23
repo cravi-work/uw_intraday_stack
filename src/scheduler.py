@@ -114,6 +114,10 @@ def get_market_hours(date_obj: dt.date, cfg: Dict[str, Any]) -> MarketHours:
 
     is_early_close = market_close.time() < dt.time(16, 0)
     
+    # FIX: Real-world correctness bounds After-Hours end strictly 4 hours after early close
+    if is_early_close:
+        aft_end = market_close + dt.timedelta(hours=4)
+        
     if ing_start >= ing_end:
         raise ValueError(f"Config error: ingest_start must be before ingest_end. {ing_start} vs {ing_end}")
 

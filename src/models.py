@@ -127,6 +127,7 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
+    # Critical Risk Block Path
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
         return Prediction(

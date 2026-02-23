@@ -16,7 +16,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
-from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState, SessionState
+from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState, SessionState, ConfidenceState
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -159,7 +159,13 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
         return
 
     sess_str = hours.get_session_label(asof_et)
-    session_enum = SessionState(sess_str)
+    
+    # Try converting the string label securely to the Enum
+    try:
+        session_enum = SessionState(sess_str)
+    except ValueError:
+        session_enum = SessionState.CLOSED
+        
     close_utc = hours.market_close_et.astimezone(UTC) if hours.market_close_et else None
     post_utc = hours.post_end_et.astimezone(UTC) if hours.post_end_et else None
     sec_to_close = hours.seconds_to_close(asof_et)
@@ -222,6 +228,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                 for (tkr, call, sig, qp, res, cb) in fetch_results:
                     endpoint_id = db.upsert_endpoint(con, call.method, call.path, qp, registry)
                     
+                    # BLOCK OUT-OF-ORDER PACKETS
                     ev_key = (tkr, endpoint_id)
                     if ev_key in max_seen_ts and res.requested_at_utc < max_seen_ts[ev_key]:
                         logger.warning(f"Out of order packet dropped from state mutation: {ev_key}")
@@ -422,9 +429,30 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
-                    # --- Cross-Endpoint Alignment Gate ---
+                    # --- DECISION WINDOW ASSEMBLER (Cross-Endpoint Time Alignment) ---
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in valid_features}
-                    start_price = feat_dict.get("spot") 
+                    
+                    ts_list = []
+                    alignment_violations = []
+                    critical_missing = 0
+                    
+                    for f in valid_features:
+                        meta = f["meta_json"]
+                        metric_lineage = meta.get("metric_lineage", {})
+                        eff_ts_str = metric_lineage.get("effective_ts_utc")
+                        if eff_ts_str:
+                            eff_ts = dt.datetime.fromisoformat(eff_ts_str)
+                            ts_list.append(eff_ts)
+                            delta_sec = abs((asof_utc - eff_ts).total_seconds())
+                            if delta_sec > alignment_tolerance_sec:
+                                alignment_violations.append(f"{f['feature_key']}_delta_{int(delta_sec)}s")
+
+                    # Map our strict feature dependencies
+                    if "spot" not in feat_dict or feat_dict["spot"] is None: critical_missing += 1
+                    if "net_gex_sign" not in feat_dict or feat_dict["net_gex_sign"] is None: critical_missing += 1
+
+                    source_ts_min = min(ts_list) if ts_list else None
+                    source_ts_max = max(ts_list) if ts_list else None
 
                     base_gate = DecisionGate(
                         data_quality_state=DataQualityState.VALID, 
@@ -432,17 +460,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         decision_state=SignalState.NEUTRAL
                     )
 
-                    for ctx in contexts.values():
-                        if ctx.endpoint_asof_ts_utc is None:
-                            base_gate = base_gate.degrade(f"missing_inner_ts_ep_{ctx.endpoint_id}", partial=True)
-                        elif ctx.alignment_delta_sec is not None and ctx.alignment_delta_sec > alignment_tolerance_sec:
-                            base_gate = base_gate.block(f"misaligned_endpoint_{ctx.endpoint_id}", invalid=True)
+                    if len(alignment_violations) > 0:
+                        base_gate = base_gate.block(f"window_misaligned: {alignment_violations}", invalid=True)
 
                     if session_enum == SessionState.CLOSED:
                         base_gate = base_gate.block("session_closed", invalid=True)
 
-                    if start_price is None:
-                        base_gate = base_gate.block("missing_critical_feature_spot", invalid=True)
+                    if critical_missing > 0:
+                        base_gate = base_gate.block(f"critical_features_missing_{critical_missing}", invalid=True)
                     elif dq < 0.5:
                         base_gate = base_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
 
@@ -459,7 +484,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             con,
                             {
                                 "snapshot_id": snapshot_id, "horizon_minutes": int(h), "horizon_kind": "FIXED", 
-                                "horizon_seconds": None, "start_price": start_price, 
+                                "horizon_seconds": None, "start_price": feat_dict.get("spot"), 
                                 "bias": pred.bias, "confidence": pred.confidence, 
                                 "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
@@ -468,7 +493,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "confidence_state": getattr(pred, "confidence_state", ConfidenceState.UNKNOWN).value,
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
-                                "gate_json": asdict(pred.gate)
+                                "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
+                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if not alignment_violations else "MISALIGNED",
+                                "decision_window_id": f"{snapshot_id}_FIXED_{h}"
                             }
                         )
 
@@ -480,7 +507,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             con,
                             {
                                 "snapshot_id": snapshot_id, "horizon_minutes": 0, "horizon_kind": "TO_CLOSE", 
-                                "horizon_seconds": int(sec_to_close), "start_price": start_price, 
+                                "horizon_seconds": int(sec_to_close), "start_price": feat_dict.get("spot"), 
                                 "bias": pred.bias, "confidence": pred.confidence, 
                                 "prob_up": pred.prob_up, "prob_down": pred.prob_down, "prob_flat": pred.prob_flat,
                                 "model_name": pred.model_name, "model_version": pred.model_version, "model_hash": pred.model_hash,
@@ -489,7 +516,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "confidence_state": getattr(pred, "confidence_state", ConfidenceState.UNKNOWN).value,
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
-                                "gate_json": asdict(pred.gate)
+                                "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
+                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if not alignment_violations else "MISALIGNED",
+                                "decision_window_id": f"{snapshot_id}_TOCLOSE_{sec_to_close}"
                             }
                         )
 
