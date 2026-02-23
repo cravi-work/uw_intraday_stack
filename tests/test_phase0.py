@@ -20,17 +20,20 @@ def test_whale_schema_non_dict_rows_is_na(dummy_ctx):
     res = extract_smart_whale_pressure(payload, dummy_ctx)
     assert res.features["smart_whale_pressure"] is None
 
-def test_whale_filtered_zero_is_zero(dummy_ctx):
+def test_whale_filtered_zero_is_none(dummy_ctx):
+    """Valid trades filtered by policy must return None to avoid fake neutral."""
     payload = [{"premium": 500, "dte": 0, "side": "BUY", "put_call": "CALL"}]
     res = extract_smart_whale_pressure(payload, dummy_ctx, min_premium=10000)
-    assert res.features["smart_whale_pressure"] == 0.0
+    assert res.features["smart_whale_pressure"] is None
 
 def test_whale_unparseable_is_na(dummy_ctx):
+    """Missing required fields must return None."""
     payload = [{"dte": 0, "side": "BUY", "put_call": "CALL"}]
     res = extract_smart_whale_pressure(payload, dummy_ctx)
     assert res.features["smart_whale_pressure"] is None
 
 def test_whale_unknown_side_labels_is_na(dummy_ctx):
+    """Enhancement: Semantic drift (e.g. 'MID') must return None, not 0.0."""
     payload = [{"premium": 50000, "dte": 0, "side": "MID", "put_call": "CALL"}]
     res = extract_smart_whale_pressure(payload, dummy_ctx)
     assert res.features["smart_whale_pressure"] is None

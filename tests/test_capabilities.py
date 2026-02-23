@@ -71,7 +71,6 @@ def test_validate_db_schema_fails_on_missing():
     """Asserts schema validation fails fast if attempt columns are missing."""
     invalid_cols = [
         "ticker", "endpoint_id", "last_success_event_id", "last_success_ts_utc"
-        # Missing attempt columns...
     ]
     con = MockConSchema(invalid_cols)
     
@@ -88,19 +87,19 @@ def test_extract_db_truth():
     # Check AAPL (Healthy)
     assert "AAPL" in truth
     aapl_ep = truth["AAPL"]["endpoints"]["GET /api/healthy"]
-    assert aapl_ep["is_healthy"] is True
+    assert aapl_ep["health_status"] == "HEALTHY"
     assert aapl_ep["attempt_age_s"] == 0
     assert aapl_ep["success_age_s"] == 0
     
     # Check SPY (Failing)
     assert "SPY" in truth
     spy_ep = truth["SPY"]["endpoints"]["GET /api/failing"]
-    assert spy_ep["is_healthy"] is False  # Because it has a 500 error
+    assert spy_ep["health_status"] == "ERROR"
     assert spy_ep["error_type"] == "HttpStatusError"
     
     # Check Market Context
     assert "__MARKET__" in truth
     mkt_ep = truth["__MARKET__"]["endpoints"]["GET /api/market"]
-    assert mkt_ep["is_healthy"] is True # Fetches are succeeding
+    assert mkt_ep["health_status"] == "HEALTHY"
     assert mkt_ep["attempt_age_s"] == 0
-    assert mkt_ep["payload_change_age_s"] >= 120 # Payload hasn't changed recently
+    assert mkt_ep["payload_change_age_s"] >= 120

@@ -51,6 +51,12 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/ohlc/{candle_size}": 1
 }
 
+def _find_first(obj: Any, keys: List[str]) -> Any:
+    if not isinstance(obj, dict): return None
+    for k in keys:
+        if k in obj: return obj[k]
+    return None
+
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if scale == 0: 
         return None 
@@ -60,7 +66,6 @@ def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     return max(-1.0, min(1.0, val / scale))
 
 def _parse_strict_ts(row: dict, key: str) -> float:
-    """Helper to deterministically extract explicit timestamps."""
     ts_val = row.get(key)
     if isinstance(ts_val, (int, float)): 
         return float(ts_val)
@@ -121,8 +126,6 @@ def _build_error_meta(
     meta["na_reason"] = na_reason
     return meta
 
-# --- Extractors ---
-
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "spot",
@@ -140,7 +143,6 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     if not rows:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "no_rows")})
     
-    # Sort strictly by timestamp instead of relying on array order
     latest_row = max(rows, key=lambda r: _parse_strict_ts(r, "t"))
     
     if "close" not in latest_row:
@@ -166,6 +168,10 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
     if not trades and isinstance(flow_payload, dict) and "data" in flow_payload:
         trades = flow_payload["data"]
         
+    # FIX: Block malformed strings/arrays from penetrating the schema
+    if trades and not all(isinstance(t, dict) for t in trades):
+        return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
+
     if not trades:
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
@@ -177,7 +183,6 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
     side_map = {"ASK": "BULL", "BUY": "BULL", "BULLISH": "BULL", "BOT": "BULL", "BID": "BEAR", "SELL": "BEAR", "BEARISH": "BEAR", "SOLD": "BEAR"}
     
     for t in trades:
-        # Strict explicit key access
         prem = safe_float(t.get("premium"))
         dte = safe_float(t.get("dte"))
         side_raw = t.get("side")
@@ -339,7 +344,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
         payload = effective_payloads.get(eid)
         routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
         
-        # Explicit None handling prevents younger data from losing priority
         safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
         
         if routing_key == "GEX":
@@ -387,7 +391,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     if not math.isclose(best.feature_value, other.feature_value, abs_tol=1e-9):
                         raise RuntimeError(f"FEATURE_CONFLICT:{f_key} - Endpoint {best.endpoint_id} vs {other.endpoint_id} generated divergent values at equal rank.")
                     
-        # Deep copy protects siblings from cross-pollution
         meta = copy.deepcopy(best.meta_json)
         if len(group) > 1:
             meta.setdefault("details", {})["shadowed_candidates"] = [
