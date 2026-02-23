@@ -50,16 +50,13 @@ class MarketHours:
         
         return SessionState.CLOSED.value
 
-
 def floor_to_interval(ts: dt.datetime, minutes: int) -> dt.datetime:
     floored_minute = (ts.minute // minutes) * minutes
     return ts.replace(minute=floored_minute, second=0, microsecond=0)
 
-
 def _parse_time(time_str: str, date_obj: dt.date) -> dt.datetime:
     t = dt.datetime.strptime(time_str, "%H:%M").time()
     return dt.datetime.combine(date_obj, t, tzinfo=ET)
-
 
 def _build_fallback_hours(date_obj: dt.date, cfg: Dict[str, Any], reason: str) -> MarketHours:
     if date_obj.weekday() >= 5:
@@ -114,7 +111,6 @@ def get_market_hours(date_obj: dt.date, cfg: Dict[str, Any]) -> MarketHours:
 
     is_early_close = market_close.time() < dt.time(16, 0)
     
-    # FIX: Real-world correctness bounds After-Hours end strictly 4 hours after early close
     if is_early_close:
         aft_end = market_close + dt.timedelta(hours=4)
         

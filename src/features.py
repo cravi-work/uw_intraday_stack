@@ -12,12 +12,10 @@ from .analytics import build_gex_levels
 _grab_list = grab_list 
 _as_float = safe_float 
 
-
 class FeatureRow(TypedDict):
     feature_key: str
     feature_value: Optional[float]
     meta_json: Dict[str, Any]
-
 
 class LevelRow(TypedDict):
     level_type: str
@@ -25,12 +23,10 @@ class LevelRow(TypedDict):
     magnitude: Optional[float]
     meta_json: Dict[str, Any]
 
-
 @dataclass
 class FeatureBundle:
     features: Dict[str, Optional[float]]
     meta: Dict[str, Any]
-
 
 @dataclass
 class FeatureCandidate:
@@ -42,7 +38,6 @@ class FeatureCandidate:
     path_priority: int
     endpoint_id: int
     is_none: bool
-
 
 PATH_PRIORITY = {
     "/api/stock/{ticker}/spot-exposures": 1,
@@ -57,7 +52,6 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/ohlc/{candle_size}": 1
 }
 
-
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if scale == 0: 
         return None 
@@ -65,7 +59,6 @@ def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if val is None or not math.isfinite(val): 
         return None
     return max(-1.0, min(1.0, val / scale))
-
 
 def _parse_strict_ts(row: dict, key: str) -> float:
     ts_val = row.get(key)
@@ -77,7 +70,6 @@ def _parse_strict_ts(row: dict, key: str) -> float:
         except ValueError:
             pass
     return 0.0
-
 
 def _build_meta(
     ctx: EndpointContext, 
@@ -118,7 +110,6 @@ def _build_meta(
         "details": d
     }
 
-
 def _build_error_meta(
     ctx: EndpointContext, 
     extractor_name: str, 
@@ -129,7 +120,6 @@ def _build_error_meta(
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
     return meta
-
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -163,7 +153,6 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
     
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": t_val, "effective_ts_utc": eff_ts})})
-
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     lineage = {
@@ -247,7 +236,6 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
     meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
-
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
     lineage = {
@@ -279,7 +267,6 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "dealer_charm": _normalize_signed(safe_float(latest.get("charm_exposure")), scale=norm_scale),
         "net_gamma_exposure_notional": _normalize_signed(safe_float(latest.get("gamma_exposure")), scale=norm_scale)
     }, {"greeks": meta})
-
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -318,6 +305,49 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     meta = _build_meta(ctx, "extract_gex_sign", lineage, {"total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
+def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "oi_pressure",
+        "fields_used": ["open_interest", "strike"],
+        "units_expected": "Contracts",
+        "normalization": "none",
+        "session_applicability": "RTH",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows:
+        return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
+        
+    total_oi = sum(safe_float(r.get("open_interest", 0.0)) or 0.0 for r in rows)
+    return FeatureBundle({"oi_pressure": total_oi}, {"oi": _build_meta(ctx, "extract_oi", lineage, {"n_rows": len(rows)})})
+
+def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "iv_rank",
+        "fields_used": ["iv_rank", "iv_percentile"],
+        "units_expected": "Percentile [0,1]",
+        "normalization": "none",
+        "session_applicability": "PRE/RTH/AFT",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows and isinstance(payload, dict):
+        rows = [payload]
+        
+    val = safe_float(rows[0].get("iv_rank")) if rows else None
+    if val is None:
+        return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, "missing_iv_rank")})
+    
+    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, {})})
+
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
@@ -330,8 +360,10 @@ EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/greek-exposure/strike": "GREEKS",
     "/api/stock/{ticker}/greek-exposure/expiry": "GREEKS",
     "/api/stock/{ticker}/ohlc/{candle_size}": "PRICE",
+    "/api/stock/{ticker}/oi-per-strike": "OI",
+    "/api/stock/{ticker}/oi-change": "OI",
+    "/api/stock/{ticker}/iv-rank": "VOL",
 }
-
 
 PRESENCE_ONLY_ENDPOINTS = {
     "/api/stock/{ticker}/option/volume-oi-expiry",
@@ -343,12 +375,9 @@ PRESENCE_ONLY_ENDPOINTS = {
     "/api/market/economic-calendar",
     "/api/market/top-net-impact",
     "/api/market/total-options-volume",
-    "/api/stock/{ticker}/oi-per-strike",
-    "/api/stock/{ticker}/oi-change",
     "/api/stock/{ticker}/volatility/term-structure",
     "/api/stock/{ticker}/interpolated-iv",
     "/api/stock/{ticker}/volatility/realized",
-    "/api/stock/{ticker}/iv-rank",
     "/api/darkpool/{ticker}",
     "/api/lit-flow/{ticker}",
     "/api/stock/{ticker}/option/stock-price-levels",
@@ -399,6 +428,16 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             f_bundle = extract_price_features(payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                
+        elif routing_key == "OI":
+            f_bundle = extract_oi_features(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                
+        elif routing_key == "VOL":
+            f_bundle = extract_volatility_features(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
             raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")

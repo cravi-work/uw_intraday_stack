@@ -68,6 +68,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_preds_dedupe ON predictions (snapshot_id, 
 
 CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snapshot_id), feature_key TEXT, feature_value DOUBLE, meta_json JSON, UNIQUE(snapshot_id, feature_key));
 CREATE TABLE IF NOT EXISTS derived_levels (snapshot_id UUID, level_type TEXT, price DOUBLE, magnitude DOUBLE, meta_json JSON);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_derived_levels_dedupe ON derived_levels (snapshot_id, level_type, price);
 
 -- MANDATORY P2 BLOCKER FIX: snapshot_id UUID NOT NULL
 CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID NOT NULL REFERENCES snapshots(snapshot_id), endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER, payload_class TEXT, na_reason TEXT, meta_json JSON, UNIQUE(snapshot_id, endpoint_id));
@@ -145,7 +146,6 @@ class DbWriter:
 
     @contextlib.contextmanager
     def writer(self):
-        """Enforces true ACID transaction guarantees. Reverts all partial inserts upon failure."""
         con = self._connect_new()
         con.execute("BEGIN TRANSACTION")
         try:
@@ -246,7 +246,7 @@ class DbWriter:
         con.execute(
             """INSERT INTO raw_http_events (
                 event_id, run_id, requested_at_utc, received_at_utc, ticker, 
-                endpoint_id, http_status, latency_ms, payload_hash, payload_json, 
+                endpoint_id, http_status, INTEGER, payload_hash, payload_json, 
                 is_retry, error_type, error_msg, circuit_state_json
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
             [
@@ -322,10 +322,14 @@ class DbWriter:
             
     def insert_levels(self, con, snapshot_id, levels: List[Dict[str, Any]]):
         if not levels: return
-        con.executemany(
-            "INSERT INTO derived_levels (snapshot_id, level_type, price, magnitude, meta_json) VALUES (?,?,?,?,?)", 
-            [[str(snapshot_id), l["level_type"], l["price"], l["magnitude"], json.dumps(l.get("meta_json", {}))] for l in levels]
-        )
+        for l in levels:
+            con.execute(
+                """INSERT INTO derived_levels (snapshot_id, level_type, price, magnitude, meta_json) 
+                   VALUES (?,?,?,?,?) 
+                   ON CONFLICT (snapshot_id, level_type, price) 
+                   DO UPDATE SET magnitude = excluded.magnitude, meta_json = excluded.meta_json""", 
+                [str(snapshot_id), l["level_type"], l["price"], l.get("magnitude"), json.dumps(l.get("meta_json", {}))]
+            )
         
     def insert_lineage(self, con, snapshot_id, endpoint_id, used_event_id, freshness_state, data_age_seconds, payload_class, na_reason, meta_json):
         con.execute(
