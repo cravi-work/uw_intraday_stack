@@ -353,7 +353,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             na_reason=n_reason,
                             endpoint_asof_ts_utc=ep_asof,
                             alignment_delta_sec=delta_sec,
-                            effective_ts_utc=res.effective_ts_utc # CL-03 Explicit Injection
+                            effective_ts_utc=res.effective_ts_utc
                         )
                         contexts[endpoint_id] = ctx
                             
@@ -464,15 +464,27 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in aligned_features}
                     
-                    # Session-Aware Criticality Check
+                    # Session-Aware Criticality Check (CL-05 Hardened)
                     critical_policy = {
-                        SessionState.RTH: ["spot", "net_gex_sign"],
+                        SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
                         SessionState.PREMARKET: ["spot", "dealer_vanna"],
                         SessionState.AFTERHOURS: ["spot"],
                         SessionState.CLOSED: ["spot"]
                     }
                     critical_reqs = critical_policy.get(session_enum, ["spot"])
-                    critical_missing = sum(1 for k in critical_reqs if k not in feat_dict or feat_dict[k] is None)
+                    
+                    missing_criticals = []
+                    for k in critical_reqs:
+                        if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]):
+                            missing_criticals.append(k)
+                    
+                    critical_missing = len(missing_criticals)
+
+                    for mk in missing_criticals:
+                        logger.warning(
+                            f"critical_feature_missing: {mk}", 
+                            extra={"counter": "critical_feature_missing_count", "feature_key": mk}
+                        )
 
                     source_ts_min = min(ts_list) if ts_list else None
                     source_ts_max = max(ts_list) if ts_list else None
@@ -498,7 +510,15 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         base_gate = base_gate.block("session_closed", invalid=True)
 
                     if critical_missing > 0:
-                        base_gate = base_gate.block(f"critical_features_missing_{critical_missing}", invalid=True)
+                        logger.warning(
+                            "no_signal_due_to_critical_missing", 
+                            extra={
+                                "counter": "no_signal_due_to_critical_missing_count", 
+                                "missing_features": missing_criticals
+                            }
+                        )
+                        # Explicit enumeration of failing dependencies
+                        base_gate = base_gate.block(f"critical_features_missing: {','.join(missing_criticals)}", invalid=True, missing_features=missing_criticals)
                     elif dq < 0.5:
                         base_gate = base_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
 

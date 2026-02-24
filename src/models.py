@@ -49,16 +49,18 @@ class DecisionGate:
     degraded_reasons: Tuple[str, ...] = field(default_factory=tuple)
     alignment_violations: Tuple[str, ...] = field(default_factory=tuple)
     critical_endpoints_missing: Tuple[int, ...] = field(default_factory=tuple)
+    critical_features_missing: Tuple[str, ...] = field(default_factory=tuple) # CL-05 Traceability
     validation_eligible: bool = True
 
-    def block(self, reason: str, invalid: bool = False) -> 'DecisionGate':
+    def block(self, reason: str, invalid: bool = False, missing_features: List[str] = None) -> 'DecisionGate':
         return replace(
             self,
             risk_gate_status=RiskGateStatus.BLOCKED,
             decision_state=SignalState.NO_SIGNAL,
             data_quality_state=DataQualityState.INVALID if invalid else self.data_quality_state,
             blocked_reasons=self.blocked_reasons + (reason,),
-            validation_eligible=False
+            validation_eligible=False,
+            critical_features_missing=tuple(missing_features) if missing_features else self.critical_features_missing
         )
 
     def degrade(self, reason: str, partial: bool = False) -> 'DecisionGate':

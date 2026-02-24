@@ -173,7 +173,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "RTH",
         "quality_policy": "None on filtered zeros to avoid false baseline certainty",
-        "criticality": "NON_CRITICAL"
+        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
     }
     
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
@@ -256,7 +256,7 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "PRE/RTH",
         "quality_policy": "None on missing",
-        "criticality": "NON_CRITICAL"
+        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
     }
     
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
@@ -324,7 +324,7 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "normalization": "none",
         "session_applicability": "RTH",
         "quality_policy": "None on missing",
-        "criticality": "NON_CRITICAL"
+        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
     }
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
