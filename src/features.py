@@ -54,7 +54,9 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/greek-exposure/expiry": 3,
     "/api/stock/{ticker}/ohlc/{candle_size}": 1,
     "/api/darkpool/{ticker}": 1,
-    "/api/lit-flow/{ticker}": 1
+    "/api/lit-flow/{ticker}": 1,
+    "/api/stock/{ticker}/volatility/term-structure": 1,
+    "/api/stock/{ticker}/historical-risk-reversal-skew": 1
 }
 
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
@@ -362,6 +364,66 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
     
     return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, {})})
 
+def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "vol_term_slope",
+        "fields_used": ["dte", "days", "iv", "implied_volatility"],
+        "units_expected": "IV Spread",
+        "normalization": "none",
+        "session_applicability": "PRE/RTH/AFT",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows:
+        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, "no_rows")})
+        
+    valid_pts = []
+    for r in rows:
+        d = safe_float(r.get("dte") or r.get("days"))
+        iv = safe_float(r.get("iv") or r.get("implied_volatility") or r.get("value"))
+        if d is not None and iv is not None and math.isfinite(d) and math.isfinite(iv):
+            valid_pts.append((d, iv))
+    
+    if len(valid_pts) < 2:
+        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, "insufficient_data_points")})
+        
+    valid_pts.sort(key=lambda x: x[0])
+    slope = valid_pts[-1][1] - valid_pts[0][1]
+    
+    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {"n_rows": len(valid_pts)})})
+
+def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "vol_skew",
+        "fields_used": ["skew", "risk_reversal", "value"],
+        "units_expected": "Skew Ratio",
+        "normalization": "none",
+        "session_applicability": "PRE/RTH/AFT",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows and isinstance(payload, dict):
+        rows = [payload]
+        
+    if not rows:
+        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "no_rows")})
+        
+    latest = rows[0]
+    skew_val = safe_float(latest.get("skew") or latest.get("risk_reversal") or latest.get("value"))
+    
+    if skew_val is None or not math.isfinite(skew_val):
+        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "missing_or_invalid_skew")})
+        
+    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, {})})
+
 def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "darkpool_pressure",
@@ -423,7 +485,6 @@ def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundl
             
     return FeatureBundle({"litflow_pressure": net_notional}, {"litflow": _build_meta(ctx, "extract_litflow", lineage, {"n_rows": len(rows)})})
 
-
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
     "/api/stock/{ticker}/spot-exposures/strike": "GEX",
@@ -438,6 +499,8 @@ EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/oi-per-strike": "OI",
     "/api/stock/{ticker}/oi-change": "OI",
     "/api/stock/{ticker}/iv-rank": "VOL",
+    "/api/stock/{ticker}/volatility/term-structure": "VOL_TERM",
+    "/api/stock/{ticker}/historical-risk-reversal-skew": "VOL_SKEW",
     "/api/darkpool/{ticker}": "DARKPOOL",
     "/api/lit-flow/{ticker}": "LITFLOW"
 }
@@ -452,12 +515,10 @@ PRESENCE_ONLY_ENDPOINTS = {
     "/api/market/economic-calendar",
     "/api/market/top-net-impact",
     "/api/market/total-options-volume",
-    "/api/stock/{ticker}/volatility/term-structure",
     "/api/stock/{ticker}/interpolated-iv",
     "/api/stock/{ticker}/volatility/realized",
     "/api/stock/{ticker}/option/stock-price-levels",
     "/api/stock/{ticker}/max-pain",
-    "/api/stock/{ticker}/historical-risk-reversal-skew",
     "/api/market/market-tide",
     "/api/stock/{ticker}/flow-alerts",
     "/api/stock/{ticker}/net-prem-ticks",
@@ -518,6 +579,16 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
+        elif routing_key == "VOL_TERM":
+            f_bundle = extract_vol_term_structure(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+
+        elif routing_key == "VOL_SKEW":
+            f_bundle = extract_vol_skew(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+
         elif routing_key == "DARKPOOL":
             f_bundle = extract_darkpool_pressure(payload, ctx)
             for k, v in f_bundle.features.items():
@@ -560,7 +631,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             
         f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
         
-        # CL-04 Strict Suppression/Emission Logging Counters
         metric_family = meta.get("metric_lineage", {}).get("metric_name", "unknown")
         if best.feature_value is not None and math.isfinite(best.feature_value):
             logger.info(

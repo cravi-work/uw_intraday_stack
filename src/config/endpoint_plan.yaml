@@ -66,6 +66,7 @@ plans:
         date: "{date}"
 
     # OI / chain structure
+    # (Expanded: Generates OI Wall levels and directional OI pressure)
     - name: oi_per_strike
       method: GET
       path: /api/stock/{ticker}/oi-per-strike
@@ -90,6 +91,7 @@ plans:
         date: "{date}"
 
     # Volatility
+    # (Expanded: Real derived features extracted for term structure slope and historical skew)
     - name: term_structure
       method: GET
       path: /api/stock/{ticker}/volatility/term-structure
@@ -119,6 +121,7 @@ plans:
         date: "{date}"
 
     # Liquidity / DP / Lit
+    # (Expanded: Computes direct notional pressure rather than acting as presence flags)
     - name: darkpool_ticker
       method: GET
       path: /api/darkpool/{ticker}
