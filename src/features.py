@@ -441,7 +441,6 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
-            # Reverted to hard fail to close the out-of-scope regression risk
             raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")
 
     grouped: Dict[str, List[FeatureCandidate]] = {}

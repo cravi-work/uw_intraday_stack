@@ -159,9 +159,21 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     sess_str = hours.get_session_label(asof_et)
     
-    try:
-        session_enum = SessionState(sess_str)
-    except ValueError:
+    # CL-02 Explicit deterministic mapping without exception-driven fallback
+    _SESSION_MAP = {
+        SessionState.PREMARKET.value: SessionState.PREMARKET,
+        SessionState.RTH.value: SessionState.RTH,
+        SessionState.AFTERHOURS.value: SessionState.AFTERHOURS,
+        SessionState.CLOSED.value: SessionState.CLOSED
+    }
+    
+    if sess_str in _SESSION_MAP:
+        session_enum = _SESSION_MAP[sess_str]
+    else:
+        logger.error(
+            f"session_mapping_failure: Unrecognized session string '{sess_str}'", 
+            extra={"counter": "session_mapping_failure_total", "invalid_label": sess_str}
+        )
         session_enum = SessionState.CLOSED
         
     close_utc = hours.market_close_et.astimezone(UTC) if hours.market_close_et else None
