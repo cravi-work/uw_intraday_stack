@@ -464,28 +464,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in aligned_features}
                     
-                    # Session-Aware Criticality Check (CL-05 Hardened)
-                    critical_policy = {
-                        SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
-                        SessionState.PREMARKET: ["spot", "dealer_vanna"],
-                        SessionState.AFTERHOURS: ["spot"],
-                        SessionState.CLOSED: ["spot"]
-                    }
-                    critical_reqs = critical_policy.get(session_enum, ["spot"])
-                    
-                    missing_criticals = []
-                    for k in critical_reqs:
-                        if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]):
-                            missing_criticals.append(k)
-                    
-                    critical_missing = len(missing_criticals)
-
-                    for mk in missing_criticals:
-                        logger.warning(
-                            f"critical_feature_missing: {mk}", 
-                            extra={"counter": "critical_feature_missing_count", "feature_key": mk}
-                        )
-
                     source_ts_min = min(ts_list) if ts_list else None
                     source_ts_max = max(ts_list) if ts_list else None
                     is_aligned = len(alignment_violations) == 0
@@ -509,27 +487,57 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     if session_enum == SessionState.CLOSED:
                         base_gate = base_gate.block("session_closed", invalid=True)
 
-                    if critical_missing > 0:
-                        logger.warning(
-                            "no_signal_due_to_critical_missing", 
-                            extra={
-                                "counter": "no_signal_due_to_critical_missing_count", 
-                                "missing_features": missing_criticals
-                            }
-                        )
-                        # Explicit enumeration of failing dependencies
-                        base_gate = base_gate.block(f"critical_features_missing: {','.join(missing_criticals)}", invalid=True, missing_features=missing_criticals)
-                    elif dq < 0.5:
-                        base_gate = base_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
-
                     horizon_weights_cfg = cfg.get("validation", {}).get("horizon_weights", {})
+                    horizon_critical_cfg = cfg.get("validation", {}).get("horizon_critical_features", {})
                     default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
+
+                    # Baseline session default if config lacks explicit horizon rules
+                    session_default_criticals = {
+                        SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
+                        SessionState.PREMARKET: ["spot", "dealer_vanna"],
+                        SessionState.AFTERHOURS: ["spot"],
+                        SessionState.CLOSED: ["spot"]
+                    }.get(session_enum, ["spot"])
+
+                    def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], int]:
+                        # CL-05 Horizon/Signal-Family Aware Evaluation
+                        reqs = horizon_critical_cfg.get(h_str, session_default_criticals)
+                        weights = horizon_weights_cfg.get(h_str, default_weights)
+                        
+                        missing_criticals = [k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])]
+                        missing_non_criticals = [k for k in weights.keys() if k not in reqs and (k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]))]
+                        
+                        h_gate = current_base_gate
+                        if missing_criticals:
+                            logger.warning(
+                                f"no_signal_due_to_critical_missing_horizon_{h_str}", 
+                                extra={
+                                    "counter": "no_signal_due_to_critical_missing_count", 
+                                    "missing_features": missing_criticals,
+                                    "horizon": h_str
+                                }
+                            )
+                            for mk in missing_criticals:
+                                logger.warning(
+                                    f"critical_feature_missing_{h_str}: {mk}", 
+                                    extra={"counter": "critical_feature_missing_count", "feature_key": mk, "horizon": h_str}
+                                )
+                            # Explicit enumeration of failing dependencies inside gate block
+                            h_gate = h_gate.block(f"critical_features_missing_{h_str}: {','.join(missing_criticals)}", invalid=True, missing_features=missing_criticals)
+                        elif missing_non_criticals and h_gate.risk_gate_status == RiskGateStatus.PASS:
+                            # CL-05 Degraded Path Logic
+                            h_gate = h_gate.degrade(f"non_critical_features_missing_{h_str}: {','.join(missing_non_criticals)}", partial=True)
+                        
+                        # Apply broad DQ degradation if no explicit block occurred
+                        if dq < 0.5 and h_gate.risk_gate_status == RiskGateStatus.PASS:
+                            h_gate = h_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
+                            
+                        return h_gate, weights, len(missing_criticals)
 
                     for h in cfg["validation"]["horizons_minutes"]:
                         h_str = str(h)
-                        weights = horizon_weights_cfg.get(h_str, default_weights)
-                        
-                        pred = bounded_additive_score(feat_dict, dq, weights, gate=base_gate)
+                        h_gate, weights, critical_missing = evaluate_horizon_gate(h_str, base_gate)
+                        pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
                         
                         db.insert_prediction(
                             con,
@@ -551,8 +559,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         )
 
                     if sec_to_close is not None and sec_to_close > 0:
-                        weights = horizon_weights_cfg.get("to_close", default_weights)
-                        pred = bounded_additive_score(feat_dict, dq, weights, gate=base_gate)
+                        h_gate, weights, critical_missing = evaluate_horizon_gate("to_close", base_gate)
+                        pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
                         
                         db.insert_prediction(
                             con,
