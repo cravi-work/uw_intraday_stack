@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
-from .analytics import build_gex_levels
+from .analytics import build_gex_levels, build_oi_walls, build_darkpool_levels
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,9 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/greek-exposure": 1,
     "/api/stock/{ticker}/greek-exposure/strike": 2,
     "/api/stock/{ticker}/greek-exposure/expiry": 3,
-    "/api/stock/{ticker}/ohlc/{candle_size}": 1
+    "/api/stock/{ticker}/ohlc/{candle_size}": 1,
+    "/api/darkpool/{ticker}": 1,
+    "/api/lit-flow/{ticker}": 1
 }
 
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
@@ -85,7 +87,6 @@ def _build_meta(
     if details: 
         d.update(details)
         
-    # CL-03 Explicit provenance chain propagation
     eff_ts = details.get("effective_ts_utc") if details and "effective_ts_utc" in details else None
     if not eff_ts and getattr(ctx, "effective_ts_utc", None):
         eff_ts = ctx.effective_ts_utc.isoformat()
@@ -330,7 +331,12 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     if not rows:
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
         
-    total_oi = sum(safe_float(r.get("open_interest", 0.0)) or 0.0 for r in rows)
+    total_oi = 0.0
+    for r in rows:
+        val = safe_float(r.get("open_interest", 0.0))
+        if val is not None and math.isfinite(val):
+            total_oi += val
+            
     return FeatureBundle({"oi_pressure": total_oi}, {"oi": _build_meta(ctx, "extract_oi", lineage, {"n_rows": len(rows)})})
 
 def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
@@ -351,10 +357,72 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
         rows = [payload]
         
     val = safe_float(rows[0].get("iv_rank")) if rows else None
-    if val is None:
+    if val is None or not math.isfinite(val):
         return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, "missing_iv_rank")})
     
     return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, {})})
+
+def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "darkpool_pressure",
+        "fields_used": ["volume", "price", "size"],
+        "units_expected": "Total Notional USD",
+        "normalization": "none",
+        "session_applicability": "PRE/RTH/AFT",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows:
+        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, "no_rows")})
+        
+    total_notional = 0.0
+    for r in rows:
+        vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
+        price = safe_float(r.get("price", 0)) or 0.0
+        notional = vol * price
+        if math.isfinite(notional):
+            total_notional += notional
+            
+    return FeatureBundle({"darkpool_pressure": total_notional}, {"darkpool": _build_meta(ctx, "extract_darkpool", lineage, {"n_rows": len(rows)})})
+
+def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    lineage = {
+        "metric_name": "litflow_pressure",
+        "fields_used": ["volume", "price", "side", "size"],
+        "units_expected": "Net Notional USD",
+        "normalization": "none",
+        "session_applicability": "RTH",
+        "quality_policy": "None on missing",
+        "criticality": "NON_CRITICAL"
+    }
+    if is_na(payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, ctx.na_reason or "missing_dependency")})
+    
+    rows = grab_list(payload)
+    if not rows:
+        return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, "no_rows")})
+        
+    net_notional = 0.0
+    for r in rows:
+        vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
+        price = safe_float(r.get("price", 0)) or 0.0
+        side = str(r.get("side", "")).upper()
+        
+        notional = vol * price
+        if not math.isfinite(notional):
+            continue
+            
+        if side in ("ASK", "BUY", "BULL", "BULLISH"):
+            net_notional += notional
+        elif side in ("BID", "SELL", "BEAR", "BEARISH"):
+            net_notional -= notional
+            
+    return FeatureBundle({"litflow_pressure": net_notional}, {"litflow": _build_meta(ctx, "extract_litflow", lineage, {"n_rows": len(rows)})})
+
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",
@@ -369,7 +437,9 @@ EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/ohlc/{candle_size}": "PRICE",
     "/api/stock/{ticker}/oi-per-strike": "OI",
     "/api/stock/{ticker}/oi-change": "OI",
-    "/api/stock/{ticker}/iv-rank": "VOL"
+    "/api/stock/{ticker}/iv-rank": "VOL",
+    "/api/darkpool/{ticker}": "DARKPOOL",
+    "/api/lit-flow/{ticker}": "LITFLOW"
 }
 
 PRESENCE_ONLY_ENDPOINTS = {
@@ -385,8 +455,6 @@ PRESENCE_ONLY_ENDPOINTS = {
     "/api/stock/{ticker}/volatility/term-structure",
     "/api/stock/{ticker}/interpolated-iv",
     "/api/stock/{ticker}/volatility/realized",
-    "/api/darkpool/{ticker}",
-    "/api/lit-flow/{ticker}",
     "/api/stock/{ticker}/option/stock-price-levels",
     "/api/stock/{ticker}/max-pain",
     "/api/stock/{ticker}/historical-risk-reversal-skew",
@@ -439,11 +507,31 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             f_bundle = extract_oi_features(payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+            if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
+                levels = build_oi_walls(payload)
+                for l_type, price, mag, details in levels:
+                    meta = _build_meta(ctx, "build_oi_walls", {"metric_name": "oi_walls", "fields_used": ["strike", "open_interest"]}, details)
+                    l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
                 
         elif routing_key == "VOL":
             f_bundle = extract_volatility_features(payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+
+        elif routing_key == "DARKPOOL":
+            f_bundle = extract_darkpool_pressure(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+            if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
+                levels = build_darkpool_levels(payload)
+                for l_type, price, mag, details in levels:
+                    meta = _build_meta(ctx, "build_darkpool_levels", {"metric_name": "darkpool_levels", "fields_used": ["price", "volume"]}, details)
+                    l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+
+        elif routing_key == "LITFLOW":
+            f_bundle = extract_litflow_pressure(payload, ctx)
+            for k, v in f_bundle.features.items():
+                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
             raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")
@@ -471,6 +559,19 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
             ]
             
         f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
+        
+        # CL-04 Strict Suppression/Emission Logging Counters
+        metric_family = meta.get("metric_lineage", {}).get("metric_name", "unknown")
+        if best.feature_value is not None and math.isfinite(best.feature_value):
+            logger.info(
+                f"Feature emitted: {f_key}", 
+                extra={"counter": "features_emitted_by_family", "family": metric_family, "feature_key": f_key}
+            )
+        else:
+            logger.warning(
+                f"Feature suppressed: {f_key}", 
+                extra={"counter": "features_suppressed_by_family", "family": metric_family, "feature_key": f_key}
+            )
 
     return f_rows, l_rows
 
