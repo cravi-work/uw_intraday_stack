@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS features (snapshot_id UUID REFERENCES snapshots(snaps
 CREATE TABLE IF NOT EXISTS derived_levels (snapshot_id UUID, level_type TEXT, price DOUBLE, magnitude DOUBLE, meta_json JSON);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_derived_levels_dedupe ON derived_levels (snapshot_id, level_type, price);
 
+-- MANDATORY P2 BLOCKER FIX: snapshot_id UUID NOT NULL
 CREATE TABLE IF NOT EXISTS snapshot_lineage (snapshot_id UUID NOT NULL REFERENCES snapshots(snapshot_id), endpoint_id INTEGER, used_event_id UUID, freshness_state TEXT, data_age_seconds INTEGER, payload_class TEXT, na_reason TEXT, meta_json JSON, UNIQUE(snapshot_id, endpoint_id));
 CREATE TABLE IF NOT EXISTS endpoint_state (ticker TEXT, endpoint_id INTEGER, last_success_event_id UUID, last_success_ts_utc TIMESTAMP, last_payload_hash TEXT, last_change_ts_utc TIMESTAMP, last_change_event_id UUID, last_attempt_event_id UUID, last_attempt_ts_utc TIMESTAMP, last_attempt_http_status INTEGER, last_attempt_error_type TEXT, last_attempt_error_msg TEXT, PRIMARY KEY (ticker, endpoint_id));
 CREATE TABLE IF NOT EXISTS raw_http_events (event_id UUID PRIMARY KEY, run_id UUID, requested_at_utc TIMESTAMP, received_at_utc TIMESTAMP, ticker TEXT, endpoint_id INTEGER, http_status INTEGER, latency_ms INTEGER, payload_hash TEXT, payload_json JSON, is_retry BOOLEAN, error_type TEXT, error_msg TEXT, circuit_state_json JSON);

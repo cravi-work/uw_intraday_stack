@@ -68,6 +68,7 @@ def logloss_3class(prob_up: float, prob_down: float, prob_flat: float, label: st
 class ValidationResult:
     updated: int
     skipped: int
+    leakage_violations: int = 0
 
 
 def validate_pending(
@@ -76,13 +77,13 @@ def validate_pending(
     now_utc: datetime,
     flat_threshold_pct: float,
     tolerance_minutes: int,
+    max_horizon_drift_minutes: int = 10, # CL-06 Leakage bound
 ) -> ValidationResult:
     
     tol = timedelta(minutes=int(tolerance_minutes))
     now_utc = _ensure_utc(now_utc)
 
-    # CL-06: Added p.decision_window_id and p.validation_eligible. 
-    # Removed AND p.validation_eligible = TRUE from WHERE clause so we can count the ineligible skips.
+    # CL-06: Added window_id and validation_eligible to selection. Removed eligibility filter for python-side tracking.
     rows = con.execute(
         f"""SELECT p.prediction_id, p.snapshot_id, p.horizon_kind, p.horizon_minutes, p.horizon_seconds, 
                   p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc, p.decision_state,
@@ -94,6 +95,7 @@ def validate_pending(
 
     updated = 0
     skipped = 0
+    leakage_violations = 0
 
     cols_pred = [r[1] for r in con.execute("PRAGMA table_info('predictions')").fetchall()]
     has_outcome_price = "outcome_price" in cols_pred
@@ -112,7 +114,7 @@ def validate_pending(
             skipped += 1
             continue
 
-        # CL-06: Track validation eligibility skips explicitly
+        # CL-06 Tracking logic for ineligible skips
         if not is_eligible:
             _record_validation_skip(con, pid, "SKIP_INELIGIBLE")
             skipped += 1
@@ -163,6 +165,8 @@ def validate_pending(
         if target_ts > now_utc:
             continue
 
+        max_drift_ts = target_ts + timedelta(minutes=int(max_horizon_drift_minutes))
+
         if start_price is not None:
             start_spot = float(start_price)
         else:
@@ -200,12 +204,17 @@ def validate_pending(
         realized_snapshot_id, realized_asof = realized_snap_row
         realized_asof = _ensure_utc(realized_asof)
 
+        # CL-06 Leakage Rejection
+        if realized_asof is not None and realized_asof > max_drift_ts:
+            _record_validation_skip(con, pid, "target_exceeded_max_drift")
+            skipped += 1
+            leakage_violations += 1
+            logger.warning(f"Leakage guard blocked prediction {pid}", extra={"counter": "leakage_guard_violations", "prediction_id": pid, "window_id": window_id})
+            continue
+
         if realized_asof is None or (realized_asof - target_ts) > tol:
             _record_validation_skip(con, pid, "realized_snapshot_outside_tolerance")
             skipped += 1
-            # CL-06: Emit Leakage Guard Violation Counter
-            if realized_asof is not None and (realized_asof - target_ts) > tol:
-                logger.warning(f"Leakage guard blocked prediction {pid}", extra={"counter": "leakage_guard_violations", "prediction_id": pid, "window_id": window_id})
             continue
 
         realized_spot_row = con.execute(
@@ -247,7 +256,7 @@ def validate_pending(
         con.execute(update_sql, params)
         updated += 1
         
-        # CL-06: Successful process logging
+        # CL-06 Validation Processing Telemetry
         logger.info(f"Processed validation {pid}", extra={"counter": "validation_rows_processed", "prediction_id": pid, "window_id": window_id})
 
-    return ValidationResult(updated=updated, skipped=skipped)
+    return ValidationResult(updated=updated, skipped=skipped, leakage_violations=leakage_violations)

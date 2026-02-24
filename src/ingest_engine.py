@@ -5,7 +5,7 @@ import datetime as dt
 import logging
 import math
 import uuid
-import hashlib # CL-06 Added for deterministic ID
+import hashlib # CL-06: Deterministic generation
 from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -536,7 +536,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
                         
                         # CL-06 Deterministic Decision Window ID Generation
-                        window_id = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
+                        window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
                         
                         db.insert_prediction(
                             con,
@@ -553,7 +553,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
                                 "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-                                "decision_window_id": window_id
+                                "decision_window_id": window_id_fixed
                             }
                         )
 
@@ -562,7 +562,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
                         
                         # CL-06 Deterministic Decision Window ID Generation
-                        window_id = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
+                        window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
                         
                         db.insert_prediction(
                             con,
@@ -579,7 +579,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
                                 "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-                                "decision_window_id": window_id
+                                "decision_window_id": window_id_close
                             }
                         )
 
