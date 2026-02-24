@@ -85,6 +85,11 @@ def _build_meta(
     if details: 
         d.update(details)
         
+    # CL-03 Explicit provenance chain propagation
+    eff_ts = details.get("effective_ts_utc") if details and "effective_ts_utc" in details else None
+    if not eff_ts and getattr(ctx, "effective_ts_utc", None):
+        eff_ts = ctx.effective_ts_utc.isoformat()
+        
     full_lineage = {
         "metric_name": lineage.get("metric_name", "unknown"),
         "source_path": ctx.path,
@@ -94,7 +99,7 @@ def _build_meta(
         "session_applicability": lineage.get("session_applicability", "PRE/RTH/AFT"),
         "quality_policy": lineage.get("quality_policy", "None on missing"),
         "criticality": lineage.get("criticality", "NON_CRITICAL"),
-        "effective_ts_utc": details.get("effective_ts_utc") if details and "effective_ts_utc" in details else None
+        "effective_ts_utc": eff_ts
     }
     
     return {

@@ -159,7 +159,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     sess_str = hours.get_session_label(asof_et)
     
-    # CL-02 Explicit deterministic mapping without exception-driven fallback
     _SESSION_MAP = {
         SessionState.PREMARKET.value: SessionState.PREMARKET,
         SessionState.RTH.value: SessionState.RTH,
@@ -353,7 +352,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             stale_age_min=(res.stale_age_seconds // 60) if res.stale_age_seconds is not None else None,
                             na_reason=n_reason,
                             endpoint_asof_ts_utc=ep_asof,
-                            alignment_delta_sec=delta_sec
+                            alignment_delta_sec=delta_sec,
+                            effective_ts_utc=res.effective_ts_utc # CL-03 Explicit Injection
                         )
                         contexts[endpoint_id] = ctx
                             
@@ -450,6 +450,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             ts_list.append(eff_ts)
                             delta_sec = abs((asof_utc - eff_ts).total_seconds())
                             if delta_sec > alignment_tolerance_sec:
+                                logger.warning(
+                                    f"alignment_violation: {f['feature_key']} misaligned by {int(delta_sec)}s", 
+                                    extra={
+                                        "counter": "alignment_violation_count", 
+                                        "feature_key": f['feature_key'], 
+                                        "delta_sec": int(delta_sec)
+                                    }
+                                )
                                 alignment_violations.append(f"{f['feature_key']}_delta_{int(delta_sec)}s")
                                 continue # Drop from active signal package if grossly misaligned
                         aligned_features.append(f)
@@ -468,6 +476,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     source_ts_min = min(ts_list) if ts_list else None
                     source_ts_max = max(ts_list) if ts_list else None
+                    is_aligned = len(alignment_violations) == 0
 
                     base_gate = DecisionGate(
                         data_quality_state=DataQualityState.VALID, 
@@ -475,7 +484,14 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         decision_state=SignalState.NEUTRAL
                     )
 
-                    if len(alignment_violations) > 0:
+                    if not is_aligned:
+                        logger.warning(
+                            "misaligned_signal_suppressed", 
+                            extra={
+                                "counter": "misaligned_signal_suppression_count", 
+                                "violations": alignment_violations
+                            }
+                        )
                         base_gate = base_gate.block(f"window_misaligned: {alignment_violations}", invalid=True)
 
                     if session_enum == SessionState.CLOSED:
@@ -509,7 +525,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
-                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if not alignment_violations else "MISALIGNED",
+                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
                                 "decision_window_id": f"{snapshot_id}_FIXED_{h}"
                             }
                         )
@@ -532,7 +548,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "data_quality_state": pred.gate.data_quality_state.value, "blocked_reasons": list(pred.gate.blocked_reasons),
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
-                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if not alignment_violations else "MISALIGNED",
+                                "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
                                 "decision_window_id": f"{snapshot_id}_TOCLOSE_{sec_to_close}"
                             }
                         )

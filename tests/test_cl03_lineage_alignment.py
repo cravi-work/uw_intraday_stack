@@ -1,0 +1,143 @@
+import pytest
+import datetime as dt
+import uuid
+from typing import Optional
+from unittest.mock import MagicMock, patch
+
+from src.endpoint_truth import (
+    resolve_effective_payload, 
+    PayloadAssessment, 
+    EndpointPayloadClass, 
+    EmptyPayloadPolicy, 
+    FreshnessState, 
+    EndpointStateRow
+)
+from src.features import _build_meta, EndpointContext
+from src.ingest_engine import IngestionEngine
+
+def test_stale_carry_preserves_original_time():
+    """
+    EVIDENCE: Stale-carry metrics preserve original source time and are not 
+    relabeled as current-window fresh. 
+    """
+    attempt_ts = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    original_success_ts = dt.datetime(2026, 1, 1, 11, 45, 0, tzinfo=dt.timezone.utc)
+    
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.HTTP_ERROR, 
+        changed=False, 
+        missing_keys=[], 
+        error_reason="HTTP_500", 
+        empty_policy=EmptyPayloadPolicy.EMPTY_IS_ERROR
+    )
+    
+    prev_state = EndpointStateRow(
+        last_success_event_id=str(uuid.uuid4()),
+        last_success_ts_utc=original_success_ts,
+        last_payload_hash="abcd",
+        last_change_ts_utc=original_success_ts,
+        last_change_event_id=str(uuid.uuid4())
+    )
+    
+    resolved = resolve_effective_payload(
+        attempt_event_id=str(uuid.uuid4()),
+        attempt_ts_utc=attempt_ts,
+        assessment=assessment,
+        prev_state=prev_state,
+        fallback_max_age_seconds=1800 # 30 min max age
+    )
+    
+    assert resolved.freshness_state == FreshnessState.STALE_CARRY
+    assert resolved.effective_ts_utc == original_success_ts
+    assert resolved.effective_ts_utc != attempt_ts
+
+def test_feature_extraction_lineage_propagation():
+    """
+    EVIDENCE: Proves that effective_ts_utc is successfully passed from EndpointContext 
+    into metric_lineage during feature meta building.
+    """
+    eff_ts = dt.datetime(2026, 1, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
+    
+    ctx = EndpointContext(
+        endpoint_id=1,
+        method="GET",
+        path="/api/test",
+        operation_id="test_op",
+        signature="GET /api/test",
+        used_event_id="mock-uuid",
+        payload_class="SUCCESS_HAS_DATA",
+        freshness_state="FRESH",
+        stale_age_min=0,
+        na_reason=None,
+        endpoint_asof_ts_utc=dt.datetime.now(),
+        alignment_delta_sec=0,
+        effective_ts_utc=eff_ts # Injected provenance
+    )
+    
+    meta = _build_meta(ctx, "test_extractor", {"metric_name": "test_metric"})
+    assert meta["metric_lineage"]["effective_ts_utc"] == eff_ts.isoformat()
+
+def test_alignment_gating_counters_and_status(caplog):
+    """
+    EVIDENCE: Mixed-timestamp fixture triggers MISALIGNED status, blocks the gate, 
+    and fires the structured logging counters.
+    """
+    cfg = {
+        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
+        "system": {},
+        "network": {},
+        "validation": {"horizons_minutes": [5], "alignment_tolerance_sec": 300}
+    }
+
+    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
+         patch("src.ingest_engine.fetch_all"), \
+         patch("src.ingest_engine.load_endpoint_plan"), \
+         patch("src.ingest_engine.load_api_catalog"), \
+         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
+         patch("src.ingest_engine.FileLock"), \
+         patch("src.ingest_engine.extract_all") as mock_extract:
+             
+        # Setup open market
+        mock_mh = MagicMock()
+        mock_mh.is_trading_day = True
+        mock_mh.ingest_start_et = dt.datetime.now() - dt.timedelta(hours=1)
+        mock_mh.ingest_end_et = dt.datetime.now() + dt.timedelta(hours=1)
+        mock_mh.get_session_label.return_value = "RTH"
+        mock_mh.seconds_to_close.return_value = 3600
+        mock_gmh.return_value = mock_mh
+
+        mock_db = MagicMock()
+        mock_dbw_cls.return_value = mock_db
+        mock_db.writer.return_value.__enter__.return_value = MagicMock()
+        mock_db.get_payloads_by_event_ids.return_value = {}
+        
+        # Base ASOF will be "now". Create two features: one aligned, one grossly misaligned.
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        stale_ts = now_utc - dt.timedelta(seconds=1000) # Exceeds 300s tolerance
+        
+        f1 = {
+            "feature_key": "spot", "feature_value": 150.0, 
+            "meta_json": {"metric_lineage": {"effective_ts_utc": now_utc.isoformat()}}
+        }
+        f2 = {
+            "feature_key": "net_gex_sign", "feature_value": 1.0, 
+            "meta_json": {"metric_lineage": {"effective_ts_utc": stale_ts.isoformat()}}
+        }
+        
+        mock_extract.return_value = ([f1, f2], [])
+        
+        engine = IngestionEngine(cfg=cfg, catalog_path="dummy.yaml", config_path="dummy.yaml")
+        
+        with caplog.at_level(logging.WARNING):
+            engine.run_cycle()
+            
+        # Check specific counters fired
+        assert "alignment_violation_count" in caplog.text
+        assert "misaligned_signal_suppression_count" in caplog.text
+        assert "net_gex_sign" in caplog.text
+        
+        # Check that the prediction write contained the blocked gate and MISALIGNED status
+        pred_call = mock_db.insert_prediction.call_args[0][1]
+        assert pred_call["alignment_status"] == "MISALIGNED"
+        assert pred_call["decision_state"] == "NO_SIGNAL" # Gate was blocked

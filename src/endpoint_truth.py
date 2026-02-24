@@ -51,6 +51,7 @@ class EndpointContext:
     na_reason: Optional[str]
     endpoint_asof_ts_utc: Optional[datetime.datetime] = None
     alignment_delta_sec: Optional[int] = None
+    effective_ts_utc: Optional[datetime.datetime] = None  # CL-03 Provenance Contract
 
 @dataclass(frozen=True)
 class PayloadAssessment:
@@ -77,6 +78,7 @@ class ResolvedLineage:
     stale_age_seconds: Optional[int]
     payload_class: EndpointPayloadClass
     na_reason: Optional[str]
+    effective_ts_utc: Optional[datetime.datetime] = None  # CL-03 Provenance Contract
 
 def to_utc_dt(x: Any, *, fallback: datetime.datetime) -> datetime.datetime:
     if x is None: return fallback
@@ -182,32 +184,37 @@ def resolve_effective_payload(
     empty_policy = assessment.empty_policy
 
     if pclass == EndpointPayloadClass.SUCCESS_HAS_DATA:
-        return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.FRESH, 0, pclass, None))
+        return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.FRESH, 0, pclass, None, effective_ts_utc=current_ts))
     
     if pclass == EndpointPayloadClass.SUCCESS_STALE:
         used_id = prev_state.last_change_event_id if prev_state and prev_state.last_change_event_id else current_event_id
         prev_change_ts = to_utc_dt(prev_state.last_change_ts_utc, fallback=current_ts) if prev_state and prev_state.last_change_ts_utc else current_ts
         age = max(0, int((current_ts - prev_change_ts).total_seconds()))
-        resolved = ResolvedLineage(used_id, FreshnessState.STALE_CARRY, age, pclass, None)
+        
+        # CL-03: Stale carry preserves original success timestamp
+        eff_ts = to_utc_dt(prev_state.last_success_ts_utc, fallback=current_ts) if prev_state and prev_state.last_success_ts_utc else current_ts
+        resolved = ResolvedLineage(used_id, FreshnessState.STALE_CARRY, age, pclass, None, effective_ts_utc=eff_ts)
         return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
 
     if pclass == EndpointPayloadClass.SUCCESS_EMPTY_VALID:
         if empty_policy == EmptyPayloadPolicy.EMPTY_IS_DATA:
-            return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.EMPTY_VALID, 0, pclass, None))
+            return _enforce_invariants(ResolvedLineage(current_event_id, FreshnessState.EMPTY_VALID, 0, pclass, None, effective_ts_utc=current_ts))
         elif empty_policy == EmptyPayloadPolicy.EMPTY_MEANS_STALE:
             cf_id, age = _get_carry_forward_target(prev_state, current_ts)
             if cf_id:
-                resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_EMPTY_MEANS_STALE.value)
+                eff_ts = to_utc_dt(prev_state.last_success_ts_utc, fallback=current_ts) if prev_state and prev_state.last_success_ts_utc else current_ts
+                resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_EMPTY_MEANS_STALE.value, effective_ts_utc=eff_ts)
                 return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
             else:
-                return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value))
+                return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value, effective_ts_utc=None))
 
     if pclass == EndpointPayloadClass.ERROR:
         cf_id, age = _get_carry_forward_target(prev_state, current_ts)
         if cf_id:
-            resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_ERROR.value)
+            eff_ts = to_utc_dt(prev_state.last_success_ts_utc, fallback=current_ts) if prev_state and prev_state.last_success_ts_utc else current_ts
+            resolved = ResolvedLineage(cf_id, FreshnessState.STALE_CARRY, age, pclass, NaReasonCode.CARRY_FORWARD_ERROR.value, effective_ts_utc=eff_ts)
             return _enforce_invariants(_apply_stale_cutoff(resolved, age, fallback_max_age_seconds, invalid_after_seconds))
         else:
-            return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value))
+            return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.NO_PRIOR_SUCCESS.value, effective_ts_utc=None))
             
-    return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.UNRESOLVED.value))
+    return _enforce_invariants(ResolvedLineage(None, FreshnessState.ERROR, None, pclass, NaReasonCode.UNRESOLVED.value, effective_ts_utc=None))
