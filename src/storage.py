@@ -226,7 +226,7 @@ class DbWriter:
                 json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), 
                 p.get("validation_eligible", True), json.dumps(p.get("gate_json", {})),
                 p.get("alignment_status", "UNKNOWN"), p.get("source_ts_min_utc"), p.get("source_ts_max_utc"),
-                p.get("critical_missing_count", 0), p.get("decision_window_id", "UNKNOWN")
+                p.get("critical_missing_count", p.get("critical_missing_count", 0)), p.get("decision_window_id", "UNKNOWN")
             ]
         )
         return pid
@@ -357,3 +357,12 @@ class DbWriter:
         
         state_str = json.dumps(rows, sort_keys=True)
         return hashlib.sha256(state_str.encode()).hexdigest()
+
+    # CL-07 Replay Diagnostics Summary
+    def get_pipeline_diagnostics(self, con: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
+        preds = con.execute("SELECT risk_gate_status, COUNT(*) FROM predictions GROUP BY risk_gate_status").fetchall()
+        lineage = con.execute("SELECT freshness_state, COUNT(*) FROM snapshot_lineage GROUP BY freshness_state").fetchall()
+        return {
+            "predictions_by_gate": {r[0]: r[1] for r in preds},
+            "lineage_by_freshness": {r[0]: r[1] for r in lineage}
+        }

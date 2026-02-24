@@ -6,12 +6,14 @@ import json
 import math
 
 class SessionState(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     PREMARKET = "PREMARKET"
     RTH = "RTH"
     AFTERHOURS = "AFTERHOURS"
     CLOSED = "CLOSED"
 
 class DataQualityState(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     VALID = "VALID"
     STALE = "STALE"
     PARTIAL = "PARTIAL"
@@ -19,12 +21,14 @@ class DataQualityState(str, Enum):
     DEGRADED = "DEGRADED"
 
 class SignalState(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     LONG = "LONG"
     SHORT = "SHORT"
     NEUTRAL = "NEUTRAL"
     NO_SIGNAL = "NO_SIGNAL"
 
 class ConfidenceState(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
@@ -32,16 +36,19 @@ class ConfidenceState(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 class RiskGateStatus(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     PASS = "PASS"
     BLOCKED = "BLOCKED"
     DEGRADED = "DEGRADED"
 
 class HorizonKind(str, Enum):
+    # CL-07 INTERFACE FREEZE: Do not rename or remove these values
     FIXED = "FIXED"
     TO_CLOSE = "TO_CLOSE"
 
 @dataclass(frozen=True)
 class DecisionGate:
+    # CL-07 INTERFACE FREEZE: Schema contract properties
     data_quality_state: DataQualityState
     risk_gate_status: RiskGateStatus
     decision_state: SignalState

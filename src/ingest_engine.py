@@ -160,6 +160,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     sess_str = hours.get_session_label(asof_et)
     
+    # CL-02: Explicit deterministic mapping
     _SESSION_MAP = {
         SessionState.PREMARKET.value: SessionState.PREMARKET,
         SessionState.RTH.value: SessionState.RTH,
@@ -238,7 +239,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     
                     ev_key = (tkr, endpoint_id)
                     if ev_key in max_seen_ts and res.requested_at_utc < max_seen_ts[ev_key]:
-                        logger.warning(f"Out of order packet dropped from state mutation: {ev_key}")
+                        # CL-07 Out of Order Dropped Counter
+                        logger.warning(
+                            f"Out of order packet dropped from state mutation: {ev_key}", 
+                            extra={"counter": "out_of_order_drops", "ticker": tkr, "endpoint_id": endpoint_id}
+                        )
                         db.insert_raw_event(
                             con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
                             res.status_code, res.latency_ms, res.payload_hash, res.payload_json,
@@ -290,6 +295,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     if enforced_reason and NaReasonCode.STALE_TOO_OLD.value in enforced_reason:
                         enforced_freshness = FreshnessState.ERROR
+                        # CL-07 Stale Packet Counter
+                        logger.warning(
+                            f"Stale packet dropped (too old): {ev_key}", 
+                            extra={"counter": "stale_packets_dropped", "ticker": tkr, "endpoint_id": endpoint_id}
+                        )
 
                     if assessment.error_reason and not enforced_reason:
                         enforced_reason = assessment.error_reason
@@ -395,7 +405,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             f_val = f.get("feature_value")
                             
                             if f_val is not None and not _is_valid_num(f_val):
-                                logger.warning(f"Malformed feature row (non-finite value): {f}")
+                                # CL-07 Malformed Guard Counter
+                                logger.warning(
+                                    f"Malformed feature row (non-finite value): {f}", 
+                                    extra={"counter": "malformed_rows_dropped"}
+                                )
                                 malformed_count += 1
                                 continue
                                 
@@ -408,7 +422,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 valid_features.append(f) 
                                 continue
                         
-                        logger.warning(f"Malformed feature row skipped: {f}")
+                        logger.warning(
+                            f"Malformed feature row skipped: {f}", 
+                            extra={"counter": "malformed_rows_dropped"}
+                        )
                         malformed_count += 1
 
                     for l in levels_insert_list:
@@ -417,7 +434,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             m = l.get("magnitude")
                             
                             if (p is not None and not _is_valid_num(p)) or (m is not None and not _is_valid_num(m)):
-                                logger.warning(f"Malformed level row (non-finite value): {l}")
+                                logger.warning(
+                                    f"Malformed level row (non-finite value): {l}", 
+                                    extra={"counter": "malformed_rows_dropped"}
+                                )
                                 malformed_count += 1
                                 continue
                                 
@@ -426,7 +446,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 valid_levels.append(l) 
                                 continue
                         
-                        logger.warning(f"Malformed level row skipped: {l}")
+                        logger.warning(
+                            f"Malformed level row skipped: {l}", 
+                            extra={"counter": "malformed_rows_dropped"}
+                        )
                         malformed_count += 1
 
                     total_outputs = len(features_insert_list) + len(levels_insert_list)
@@ -500,6 +523,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     }.get(session_enum, ["spot"])
 
                     def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], int]:
+                        # CL-05 Horizon/Signal-Family Aware Evaluation
                         reqs = horizon_critical_cfg.get(h_str, session_default_criticals)
                         weights = horizon_weights_cfg.get(h_str, default_weights)
                         
