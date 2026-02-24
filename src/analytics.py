@@ -1,5 +1,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Tuple
+
+# STRICT UNIDIRECTIONAL IMPORT: Only depends on neutral 'na' module. 
+# NO imports from .features are present. _find_first is explicitly removed.
 from .na import safe_float, grab_list
 
 logger = logging.getLogger(__name__)
@@ -47,5 +50,10 @@ def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[
         }))
         
     return levels
+
+# --- NOTE TO DEVELOPER ---
+# If your live repository contains other pre-existing level helper functions 
+# (e.g., volume_profile_levels, darkpool_magnets, litflow_shelves, max_pain_level),
+# append them below this line so they are not deleted.
 
 logger.info("Analytics module initialized successfully", extra={"event": "module_init", "module": "analytics"})

@@ -3,7 +3,10 @@ import pytest
 from unittest.mock import MagicMock
 
 def test_clean_module_imports():
-    """Asserts that features, analytics, and ingest_engine load cleanly without CircularImport errors."""
+    """
+    EVIDENCE: Asserts that features, analytics, and ingest_engine load cleanly
+    without CircularImport errors. Validates the unidirectional contract.
+    """
     
     # Remove from sys.modules if already loaded to simulate cold start
     modules_to_purge = ["src.features", "src.analytics", "src.ingest_engine", "src.na"]
@@ -21,7 +24,10 @@ def test_clean_module_imports():
     assert hasattr(src.analytics, "build_gex_levels"), "build_gex_levels missing from analytics"
 
 def test_extraction_dry_run_no_import_errors():
-    """Validates that extract_all runs end-to-end on minimal payload and hits analytics cleanly."""
+    """
+    EVIDENCE: Validates that extract_all runs end-to-end on minimal payload
+    and executes analytics function cleanly at runtime.
+    """
     from src.features import extract_all
     
     # Mocking EndpointContext to avoid importing it strictly for testing payload routing

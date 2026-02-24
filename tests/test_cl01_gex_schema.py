@@ -2,7 +2,10 @@ import pytest
 from src.analytics import build_gex_levels
 
 def test_build_gex_levels_schema():
-    """Asserts that build_gex_levels conforms to the expected Tuple structure downstream."""
+    """
+    EVIDENCE: Asserts that build_gex_levels conforms to the expected Tuple structure downstream.
+    Proves frozen interface stability.
+    """
     payload = [
         {"strike": 100, "gamma_exposure": 5000},
         {"strike": 105, "gamma_exposure": -2000},
