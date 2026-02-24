@@ -1,6 +1,7 @@
 import pytest
 import datetime as dt
 import uuid
+import logging
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +25,7 @@ def test_stale_carry_preserves_original_time():
     original_success_ts = dt.datetime(2026, 1, 1, 11, 45, 0, tzinfo=dt.timezone.utc)
     
     assessment = PayloadAssessment(
-        payload_class=EndpointPayloadClass.HTTP_ERROR, 
+        payload_class=EndpointPayloadClass.ERROR, 
         changed=False, 
         missing_keys=[], 
         error_reason="HTTP_500", 
@@ -40,8 +41,8 @@ def test_stale_carry_preserves_original_time():
     )
     
     resolved = resolve_effective_payload(
-        attempt_event_id=str(uuid.uuid4()),
-        attempt_ts_utc=attempt_ts,
+        current_event_id=str(uuid.uuid4()),
+        current_ts_raw=attempt_ts,
         assessment=assessment,
         prev_state=prev_state,
         fallback_max_age_seconds=1800 # 30 min max age
@@ -141,3 +142,64 @@ def test_alignment_gating_counters_and_status(caplog):
         pred_call = mock_db.insert_prediction.call_args[0][1]
         assert pred_call["alignment_status"] == "MISALIGNED"
         assert pred_call["decision_state"] == "NO_SIGNAL" # Gate was blocked
+
+def test_aligned_fixture_produces_aligned_status():
+    """
+    EVIDENCE: Fully aligned fixture produces ALIGNED status with bounded timestamp span.
+    """
+    cfg = {
+        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
+        "system": {},
+        "network": {},
+        "validation": {"horizons_minutes": [5], "alignment_tolerance_sec": 300}
+    }
+
+    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
+         patch("src.ingest_engine.fetch_all"), \
+         patch("src.ingest_engine.load_endpoint_plan"), \
+         patch("src.ingest_engine.load_api_catalog"), \
+         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
+         patch("src.ingest_engine.FileLock"), \
+         patch("src.ingest_engine.extract_all") as mock_extract:
+             
+        # Setup open market
+        mock_mh = MagicMock()
+        mock_mh.is_trading_day = True
+        mock_mh.ingest_start_et = dt.datetime.now() - dt.timedelta(hours=1)
+        mock_mh.ingest_end_et = dt.datetime.now() + dt.timedelta(hours=1)
+        mock_mh.get_session_label.return_value = "RTH"
+        mock_mh.seconds_to_close.return_value = 3600
+        mock_gmh.return_value = mock_mh
+
+        mock_db = MagicMock()
+        mock_dbw_cls.return_value = mock_db
+        mock_db.writer.return_value.__enter__.return_value = MagicMock()
+        mock_db.get_payloads_by_event_ids.return_value = {}
+        
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        aligned_ts_1 = now_utc - dt.timedelta(seconds=10)
+        aligned_ts_2 = now_utc - dt.timedelta(seconds=20) # Within 300s tolerance
+        
+        f1 = {
+            "feature_key": "spot", "feature_value": 150.0, 
+            "meta_json": {"metric_lineage": {"effective_ts_utc": aligned_ts_1.isoformat()}}
+        }
+        f2 = {
+            "feature_key": "net_gex_sign", "feature_value": 1.0, 
+            "meta_json": {"metric_lineage": {"effective_ts_utc": aligned_ts_2.isoformat()}}
+        }
+        
+        mock_extract.return_value = ([f1, f2], [])
+        
+        engine = IngestionEngine(cfg=cfg, catalog_path="dummy.yaml", config_path="dummy.yaml")
+        engine.run_cycle()
+            
+        pred_call = mock_db.insert_prediction.call_args[0][1]
+        
+        assert pred_call["alignment_status"] == "ALIGNED"
+        assert pred_call["source_ts_min_utc"] == aligned_ts_2
+        assert pred_call["source_ts_max_utc"] == aligned_ts_1
+        
+        span_sec = (pred_call["source_ts_max_utc"] - pred_call["source_ts_min_utc"]).total_seconds()
+        assert span_sec <= 300
