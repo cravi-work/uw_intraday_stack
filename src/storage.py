@@ -344,3 +344,15 @@ class DbWriter:
         
     def ro_connect(self) -> duckdb.DuckDBPyConnection: 
         return duckdb.connect(self.duckdb_path, read_only=True)
+
+    # CL-06: Deterministic Replay Checksum
+    def get_validation_checksum(self, con: duckdb.DuckDBPyConnection) -> str:
+        rows = con.execute("""
+            SELECT prediction_id, brier_score, log_loss, is_correct 
+            FROM predictions 
+            WHERE outcome_realized = TRUE 
+            ORDER BY prediction_id
+        """).fetchall()
+        
+        state_str = json.dumps(rows, sort_keys=True)
+        return hashlib.sha256(state_str.encode()).hexdigest()

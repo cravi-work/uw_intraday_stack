@@ -5,6 +5,7 @@ import datetime as dt
 import logging
 import math
 import uuid
+import hashlib # CL-06 Added for deterministic ID
 from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -491,7 +492,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     horizon_critical_cfg = cfg.get("validation", {}).get("horizon_critical_features", {})
                     default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
 
-                    # Baseline session default if config lacks explicit horizon rules
                     session_default_criticals = {
                         SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
                         SessionState.PREMARKET: ["spot", "dealer_vanna"],
@@ -500,7 +500,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     }.get(session_enum, ["spot"])
 
                     def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], int]:
-                        # CL-05 Horizon/Signal-Family Aware Evaluation
                         reqs = horizon_critical_cfg.get(h_str, session_default_criticals)
                         weights = horizon_weights_cfg.get(h_str, default_weights)
                         
@@ -522,13 +521,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                     f"critical_feature_missing_{h_str}: {mk}", 
                                     extra={"counter": "critical_feature_missing_count", "feature_key": mk, "horizon": h_str}
                                 )
-                            # Explicit enumeration of failing dependencies inside gate block
                             h_gate = h_gate.block(f"critical_features_missing_{h_str}: {','.join(missing_criticals)}", invalid=True, missing_features=missing_criticals)
                         elif missing_non_criticals and h_gate.risk_gate_status == RiskGateStatus.PASS:
-                            # CL-05 Degraded Path Logic
                             h_gate = h_gate.degrade(f"non_critical_features_missing_{h_str}: {','.join(missing_non_criticals)}", partial=True)
                         
-                        # Apply broad DQ degradation if no explicit block occurred
                         if dq < 0.5 and h_gate.risk_gate_status == RiskGateStatus.PASS:
                             h_gate = h_gate.degrade(f"low_data_quality_score_{dq:.2f}", partial=True)
                             
@@ -538,6 +534,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         h_str = str(h)
                         h_gate, weights, critical_missing = evaluate_horizon_gate(h_str, base_gate)
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
+                        
+                        # CL-06 Deterministic Decision Window ID Generation
+                        window_id = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
                         
                         db.insert_prediction(
                             con,
@@ -554,13 +553,16 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
                                 "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-                                "decision_window_id": f"{snapshot_id}_FIXED_{h}"
+                                "decision_window_id": window_id
                             }
                         )
 
                     if sec_to_close is not None and sec_to_close > 0:
                         h_gate, weights, critical_missing = evaluate_horizon_gate("to_close", base_gate)
                         pred = bounded_additive_score(feat_dict, dq, weights, gate=h_gate)
+                        
+                        # CL-06 Deterministic Decision Window ID Generation
+                        window_id = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
                         
                         db.insert_prediction(
                             con,
@@ -577,7 +579,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
                                 "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
                                 "critical_missing_count": critical_missing, "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-                                "decision_window_id": f"{snapshot_id}_TOCLOSE_{sec_to_close}"
+                                "decision_window_id": window_id
                             }
                         )
 

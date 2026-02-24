@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
@@ -10,6 +11,7 @@ import duckdb
 from .models import predicted_class, SignalState
 
 UTC = timezone.utc
+logger = logging.getLogger(__name__)
 
 
 def _clamp_prob(p: float, eps: float = 1e-12) -> float:
@@ -79,13 +81,15 @@ def validate_pending(
     tol = timedelta(minutes=int(tolerance_minutes))
     now_utc = _ensure_utc(now_utc)
 
+    # CL-06: Added p.decision_window_id and p.validation_eligible. 
+    # Removed AND p.validation_eligible = TRUE from WHERE clause so we can count the ineligible skips.
     rows = con.execute(
         f"""SELECT p.prediction_id, p.snapshot_id, p.horizon_kind, p.horizon_minutes, p.horizon_seconds, 
-                  p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc, p.decision_state
+                  p.start_price, p.prob_up, p.prob_down, p.prob_flat, s.ticker, s.asof_ts_utc, p.decision_state,
+                  p.decision_window_id, p.validation_eligible
            FROM predictions p 
            JOIN snapshots s ON s.snapshot_id = p.snapshot_id
-           WHERE p.realized_at_utc IS NULL
-             AND p.validation_eligible = TRUE"""
+           WHERE p.realized_at_utc IS NULL"""
     ).fetchall()
 
     updated = 0
@@ -100,12 +104,19 @@ def validate_pending(
         
     update_sql = "UPDATE predictions SET " + ", ".join(set_parts) + " WHERE prediction_id = ?"
 
-    for (prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds, start_price, prob_up, prob_down, prob_flat, ticker, asof_ts_utc, decision_state) in rows:
+    for (prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds, start_price, prob_up, prob_down, prob_flat, ticker, asof_ts_utc, decision_state, window_id, is_eligible) in rows:
         pid = str(prediction_id)
         asof_ts_utc = _ensure_utc(asof_ts_utc)
         
         if asof_ts_utc is None:
             skipped += 1
+            continue
+
+        # CL-06: Track validation eligibility skips explicitly
+        if not is_eligible:
+            _record_validation_skip(con, pid, "SKIP_INELIGIBLE")
+            skipped += 1
+            logger.info(f"Skipped prediction {pid} (ineligible)", extra={"counter": "validation_rows_skipped_ineligible", "prediction_id": pid})
             continue
 
         if decision_state == SignalState.NO_SIGNAL.value:
@@ -192,6 +203,9 @@ def validate_pending(
         if realized_asof is None or (realized_asof - target_ts) > tol:
             _record_validation_skip(con, pid, "realized_snapshot_outside_tolerance")
             skipped += 1
+            # CL-06: Emit Leakage Guard Violation Counter
+            if realized_asof is not None and (realized_asof - target_ts) > tol:
+                logger.warning(f"Leakage guard blocked prediction {pid}", extra={"counter": "leakage_guard_violations", "prediction_id": pid, "window_id": window_id})
             continue
 
         realized_spot_row = con.execute(
@@ -232,5 +246,8 @@ def validate_pending(
 
         con.execute(update_sql, params)
         updated += 1
+        
+        # CL-06: Successful process logging
+        logger.info(f"Processed validation {pid}", extra={"counter": "validation_rows_processed", "prediction_id": pid, "window_id": window_id})
 
     return ValidationResult(updated=updated, skipped=skipped)
