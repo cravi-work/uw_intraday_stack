@@ -18,30 +18,27 @@ def mock_ctx():
     ctx.operation_id = "test"
     ctx.used_event_id = "mock-id"
     ctx.signature = "sig"
+    ctx.endpoint_id = 1
+    ctx.stale_age_min = 0
+    ctx.effective_ts_utc = None
     return ctx
 
 def test_darkpool_pressure_finite_guards(mock_ctx):
-    """
-    EVIDENCE: Proves darkpool metrics compute properly and strictly block NaNs/Infs.
-    """
     payload = [
         {"price": 100.0, "volume": 500},
-        {"price": 100.0, "volume": float('nan')},  # Should be skipped
-        {"price": float('inf'), "volume": 100}     # Should be skipped
+        {"price": 100.0, "volume": float('nan')},  
+        {"price": float('inf'), "volume": 100}     
     ]
     bundle = extract_darkpool_pressure(payload, mock_ctx)
     val = bundle.features["darkpool_pressure"]
     
-    assert val == 50000.0  # Only the first row should be successfully parsed
+    assert val == 50000.0  
     assert math.isfinite(val)
 
 def test_litflow_pressure_side_logic(mock_ctx):
-    """
-    EVIDENCE: Proves litflow evaluates correct ASK/BID sided pressure.
-    """
     payload = [
-        {"price": 10.0, "size": 100, "side": "ASK"}, # Bullish flow +1000
-        {"price": 10.0, "size": 50, "side": "BID"}   # Bearish flow -500
+        {"price": 10.0, "size": 100, "side": "ASK"}, 
+        {"price": 10.0, "size": 50, "side": "BID"}   
     ]
     bundle = extract_litflow_pressure(payload, mock_ctx)
     val = bundle.features["litflow_pressure"]
@@ -49,9 +46,6 @@ def test_litflow_pressure_side_logic(mock_ctx):
     assert val == 500.0
     
 def test_volatility_finite_guards(mock_ctx):
-    """
-    EVIDENCE: Proves volatility metrics explicitly reject NaNs to protect the pipeline.
-    """
     payload = [{"iv_rank": float('nan')}]
     bundle = extract_volatility_features(payload, mock_ctx)
     

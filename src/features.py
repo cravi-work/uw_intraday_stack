@@ -89,8 +89,24 @@ def _build_meta(
     if details: 
         d.update(details)
         
-    eff_ts = details.get("effective_ts_utc") if details and "effective_ts_utc" in details else None
-    if not eff_ts and getattr(ctx, "effective_ts_utc", None):
+    eff_ts = None
+    ts_source = "missing"
+    ts_quality = "MISSING"
+    
+    # Task 3: Predictive Feature Timestamp Lineage Hardening
+    if details and "effective_ts_utc" in details:
+        payload_ts = details.get("effective_ts_utc")
+        if payload_ts in (None, "INVALID"):
+            ts_source = "payload"
+            ts_quality = "INVALID"
+            eff_ts = None
+        else:
+            ts_source = "payload"
+            ts_quality = "VALID"
+            eff_ts = payload_ts
+    elif getattr(ctx, "effective_ts_utc", None):
+        ts_source = "endpoint_context"
+        ts_quality = "VALID"
         eff_ts = ctx.effective_ts_utc.isoformat()
         
     full_lineage = {
@@ -102,7 +118,9 @@ def _build_meta(
         "session_applicability": lineage.get("session_applicability", "PRE/RTH/AFT"),
         "quality_policy": lineage.get("quality_policy", "None on missing"),
         "criticality": lineage.get("criticality", "NON_CRITICAL"),
-        "effective_ts_utc": eff_ts
+        "effective_ts_utc": eff_ts,
+        "timestamp_source": ts_source,
+        "timestamp_quality": ts_quality
     }
     
     return {
@@ -161,7 +179,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     close_float = safe_float(close_val)
     ts_float = _parse_strict_ts(latest_row, "t")
     
-    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
+    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
     
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": t_val, "effective_ts_utc": eff_ts})})
 
@@ -269,7 +287,7 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     latest = max(rows, key=lambda r: _parse_strict_ts(r, "date"))
     
     ts_float = _parse_strict_ts(latest, "date")
-    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
+    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
     
     meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {"ts": latest.get("date"), "scale_used": norm_scale, "effective_ts_utc": eff_ts})
     

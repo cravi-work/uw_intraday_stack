@@ -226,7 +226,7 @@ class DbWriter:
                 json.dumps(p.get("blocked_reasons", [])), json.dumps(p.get("degraded_reasons", [])), 
                 p.get("validation_eligible", True), json.dumps(p.get("gate_json", {})),
                 p.get("alignment_status", "UNKNOWN"), p.get("source_ts_min_utc"), p.get("source_ts_max_utc"),
-                p.get("critical_missing_count", p.get("critical_missing_count", 0)), p.get("decision_window_id", "UNKNOWN")
+                p.get("critical_missing_count", 0), p.get("decision_window_id", "UNKNOWN")
             ]
         )
         return pid

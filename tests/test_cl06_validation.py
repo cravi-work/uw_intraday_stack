@@ -6,16 +6,12 @@ from unittest.mock import MagicMock
 from src.validator import validate_pending
 
 def test_leakage_guard_rejection(caplog):
-    """
-    EVIDENCE: Leakage test detects and rejects future data that falls outside 
-    the safe maximum drift boundaries (tolerance_minutes).
-    """
     mock_con = MagicMock()
     pred_asof = dt.datetime(2026, 1, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
     now_utc = pred_asof + dt.timedelta(hours=2)
     
     target_ts = pred_asof + dt.timedelta(minutes=5)
-    leaked_ts = target_ts + dt.timedelta(minutes=10) # Way outside the 2m tolerance
+    leaked_ts = target_ts + dt.timedelta(minutes=15)
 
     def mock_execute(query, params=None):
         m = MagicMock()
@@ -36,21 +32,18 @@ def test_leakage_guard_rejection(caplog):
             mock_con, 
             now_utc=now_utc, 
             flat_threshold_pct=0.0005, 
-            tolerance_minutes=2 # 2 minute maximum drift tolerance
+            tolerance_minutes=2
         )
         
     assert stats.skipped == 1
-    assert "leakage_guard_violations" in caplog.text
+    assert "Leakage guard blocked prediction" in caplog.text
+    assert stats.leakage_violations == 1
 
 def test_to_close_semantics():
-    """
-    EVIDENCE: TO_CLOSE predictions correctly compute target_ts relative to their specific 
-    horizon_seconds remaining in the session rather than failing via static horizon offsets.
-    """
     mock_con = MagicMock()
     pred_asof = dt.datetime(2026, 1, 1, 15, 0, 0, tzinfo=dt.timezone.utc)
     now_utc = pred_asof + dt.timedelta(hours=2)
-    hz_sec = 3600 # Exactly one hour left in session
+    hz_sec = 3600 
     
     target_ts = pred_asof + dt.timedelta(seconds=hz_sec)
     
@@ -81,15 +74,9 @@ def test_to_close_semantics():
     assert stats.skipped == 0
 
 def test_deterministic_replay_checksum():
-    """
-    EVIDENCE: Walk-forward validation produces identical results across reruns. 
-    We simulate running validation, getting the state hash, resetting, and running again.
-    """
     import hashlib
     import json
     
-    # We simply mock the DB returning identical validation states to prove 
-    # the exact checksumming process defined in the storage class Acceptance Criteria.
     rows = [
         ("uuid1", 0.05, 0.10, True),
         ("uuid2", 0.45, 0.80, False)
@@ -98,7 +85,6 @@ def test_deterministic_replay_checksum():
     state_str_1 = json.dumps(rows, sort_keys=True)
     hash_1 = hashlib.sha256(state_str_1.encode()).hexdigest()
     
-    # Simulate wipe and rerun (rows order might change internally but DB query has ORDER BY)
     rows_reordered_query_sim = [
         ("uuid1", 0.05, 0.10, True),
         ("uuid2", 0.45, 0.80, False)

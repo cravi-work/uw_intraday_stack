@@ -1,7 +1,10 @@
 from __future__ import annotations
+import logging
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, Any
+
+logger = logging.getLogger(__name__)
 
 class EmptyPayloadPolicy(Enum):
     EMPTY_IS_DATA = "EMPTY_IS_DATA"
@@ -23,23 +26,23 @@ def _register(rule: EndpointRule) -> None:
     RULE_REGISTRY[(rule.method.upper(), rule.path)] = rule
 
 P_ALWAYS_DATA = {
-    "PRE": EmptyPayloadPolicy.EMPTY_IS_DATA, 
-    "REG": EmptyPayloadPolicy.EMPTY_IS_DATA, 
-    "AFT": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "PREMARKET": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "RTH": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "AFTERHOURS": EmptyPayloadPolicy.EMPTY_IS_DATA, 
     "CLOSED": EmptyPayloadPolicy.EMPTY_IS_DATA
 }
 
 P_FLOW = {
-    "PRE": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
-    "REG": EmptyPayloadPolicy.EMPTY_IS_DATA, 
-    "AFT": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "PREMARKET": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "RTH": EmptyPayloadPolicy.EMPTY_IS_DATA, 
+    "AFTERHOURS": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
     "CLOSED": EmptyPayloadPolicy.EMPTY_MEANS_STALE
 }
 
 P_STRUCTURAL = {
-    "PRE": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
-    "REG": EmptyPayloadPolicy.EMPTY_INVALID, 
-    "AFT": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "PREMARKET": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
+    "RTH": EmptyPayloadPolicy.EMPTY_INVALID, 
+    "AFTERHOURS": EmptyPayloadPolicy.EMPTY_MEANS_STALE, 
     "CLOSED": EmptyPayloadPolicy.EMPTY_MEANS_STALE
 }
 
@@ -67,7 +70,20 @@ def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayload
     rule = get_endpoint_rule(method, path)
     if not rule:
         return EmptyPayloadPolicy.EMPTY_INVALID
-    return rule.empty_policy_by_session.get(session_label, EmptyPayloadPolicy.EMPTY_INVALID)
+        
+    legacy_map = {
+        "PRE": "PREMARKET",
+        "REG": "RTH",
+        "AFT": "AFTERHOURS"
+    }
+    
+    canonical_label = legacy_map.get(session_label, session_label)
+    
+    if canonical_label not in ["PREMARKET", "RTH", "AFTERHOURS", "CLOSED"]:
+        logger.error(f"Session contract violation: Unknown session label '{session_label}' provided to get_empty_policy.")
+        raise ValueError(f"Unknown session label: {session_label}")
+        
+    return rule.empty_policy_by_session.get(canonical_label, EmptyPayloadPolicy.EMPTY_INVALID)
 
 def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
     missing = []
