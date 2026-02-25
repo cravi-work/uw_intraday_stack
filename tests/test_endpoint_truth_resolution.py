@@ -107,7 +107,7 @@ def test_provider_error_envelope_classification():
     }
     
     res = MockResponse(True, error_payload, "error_hash")
-    assessment = classify_payload(res, "old_hash", "GET", "/api/stock/AAPL/option-chains", "REG")
+    assessment = classify_payload(res, "old_hash", "GET", "/api/stock/AAPL/option-chains", "RTH")
     
     assert assessment.payload_class == EndpointPayloadClass.ERROR
     assert assessment.error_reason == "PROVIDER_ERROR_ENVELOPE"

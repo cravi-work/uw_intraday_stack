@@ -71,19 +71,13 @@ def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayload
     if not rule:
         return EmptyPayloadPolicy.EMPTY_INVALID
         
-    legacy_map = {
-        "PRE": "PREMARKET",
-        "REG": "RTH",
-        "AFT": "AFTERHOURS"
-    }
+    allowed = ["PREMARKET", "RTH", "AFTERHOURS", "CLOSED"]
     
-    canonical_label = legacy_map.get(session_label, session_label)
-    
-    if canonical_label not in ["PREMARKET", "RTH", "AFTERHOURS", "CLOSED"]:
+    if session_label not in allowed:
         logger.error(f"Session contract violation: Unknown session label '{session_label}' provided to get_empty_policy.")
-        raise ValueError(f"Unknown session label: {session_label}")
+        raise ValueError(f"Unknown session label: {session_label}. Allowed: {', '.join(allowed)}")
         
-    return rule.empty_policy_by_session.get(canonical_label, EmptyPayloadPolicy.EMPTY_INVALID)
+    return rule.empty_policy_by_session.get(session_label, EmptyPayloadPolicy.EMPTY_INVALID)
 
 def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
     missing = []

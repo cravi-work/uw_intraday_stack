@@ -20,23 +20,16 @@ def test_canonical_session_labels():
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "RTH") == EmptyPayloadPolicy.EMPTY_INVALID
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "AFTERHOURS") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
 
-def test_legacy_session_mapping():
+def test_legacy_session_labels_explicit_failure(caplog):
     """
-    EVIDENCE: Legacy session map successfully bridges old keys to Canonical versions.
-    """
-    assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "REG") == EmptyPayloadPolicy.EMPTY_INVALID
-    assert get_empty_policy("GET", "/api/stock/{ticker}/flow-recent", "PRE") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
-
-def test_unknown_session_label_explicit_failure(caplog):
-    """
-    EVIDENCE: Proves that an invalid session label triggers explicit failure 
+    EVIDENCE: Proves that an invalid session label (including legacy tags) triggers explicit failure 
     behavior and logs the contract violation rather than defaulting silently.
     """
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(ValueError, match="Unknown session label: INVALID_SESSION"):
-            get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "INVALID_SESSION")
+        with pytest.raises(ValueError, match="Unknown session label: REG. Allowed: PREMARKET, RTH, AFTERHOURS, CLOSED"):
+            get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "REG")
             
-    assert "Session contract violation: Unknown session label 'INVALID_SESSION'" in caplog.text
+    assert "Session contract violation: Unknown session label 'REG'" in caplog.text
 
 def test_unregistered_endpoint_fallback():
     """

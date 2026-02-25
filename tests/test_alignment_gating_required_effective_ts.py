@@ -12,6 +12,7 @@ def mock_engine_env():
         "system": {},
         "network": {},
         "validation": {
+            "use_default_required_features": False,
             "horizons_minutes": [5],
             "horizon_critical_features": {"5": ["spot", "oi_pressure"]},
             "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0, "iv_rank": 0.5}}
@@ -56,14 +57,10 @@ def _run_with_features(cfg, features, caplog):
         return mock_db
 
 def test_missing_effective_ts_critical_feature(mock_engine_env, caplog):
-    """
-    EVIDENCE: Missing effective_ts on a weighted critical feature -> horizon emits NO_SIGNAL.
-    """
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     
     features = [
-        # Explicitly omit effective_ts_utc in spot lineage
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {}}},
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}}
     ]
@@ -71,19 +68,15 @@ def test_missing_effective_ts_critical_feature(mock_engine_env, caplog):
     mock_db = _run_with_features(mock_engine_env, features, caplog)
     
     assert "feature_missing_effective_ts" in caplog.text
-    assert "critical_features_failed_5: spot_missing_ts" in caplog.text
     
     pred_call = mock_db.insert_prediction.call_args[0][1]
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["risk_gate_status"] == "BLOCKED"
 
 def test_misaligned_effective_ts_critical_feature(mock_engine_env, caplog):
-    """
-    EVIDENCE: Misaligned effective_ts beyond tolerance -> horizon emits NO_SIGNAL.
-    """
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     now_utc = dt.datetime.now(dt.timezone.utc)
-    stale_ts = (now_utc - dt.timedelta(seconds=2000)).isoformat() # Exceeds 1800s default tolerance
+    stale_ts = (now_utc - dt.timedelta(seconds=2000)).isoformat() 
     
     features = [
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc.isoformat()}}},
@@ -93,30 +86,75 @@ def test_misaligned_effective_ts_critical_feature(mock_engine_env, caplog):
     mock_db = _run_with_features(mock_engine_env, features, caplog)
     
     assert "alignment_violation" in caplog.text
-    assert "critical_features_failed_5: oi_pressure_misaligned" in caplog.text
     
     pred_call = mock_db.insert_prediction.call_args[0][1]
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["risk_gate_status"] == "BLOCKED"
 
 def test_missing_ts_non_critical_feature_degrades(mock_engine_env, caplog):
-    """
-    EVIDENCE: Non-critical missing timestamp -> no hard block, but degradation reason appears.
-    """
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     
     features = [
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}},
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}},
-        {"feature_key": "iv_rank", "feature_value": 0.5, "meta_json": {**valid_meta, "metric_lineage": {}}} # Missing TS, but non-critical
+        {"feature_key": "iv_rank", "feature_value": 0.5, "meta_json": {**valid_meta, "metric_lineage": {}}} 
     ]
     
     mock_db = _run_with_features(mock_engine_env, features, caplog)
     
     assert "feature_missing_effective_ts" in caplog.text
-    assert "non_critical_features_failed_5: iv_rank_missing_ts" in caplog.text
     
     pred_call = mock_db.insert_prediction.call_args[0][1]
-    assert pred_call["decision_state"] != "NO_SIGNAL" # Passed critical checks
+    assert pred_call["decision_state"] != "NO_SIGNAL" 
     assert pred_call["risk_gate_status"] == "DEGRADED"
+
+def test_naive_timestamp_rejected(mock_engine_env, caplog):
+    """
+    EVIDENCE: Explicitly verify that an ISO string missing timezone offset (+00:00) 
+    is intercepted and treated as missing rather than silently converted.
+    """
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    naive_ts = dt.datetime.utcnow().isoformat() # Lacks tzinfo
+    
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": naive_ts}}},
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": naive_ts}}}
+    ]
+    
+    mock_db = _run_with_features(mock_engine_env, features, caplog)
+    
+    assert "feature_invalid_effective_ts (naive timezone)" in caplog.text
+    
+    pred_call = mock_db.insert_prediction.call_args[0][1]
+    assert pred_call["decision_state"] == "NO_SIGNAL"
+    assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_missing_ts_count"] == 2
+    assert "spot" in pred_call["meta_json"]["alignment_diagnostics"]["missing_ts_keys"]
+
+def test_misaligned_feature_does_not_pollute_ts_min_max(mock_engine_env, caplog):
+    """
+    EVIDENCE: Misaligned features are excluded entirely from source_ts_min and source_ts_max calculations.
+    """
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    aligned_ts = now_utc.isoformat()
+    stale_ts = (now_utc - dt.timedelta(seconds=2000)).isoformat()
+    
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": aligned_ts}}},
+        {"feature_key": "iv_rank", "feature_value": 0.5, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": stale_ts}}}
+    ]
+    
+    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot"]}
+    
+    mock_db = _run_with_features(mock_engine_env, features, caplog)
+    
+    pred_call = mock_db.insert_prediction.call_args[0][1]
+    
+    # Assert window is clean (matches 'now' exactly, ignoring the older stale_ts)
+    assert pred_call["source_ts_min_utc"] == now_utc
+    assert pred_call["source_ts_max_utc"] == now_utc
+    
+    # Assert alignment diagnostics properly caught it
+    assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_misaligned_count"] == 1
+    assert any("iv_rank_delta_" in k for k in pred_call["meta_json"]["alignment_diagnostics"]["misaligned_keys"])

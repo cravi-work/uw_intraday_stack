@@ -160,7 +160,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
     sess_str = hours.get_session_label(asof_et)
     
-    # Task 2: Ingestion Session Contract Enforcement
     canonical_labels = {
         SessionState.PREMARKET.value,
         SessionState.RTH.value,
@@ -179,7 +178,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                 "processing_mode": cfg.get("system", {}).get("mode", "live")
             }
         )
-        return  # Fail fast
+        return
         
     session_enum = SessionState(sess_str)
         
@@ -245,7 +244,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     
                     ev_key = (tkr, endpoint_id)
                     if ev_key in max_seen_ts and res.requested_at_utc < max_seen_ts[ev_key]:
-                        # CL-07 Out of Order Dropped Counter
                         logger.warning(
                             f"Out of order packet dropped from state mutation: {ev_key}", 
                             extra={"counter": "out_of_order_drops", "ticker": tkr, "endpoint_id": endpoint_id}
@@ -301,7 +299,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     if enforced_reason and NaReasonCode.STALE_TOO_OLD.value in enforced_reason:
                         enforced_freshness = FreshnessState.ERROR
-                        # CL-07 Stale Packet Counter
                         logger.warning(
                             f"Stale packet dropped (too old): {ev_key}", 
                             extra={"counter": "stale_packets_dropped", "ticker": tkr, "endpoint_id": endpoint_id}
@@ -322,7 +319,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     
                     valid_count = sum(1 for _, _, res, _, _, asmnt in evs if res.freshness_state == FreshnessState.FRESH or (res.freshness_state == FreshnessState.STALE_CARRY and res.used_event_id is not None) or (res.freshness_state == FreshnessState.EMPTY_VALID and asmnt.empty_policy.name == "EMPTY_IS_DATA"))
                     
-                    # Task 5: Endpoint Coverage vs Decision DQ
                     endpoint_coverage = (valid_count / len(evs)) if evs else 0.0
                     logger.info("Snapshot endpoint coverage", extra={"counter": "endpoint_coverage_ratio", "ratio": endpoint_coverage, "ticker": tkr})
 
@@ -414,7 +410,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             f_val = f.get("feature_value")
                             
                             if f_val is not None and not _is_valid_num(f_val):
-                                # CL-07 Malformed Guard Counter
                                 logger.warning(
                                     f"Malformed feature row (non-finite value): {f}", 
                                     extra={"counter": "malformed_rows_dropped"}
@@ -469,9 +464,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     db.insert_features(con, snapshot_id, valid_features)
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
-                    # Task 5: Capture pre-alignment value map and freshness for Decision-Relevant DQ
                     feature_value_map = {f["feature_key"]: f["feature_value"] for f in valid_features}
                     freshness_by_feature = {f["feature_key"]: f["meta_json"].get("freshness_state", "ERROR") for f in valid_features}
+                    stale_age_by_feature = {f["feature_key"]: f["meta_json"].get("stale_age_min") for f in valid_features}
                     
                     # --- DECISION WINDOW ASSEMBLER (Cross-Endpoint Time Alignment) ---
                     ts_list = []
@@ -484,17 +479,31 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         metric_lineage = meta.get("metric_lineage", {})
                         eff_ts_str = metric_lineage.get("effective_ts_utc")
                         
-                        # Task 4: Prevent predictive features from entering decision window if missing/misaligned
-                        if not eff_ts_str:
+                        if not isinstance(eff_ts_str, str) or not eff_ts_str:
                             logger.warning(
                                 f"feature_missing_effective_ts: {f['feature_key']}", 
                                 extra={"counter": "feature_missing_effective_ts", "feature_key": f['feature_key']}
                             )
                             missing_ts_features.append(f['feature_key'])
-                            continue # Dropped from aligned_features
+                            continue
 
-                        eff_ts = dt.datetime.fromisoformat(eff_ts_str)
-                        ts_list.append(eff_ts)
+                        try:
+                            eff_ts = dt.datetime.fromisoformat(eff_ts_str.replace('Z', '+00:00'))
+                            if eff_ts.tzinfo is None:
+                                logger.warning(
+                                    f"feature_invalid_effective_ts (naive timezone): {f['feature_key']}", 
+                                    extra={"counter": "feature_invalid_effective_ts", "feature_key": f['feature_key']}
+                                )
+                                missing_ts_features.append(f['feature_key'])
+                                continue
+                        except Exception:
+                            logger.warning(
+                                f"feature_invalid_effective_ts (malformed): {f['feature_key']}", 
+                                extra={"counter": "feature_invalid_effective_ts", "feature_key": f['feature_key']}
+                            )
+                            missing_ts_features.append(f['feature_key'])
+                            continue
+
                         delta_sec = abs((asof_utc - eff_ts).total_seconds())
                         if delta_sec > alignment_tolerance_sec:
                             logger.warning(
@@ -506,8 +515,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 }
                             )
                             alignment_violations.append(f"{f['feature_key']}_delta_{int(delta_sec)}s")
-                            continue # Dropped from aligned_features
+                            continue
                             
+                        ts_list.append(eff_ts)
                         aligned_features.append(f)
 
                     feat_dict = {f["feature_key"]: f["feature_value"] for f in aligned_features}
@@ -524,11 +534,15 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
 
                     if session_enum == SessionState.CLOSED:
                         base_gate = base_gate.block("session_closed", invalid=True)
+                        
+                    if not feat_dict and valid_features:
+                        base_gate = base_gate.block("all_features_excluded_by_alignment_or_ts", invalid=True)
 
                     horizon_weights_cfg = cfg.get("validation", {}).get("horizon_weights", {})
                     horizon_critical_cfg = cfg.get("validation", {}).get("horizon_critical_features", {})
+                    use_default_reqs = cfg.get("validation", {}).get("use_default_required_features", True)
+                    
                     default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
-
                     session_default_criticals = {
                         SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
                         SessionState.PREMARKET: ["spot", "dealer_vanna"],
@@ -537,12 +551,32 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     }.get(session_enum, ["spot"])
 
                     def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], float]:
-                        reqs = horizon_critical_cfg.get(h_str, session_default_criticals)
+                        old_dq_state = current_base_gate.data_quality_state
+                        
+                        base_reqs = horizon_critical_cfg.get(h_str, [])
                         weights = horizon_weights_cfg.get(h_str, default_weights)
                         
-                        # Task 5: Decision-Relevant DQ Formulation
+                        reqs = list(base_reqs)
+                        if use_default_reqs:
+                            reqs = list(set(reqs) | set(session_default_criticals))
+                        else:
+                            if not reqs:
+                                logger.info(f"No explicit critical features for horizon {h_str} and defaults disabled. Falling back to ['spot'].")
+                                reqs = ["spot"]
+                                
                         target_features = set(weights.keys()) | set(reqs)
-                        valid_target_count = 0
+                        
+                        logger.info(
+                            f"resolved_horizon_{h_str}_features",
+                            extra={
+                                "counter": "resolved_horizon_features",
+                                "horizon": h_str,
+                                "critical_features": sorted(list(reqs)),
+                                "target_features": sorted(list(target_features))
+                            }
+                        )
+                        
+                        valid_target_count = 0.0
                         dq_reasons = []
                         
                         for k in target_features:
@@ -554,10 +588,22 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 dq_reasons.append(f"{k}_missing_or_invalid")
                             else:
                                 f_state = freshness_by_feature.get(k, "ERROR")
-                                if f_state not in ("FRESH", "STALE_CARRY", "EMPTY_VALID"):
-                                    dq_reasons.append(f"{k}_bad_freshness_{f_state}")
+                                if f_state in ("FRESH", "EMPTY_VALID"):
+                                    valid_target_count += 1.0
+                                elif f_state == "STALE_CARRY":
+                                    age = stale_age_by_feature.get(k)
+                                    if age is not None:
+                                        invalid_mins = int(cfg.get("validation", {}).get("invalid_after_minutes", 60))
+                                        penalty_ratio = min(1.0, age / float(invalid_mins)) if invalid_mins > 0 else 1.0
+                                        credit = max(0.1, 1.0 - penalty_ratio)
+                                        valid_target_count += credit
+                                        dq_reasons.append(f"{k}_stale_carry_age_{int(age)}m")
+                                    else:
+                                        valid_target_count += 0.5
+                                        dq_reasons.append(f"{k}_stale_carry_fixed_penalty")
+                                        logger.warning(f"stale_age_missing_for_feature: {k}", extra={"counter": "stale_age_missing", "feature_key": k})
                                 else:
-                                    valid_target_count += 1
+                                    dq_reasons.append(f"{k}_bad_freshness_{f_state}")
                                     
                         decision_dq = valid_target_count / len(target_features) if target_features else 0.0
                         
@@ -580,7 +626,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                     "horizon": h_str
                                 }
                             )
-                            # Task 4 explicit reasons resolution
                             reasons = []
                             for mk in missing_criticals:
                                 if any(av.startswith(f"{mk}_delta_") for av in alignment_violations):
@@ -597,7 +642,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 )
                             h_gate = h_gate.block(f"critical_features_failed_{h_str}: {','.join(reasons)}", invalid=True, missing_features=missing_criticals)
                         elif missing_non_criticals and h_gate.risk_gate_status == RiskGateStatus.PASS:
-                            # Task 4 graceful degradation
                             reasons = []
                             for mk in missing_non_criticals:
                                 if any(av.startswith(f"{mk}_delta_") for av in alignment_violations):
@@ -609,10 +653,28 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 reasons.append(reason_str)
                             h_gate = h_gate.degrade(f"non_critical_features_failed_{h_str}: {','.join(reasons)}", partial=True)
                         
-                        # Apply new decision_dq degradation instead of the raw endpoint ratio
                         if decision_dq < 0.5 and h_gate.risk_gate_status == RiskGateStatus.PASS:
                             h_gate = h_gate.degrade(f"low_decision_dq_{decision_dq:.2f}", partial=True)
+                        elif decision_dq < 1.0 and h_gate.data_quality_state == DataQualityState.VALID:
+                            h_gate = replace(h_gate, data_quality_state=DataQualityState.PARTIAL, degraded_reasons=h_gate.degraded_reasons + (f"suboptimal_decision_dq_{decision_dq:.2f}",))
                             
+                        # Task 12: Ensure DEGRADED risk never allows VALID quality
+                        if h_gate.risk_gate_status == RiskGateStatus.DEGRADED and h_gate.data_quality_state == DataQualityState.VALID:
+                            h_gate = replace(h_gate, data_quality_state=DataQualityState.PARTIAL, degraded_reasons=h_gate.degraded_reasons + ("risk_degraded_implies_partial_quality",))
+                            
+                        # Task 12: Explicit log for gate-state transitions
+                        if h_gate.data_quality_state != old_dq_state:
+                            logger.info(
+                                f"gate_state_transition_horizon_{h_str}: {old_dq_state.value} -> {h_gate.data_quality_state.value}",
+                                extra={
+                                    "counter": "gate_state_transition",
+                                    "horizon": h_str,
+                                    "old_state": old_dq_state.value,
+                                    "new_state": h_gate.data_quality_state.value,
+                                    "risk_status": h_gate.risk_gate_status.value
+                                }
+                            )
+
                         return h_gate, weights, decision_dq
 
                     for h in cfg["validation"]["horizons_minutes"]:
@@ -620,12 +682,16 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         h_gate, weights, decision_dq = evaluate_horizon_gate(h_str, base_gate)
                         pred = bounded_additive_score(feat_dict, decision_dq, weights, gate=h_gate)
                         
-                        # CL-06 Deterministic Decision Window ID Generation
                         window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
                         
-                        # Save endpoint_coverage into meta_json explicitly while preserving decision_dq in confidence
                         pred_meta = pred.meta
                         pred_meta["endpoint_coverage"] = endpoint_coverage
+                        pred_meta["alignment_diagnostics"] = {
+                            "excluded_misaligned_count": len(alignment_violations),
+                            "excluded_missing_ts_count": len(missing_ts_features),
+                            "misaligned_keys": alignment_violations,
+                            "missing_ts_keys": missing_ts_features
+                        }
                         
                         db.insert_prediction(
                             con,
@@ -650,11 +716,16 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         h_gate, weights, decision_dq = evaluate_horizon_gate("to_close", base_gate)
                         pred = bounded_additive_score(feat_dict, decision_dq, weights, gate=h_gate)
                         
-                        # CL-06 Deterministic Decision Window ID Generation
                         window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
                         
                         pred_meta = pred.meta
                         pred_meta["endpoint_coverage"] = endpoint_coverage
+                        pred_meta["alignment_diagnostics"] = {
+                            "excluded_misaligned_count": len(alignment_violations),
+                            "excluded_missing_ts_count": len(missing_ts_features),
+                            "misaligned_keys": alignment_violations,
+                            "missing_ts_keys": missing_ts_features
+                        }
                         
                         db.insert_prediction(
                             con,
