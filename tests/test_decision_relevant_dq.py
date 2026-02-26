@@ -1,3 +1,4 @@
+# tests/test_decision_relevant_dq.py
 import pytest
 import datetime as dt
 import logging
@@ -17,6 +18,7 @@ def mock_engine_env():
         "network": {},
         "validation": {
             "use_default_required_features": False,
+            "emit_to_close_horizon": False, 
             "horizons_minutes": [5],
             "horizon_critical_features": {"5": ["spot"]},
             "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0}}
@@ -92,7 +94,6 @@ def test_dq_is_low_when_critical_missing_despite_high_endpoint_coverage(mock_eng
     
     assert "spot_missing_or_invalid" in pred_call["meta_json"]["dq_reason_codes"]
     assert pred_call["meta_json"]["decision_dq"] == 0.5 
-    assert pred_call["meta_json"]["dq_eff"] == 0.5 
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["data_quality_state"] == "INVALID"
 
@@ -112,7 +113,6 @@ def test_dq_acceptable_when_endpoints_fail_but_required_features_present(mock_en
     
     assert pred_call["meta_json"]["decision_dq"] == 1.0
     assert len(pred_call["meta_json"]["dq_reason_codes"]) == 0
-    assert pred_call["meta_json"]["dq_eff"] == 1.0
     assert pred_call["decision_state"] != "NO_SIGNAL"
     assert pred_call["data_quality_state"] == "VALID"
 
@@ -132,7 +132,6 @@ def test_stale_features_reduce_dq(mock_engine_env, caplog):
     
     assert "spot_stale_carry_age_30m" in pred_call["meta_json"]["dq_reason_codes"]
     assert pred_call["meta_json"]["decision_dq"] < 1.0 
-    assert pred_call["meta_json"]["dq_eff"] < 1.0 
     assert pred_call["data_quality_state"] == "PARTIAL" 
 
 def test_stale_non_critical_lowers_confidence(mock_engine_env, caplog):

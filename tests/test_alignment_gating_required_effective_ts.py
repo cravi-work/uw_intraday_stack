@@ -1,3 +1,4 @@
+# tests/test_alignment_gating_required_effective_ts.py
 import pytest
 import datetime as dt
 import logging
@@ -17,6 +18,7 @@ def mock_engine_env():
         "network": {},
         "validation": {
             "use_default_required_features": False,
+            "emit_to_close_horizon": True, # FIXED: Explicit Contract
             "horizons_minutes": [5],
             "horizon_critical_features": {"5": ["spot", "oi_pressure"]},
             "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0, "iv_rank": 0.5}}

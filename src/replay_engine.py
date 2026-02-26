@@ -1,3 +1,4 @@
+# src/replay_engine.py
 import duckdb
 import json
 import math
@@ -31,7 +32,7 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
     snapshots = con.execute(query, params).fetchall()
     
     for snap_id, asof_ts, dq, sess_str, sec_to_close in snapshots:
-        lineage_rows = con.execute("SELECT endpoint_id, used_event_id, freshness_state, data_age_seconds, na_reason, payload_class FROM snapshot_lineage WHERE snapshot_id = ?", [str(snap_id)]).fetchall()
+        lineage_rows = con.execute("SELECT endpoint_id, used_event_id, freshness_state, data_age_seconds, na_reason, payload_class, meta_json FROM snapshot_lineage WHERE snapshot_id = ?", [str(snap_id)]).fetchall()
         
         used_event_ids = [str(r[1]) for r in lineage_rows if r[1] is not None]
         payloads_dict = {}
@@ -44,7 +45,7 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
                     except json.JSONDecodeError as e: raise RuntimeError(f"JSON Parse Error for event {r_id}: {e}")
 
         effective_payloads, contexts = {}, {}
-        for eid, used_eid, f_state, age, na_reason, p_class in lineage_rows:
+        for eid, used_eid, f_state, age, na_reason, p_class, meta_json_val in lineage_rows:
             if used_eid:
                 p_val = payloads_dict.get(str(used_eid))
                 effective_payloads[eid] = p_val
@@ -52,6 +53,30 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
             else:
                 effective_payloads[eid] = None
                 
+            meta_dict = {}
+            if meta_json_val:
+                try:
+                    meta_dict = json.loads(meta_json_val) if isinstance(meta_json_val, str) else meta_json_val
+                except Exception:
+                    pass
+                    
+            details = meta_dict.get("details", {})
+            eff_ts_str = details.get("effective_ts_utc")
+            
+            eff_ts_utc = None
+            if eff_ts_str:
+                try:
+                    eff_ts_utc = datetime.fromisoformat(eff_ts_str.replace('Z', '+00:00'))
+                    if eff_ts_utc.tzinfo is None:
+                        eff_ts_utc = eff_ts_utc.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+            else:
+                # Task 3 Strict Constraint: If missing for older DB rows, mark invalid.
+                # Setting na_reason acts as an explicit diagnostic marker, while eff_ts_utc=None triggers correct engine blocking.
+                if f_state in ("FRESH", "STALE_CARRY", "EMPTY_VALID"):
+                    na_reason = "missing_effective_ts_lineage_meta"
+
             ep_info = con.execute("SELECT method, path, signature FROM dim_endpoints WHERE endpoint_id = ?", [eid]).fetchone()
             if ep_info:
                 if asof_ts.tzinfo is None: asof_ts = asof_ts.replace(tzinfo=timezone.utc)
@@ -62,7 +87,8 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
                     endpoint_id=eid, method=ep_info[0], path=ep_info[1], operation_id=None, signature=ep_info[2],
                     used_event_id=str(used_eid) if used_eid else None, payload_class=p_class, freshness_state=f_state,
                     stale_age_min=(age // 60) if age is not None else None, na_reason=na_reason,
-                    endpoint_asof_ts_utc=ep_asof, alignment_delta_sec=delta_sec
+                    endpoint_asof_ts_utc=ep_asof, alignment_delta_sec=delta_sec,
+                    effective_ts_utc=eff_ts_utc
                 )
                 
         f_rows, l_rows = feat.extract_all(effective_payloads, contexts)
@@ -90,15 +116,16 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
         )
 
         stored_preds = con.execute("SELECT horizon_kind, horizon_minutes, horizon_seconds, decision_state, risk_gate_status, prob_up, prob_down, prob_flat FROM predictions WHERE snapshot_id = ?", [str(snap_id)]).fetchall()
-        stored_pred_map = {(r[0], r[1]): r for r in stored_preds}
+        # Task 3 Verification Strictness: Compare explicitly across all three horizon identifiers (including TO_CLOSE seconds)
+        stored_pred_map = {(r[0], r[1], r[2]): r for r in stored_preds}
         
         if stored_preds:
             for rp in recomputed_preds:
-                sp_row = stored_pred_map.get((rp["horizon_kind"], rp["horizon_minutes"]))
+                sp_row = stored_pred_map.get((rp["horizon_kind"], rp["horizon_minutes"], rp["horizon_seconds"]))
                 if not sp_row:
                     continue # Ignore explicitly skipped to_close scenarios
                 
                 if sp_row[3] != rp["decision_state"] or sp_row[4] != rp["risk_gate_status"]:
-                    raise RuntimeError(f"PARITY MISMATCH: Snapshot {snap_id} Horizon {rp['horizon_kind']}_{rp['horizon_minutes']} Risk/Decision Governance altered. Stored: {sp_row[3]}/{sp_row[4]} | Recomputed: {rp['decision_state']}/{rp['risk_gate_status']}")
+                    raise RuntimeError(f"PARITY MISMATCH: Snapshot {snap_id} Horizon {rp['horizon_kind']}_{rp['horizon_minutes']}_{rp['horizon_seconds']} Risk/Decision Governance altered. Stored: {sp_row[3]}/{sp_row[4]} | Recomputed: {rp['decision_state']}/{rp['risk_gate_status']}")
 
     print("✅ Replay Parity Check Passed: Recomputed logic exactly matches stored features & decision governance across all horizons.")

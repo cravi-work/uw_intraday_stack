@@ -1,3 +1,4 @@
+# tests/test_ingest_session_contract.py
 import pytest
 import datetime as dt
 import logging
@@ -14,7 +15,12 @@ def test_valid_session_labels_pass(caplog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
@@ -49,7 +55,12 @@ def test_invalid_session_label_fails_fast(caplog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {"mode": "test_replay"},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \

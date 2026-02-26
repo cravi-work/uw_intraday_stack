@@ -1,3 +1,4 @@
+# tests/test_cl01_integration.py
 import pytest
 import datetime as dt
 from unittest.mock import MagicMock, patch
@@ -10,7 +11,12 @@ def test_ingestion_dry_run_reaches_feature_insertion():
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \

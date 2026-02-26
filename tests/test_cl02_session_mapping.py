@@ -1,3 +1,4 @@
+# tests/test_cl02_session_mapping.py
 import pytest
 import datetime as dt
 from unittest.mock import MagicMock, patch
@@ -42,7 +43,12 @@ def test_holiday_suppresses_forward_signals():
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
@@ -103,7 +109,12 @@ def test_deterministic_mapping_failure_counter(caplog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
     
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \

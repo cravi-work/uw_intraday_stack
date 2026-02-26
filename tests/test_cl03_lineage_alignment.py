@@ -1,3 +1,4 @@
+# tests/test_cl03_lineage_alignment.py
 import pytest
 import datetime as dt
 import uuid
@@ -81,7 +82,13 @@ def test_alignment_gating_counters_and_status(caplog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5], "alignment_tolerance_sec": 300}
+        "validation": {
+            "horizons_minutes": [5], 
+            "alignment_tolerance_sec": 300,
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
@@ -151,7 +158,13 @@ def test_aligned_fixture_produces_aligned_status():
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5], "alignment_tolerance_sec": 300}
+        "validation": {
+            "horizons_minutes": [5], 
+            "alignment_tolerance_sec": 300,
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \

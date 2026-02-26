@@ -1,3 +1,4 @@
+# tests/test_cl05_gating.py
 import pytest
 import datetime as dt
 import logging
@@ -49,7 +50,12 @@ def test_integration_premarket_missing_greeks(caplog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [5]}
+        "validation": {
+            "horizons_minutes": [5],
+            "use_default_required_features": True,
+            "emit_to_close_horizon": False,
+            "horizon_critical_features": {}
+        }
     }
 
     with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
@@ -127,6 +133,8 @@ def test_integration_horizon_aware_gating(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "use_default_required_features": False,
+            "emit_to_close_horizon": False,
             "horizons_minutes": [5, 10],
             "horizon_critical_features": {
                 "5": ["spot", "oi_pressure"],

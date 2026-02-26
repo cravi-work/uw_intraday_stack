@@ -1,3 +1,4 @@
+# src/config/config.yaml
 system:
   timezone: America/New_York
   base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
@@ -28,6 +29,12 @@ validation:
   - 60
   flat_threshold_pct: 0.001
   realized_snapshot_tolerance_minutes: 10
+  
+  # Task 4: Explicit Predictive Gating Contract
+  use_default_required_features: true
+  emit_to_close_horizon: true
+  horizon_critical_features: {}
+  
 network:
   timeout_seconds: 15
   max_retries: 3

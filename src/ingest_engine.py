@@ -1,3 +1,4 @@
+# src/ingest_engine.py
 from __future__ import annotations
 
 import asyncio
@@ -57,6 +58,16 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         raise KeyError("Missing ingestion.cadence_minutes")
     if "horizons_minutes" not in cfg["validation"]:
         raise KeyError("Missing validation.horizons_minutes")
+        
+    # Task 4: Explicit Contract Enforcement (Fail-Fast)
+    if "use_default_required_features" not in cfg["validation"]:
+        raise KeyError("Missing validation.use_default_required_features. This key explicitly controls whether the system falls back to session-based default critical features. Must be explicitly provided as true or false.")
+        
+    if "emit_to_close_horizon" not in cfg["validation"]:
+        raise KeyError("Missing validation.emit_to_close_horizon. This key explicitly controls whether the engine emits predictions for the time remaining to market close. Must be explicitly provided as true or false.")
+        
+    if "horizon_critical_features" not in cfg["validation"]:
+        raise KeyError("Missing validation.horizon_critical_features. This key maps specific horizons to their required critical features. Must be explicitly provided, even if intentionally empty (e.g., {}).")
 
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
     def _parse(l, market: bool = False) -> List[PlannedCall]:
@@ -147,11 +158,13 @@ def generate_predictions(
     stale_age_by_feature = {f["feature_key"]: f["meta_json"].get("stale_age_min") for f in valid_features}
     
     alignment_tolerance_sec = int(cfg.get("validation", {}).get("alignment_tolerance_sec", 1800))
+    cadence_sec = int(cfg.get("ingestion", {}).get("cadence_minutes", 5)) * 60
     
     ts_list = []
     alignment_violations = []
     missing_ts_features = []
     future_ts_features = []
+    normalized_future_ts_features = []
     aligned_features = []
     
     for f in valid_features:
@@ -187,16 +200,26 @@ def generate_predictions(
         delta_sec = (asof_utc - eff_ts).total_seconds()
         
         if delta_sec < 0:
-            logger.warning(
-                f"future_ts_violation: {f['feature_key']} is ahead of asof_utc by {int(abs(delta_sec))}s", 
-                extra={
-                    "counter": "future_ts_violation_count", 
-                    "feature_key": f['feature_key'], 
-                    "delta_sec": int(delta_sec)
-                }
-            )
-            future_ts_features.append(f['feature_key'])
-            continue
+            drift_sec = abs(delta_sec)
+            if drift_sec < cadence_sec:
+                logger.info(
+                    f"normalized_future_ts: {f['feature_key']} timestamp {eff_ts.isoformat()} clamped to {asof_utc.isoformat()}",
+                    extra={"counter": "normalized_future_ts_count", "feature_key": f['feature_key'], "drift_sec": int(drift_sec)}
+                )
+                eff_ts = asof_utc
+                delta_sec = 0.0
+                normalized_future_ts_features.append(f['feature_key'])
+            else:
+                logger.warning(
+                    f"future_ts_violation: {f['feature_key']} is ahead of asof_utc by {int(drift_sec)}s", 
+                    extra={
+                        "counter": "future_ts_violation_count", 
+                        "feature_key": f['feature_key'], 
+                        "delta_sec": int(delta_sec)
+                    }
+                )
+                future_ts_features.append(f['feature_key'])
+                continue
 
         if delta_sec > alignment_tolerance_sec:
             logger.warning(
@@ -232,8 +255,10 @@ def generate_predictions(
         base_gate = base_gate.block("all_features_excluded_by_alignment_or_ts", invalid=True)
 
     horizon_weights_cfg = cfg.get("validation", {}).get("horizon_weights", {})
-    horizon_critical_cfg = cfg.get("validation", {}).get("horizon_critical_features", {})
-    use_default_reqs = cfg.get("validation", {}).get("use_default_required_features", True)
+    
+    # Task 4: Strict dictionary access enforcing that the config validation already guaranteed presence.
+    horizon_critical_cfg = cfg["validation"]["horizon_critical_features"]
+    use_default_reqs = cfg["validation"]["use_default_required_features"]
     
     default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
     session_default_criticals = {
@@ -397,9 +422,11 @@ def generate_predictions(
             "excluded_misaligned_count": len(alignment_violations),
             "excluded_missing_ts_count": len(missing_ts_features),
             "excluded_future_ts_count": len(future_ts_features),
+            "normalized_future_ts_count": len(normalized_future_ts_features),
             "misaligned_keys": alignment_violations,
             "missing_ts_keys": missing_ts_features,
-            "future_ts_keys": future_ts_features
+            "future_ts_keys": future_ts_features,
+            "normalized_keys": normalized_future_ts_features
         }
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
@@ -421,7 +448,9 @@ def generate_predictions(
             "decision_window_id": window_id_fixed
         })
 
-    emit_to_close = cfg.get("validation", {}).get("emit_to_close_horizon", True)
+    # Task 4: Strict dictionary access enforcing that the config validation already guaranteed presence.
+    emit_to_close = cfg["validation"]["emit_to_close_horizon"]
+    
     if emit_to_close and sec_to_close is not None and sec_to_close > 0:
         h_gate, weights, decision_dq, horizon_contract, dq_reasons = evaluate_horizon_gate("to_close", base_gate)
         pred = bounded_additive_score(feat_dict, decision_dq, weights, gate=h_gate)
@@ -434,9 +463,11 @@ def generate_predictions(
             "excluded_misaligned_count": len(alignment_violations),
             "excluded_missing_ts_count": len(missing_ts_features),
             "excluded_future_ts_count": len(future_ts_features),
+            "normalized_future_ts_count": len(normalized_future_ts_features),
             "misaligned_keys": alignment_violations,
             "missing_ts_keys": missing_ts_features,
-            "future_ts_keys": future_ts_features
+            "future_ts_keys": future_ts_features,
+            "normalized_keys": normalized_future_ts_features
         }
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
@@ -616,7 +647,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     )
 
                     resolved = resolve_effective_payload(
-                        str(event_id), attempt_ts_utc, assessment, prev_state,
+                        str(event_id), asof_utc, assessment, prev_state,
                         fallback_max_age_seconds=fallback_max_age_seconds,
                         invalid_after_seconds=invalid_after_seconds
                     )
@@ -719,7 +750,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             freshness_state=f_state.name,
                             stale_age_min=ctx.stale_age_min,
                             na_reason=n_reason,
-                            details={}
+                            details={
+                                "effective_ts_utc": ctx.effective_ts_utc.isoformat() if ctx.effective_ts_utc else None,
+                                "endpoint_asof_ts_utc": ctx.endpoint_asof_ts_utc.isoformat() if ctx.endpoint_asof_ts_utc else None,
+                                "alignment_delta_sec": ctx.alignment_delta_sec
+                            }
                         )
 
                         db.insert_lineage(

@@ -1,3 +1,4 @@
+# tests/test_replay_parity.py
 import pytest
 import datetime as dt
 import tempfile
@@ -28,7 +29,6 @@ def test_no_hallucination_replay_defaults():
     assert spot_row["meta_json"]["na_reason"] == "missing_raw_payload_for_lineage"
 
 def test_replay_parity_matches_ingest(caplog):
-    # Ensure DuckDB initializes gracefully by passing an explicitly unallocated path
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as db_file:
         db_path = db_file.name
     os.remove(db_path)
@@ -44,6 +44,7 @@ def test_replay_parity_matches_ingest(caplog):
         "network": {},
         "validation": {
             "use_default_required_features": False,
+            "emit_to_close_horizon": False,
             "horizons_minutes": [5],
             "horizon_critical_features": {"5": ["spot", "oi_pressure"]},
             "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0}}
