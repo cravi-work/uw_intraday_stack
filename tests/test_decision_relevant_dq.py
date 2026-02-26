@@ -3,6 +3,8 @@ import pytest
 import datetime as dt
 import logging
 from unittest.mock import MagicMock, patch
+
+import src.ingest_engine as ie_mod
 from src.ingest_engine import IngestionEngine
 
 @pytest.fixture
@@ -27,13 +29,13 @@ def mock_engine_env():
     return cfg
 
 def _run_with_features(cfg, features, caplog, mock_fetch_len=10, mock_fetch_success=10):
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan") as mock_lep, \
-         patch("src.ingest_engine.load_api_catalog"), \
-         patch("src.ingest_engine.validate_plan_coverage"), \
-         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
-         patch("src.ingest_engine.FileLock"):
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan") as mock_lep, \
+         patch.object(ie_mod, "load_api_catalog"), \
+         patch.object(ie_mod, "validate_plan_coverage"), \
+         patch.object(ie_mod, "DbWriter") as mock_dbw_cls, \
+         patch.object(ie_mod, "FileLock"):
 
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
@@ -72,7 +74,7 @@ def _run_with_features(cfg, features, caplog, mock_fetch_len=10, mock_fetch_succ
 
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
-        with patch('src.ingest_engine.extract_all') as mock_extract:
+        with patch.object(ie_mod, 'extract_all') as mock_extract:
             mock_extract.return_value = (features, [])
             with caplog.at_level(logging.INFO):
                 engine.run_cycle()

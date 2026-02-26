@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
+import src.ingest_engine as ie_mod
 from src.endpoint_truth import (
     resolve_effective_payload, 
     PayloadAssessment, 
@@ -87,18 +88,19 @@ def test_alignment_gating_counters_and_status(caplog):
             "alignment_tolerance_sec": 300,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {}
+            "horizon_critical_features": {"5": ["spot", "net_gex_sign"]}  # STRICT CONTRACT
         }
     }
 
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan") as mock_lep, \
-         patch("src.ingest_engine.load_api_catalog") as mock_lac, \
-         patch("src.ingest_engine.validate_plan_coverage") as mock_vpc, \
-         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
-         patch("src.ingest_engine.FileLock") as mock_fl, \
-         patch("src.ingest_engine.extract_all") as mock_extract:
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan") as mock_lep, \
+         patch.object(ie_mod, "load_api_catalog") as mock_lac, \
+         patch.object(ie_mod, "validate_plan_coverage") as mock_vpc, \
+         patch.object(ie_mod, "DbWriter") as mock_dbw_cls, \
+         patch.object(ie_mod, "FileLock") as mock_fl, \
+         patch.object(ie_mod, "extract_all") as mock_extract, \
+         patch.object(ie_mod, "floor_to_interval") as mock_floor:
              
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
@@ -118,14 +120,18 @@ def test_alignment_gating_counters_and_status(caplog):
         mock_db.writer.return_value.__enter__.return_value = MagicMock()
         mock_db.get_payloads_by_event_ids.return_value = {}
         
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        stale_ts = now_utc - dt.timedelta(seconds=1000)
+        from src.scheduler import ET
+        fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+        mock_floor.return_value = fixed_asof.astimezone(ET)
+        
+        stale_ts = fixed_asof - dt.timedelta(seconds=1000)
+        f1_ts = fixed_asof - dt.timedelta(seconds=10)
         
         valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
         
         f1 = {
             "feature_key": "spot", "feature_value": 150.0, 
-            "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc.isoformat()}}
+            "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": f1_ts.isoformat()}}
         }
         f2 = {
             "feature_key": "net_gex_sign", "feature_value": 1.0, 
@@ -167,14 +173,15 @@ def test_aligned_fixture_produces_aligned_status():
         }
     }
 
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan") as mock_lep, \
-         patch("src.ingest_engine.load_api_catalog") as mock_lac, \
-         patch("src.ingest_engine.validate_plan_coverage") as mock_vpc, \
-         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
-         patch("src.ingest_engine.FileLock") as mock_fl, \
-         patch("src.ingest_engine.extract_all") as mock_extract:
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan") as mock_lep, \
+         patch.object(ie_mod, "load_api_catalog") as mock_lac, \
+         patch.object(ie_mod, "validate_plan_coverage") as mock_vpc, \
+         patch.object(ie_mod, "DbWriter") as mock_dbw_cls, \
+         patch.object(ie_mod, "FileLock") as mock_fl, \
+         patch.object(ie_mod, "extract_all") as mock_extract, \
+         patch.object(ie_mod, "floor_to_interval") as mock_floor:
              
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
@@ -194,9 +201,12 @@ def test_aligned_fixture_produces_aligned_status():
         mock_db.writer.return_value.__enter__.return_value = MagicMock()
         mock_db.get_payloads_by_event_ids.return_value = {}
         
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        aligned_ts_1 = now_utc - dt.timedelta(seconds=10)
-        aligned_ts_2 = now_utc - dt.timedelta(seconds=20)
+        from src.scheduler import ET
+        fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+        mock_floor.return_value = fixed_asof.astimezone(ET)
+        
+        aligned_ts_1 = fixed_asof - dt.timedelta(seconds=10)
+        aligned_ts_2 = fixed_asof - dt.timedelta(seconds=20)
         
         valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
         

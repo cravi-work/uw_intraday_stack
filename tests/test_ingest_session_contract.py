@@ -3,6 +3,8 @@ import pytest
 import datetime as dt
 import logging
 from unittest.mock import MagicMock, patch
+
+import src.ingest_engine as ie_mod
 from src.ingest_engine import IngestionEngine
 
 def test_valid_session_labels_pass(caplog):
@@ -23,13 +25,13 @@ def test_valid_session_labels_pass(caplog):
         }
     }
 
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan"), \
-         patch("src.ingest_engine.validate_plan_coverage"), \
-         patch("src.ingest_engine.load_api_catalog"), \
-         patch("src.ingest_engine.DbWriter"), \
-         patch("src.ingest_engine.FileLock"):
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan"), \
+         patch.object(ie_mod, "validate_plan_coverage"), \
+         patch.object(ie_mod, "load_api_catalog"), \
+         patch.object(ie_mod, "DbWriter"), \
+         patch.object(ie_mod, "FileLock"):
         
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
@@ -63,13 +65,13 @@ def test_invalid_session_label_fails_fast(caplog):
         }
     }
 
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan"), \
-         patch("src.ingest_engine.validate_plan_coverage"), \
-         patch("src.ingest_engine.load_api_catalog"), \
-         patch("src.ingest_engine.DbWriter") as mock_dbw_cls, \
-         patch("src.ingest_engine.FileLock"):
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan"), \
+         patch.object(ie_mod, "validate_plan_coverage"), \
+         patch.object(ie_mod, "load_api_catalog"), \
+         patch.object(ie_mod, "DbWriter") as mock_dbw_cls, \
+         patch.object(ie_mod, "FileLock"):
         
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
