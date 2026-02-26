@@ -312,7 +312,7 @@ def generate_predictions(
                 dq_reasons.append(f"{k}_future_ts")
             elif k in missing_ts_features:
                 dq_reasons.append(f"{k}_missing_ts")
-            elif k not in feature_value_map or not math.isfinite(feature_value_map[k]):
+            elif k not in feature_value_map or feature_value_map[k] is None or not math.isfinite(feature_value_map[k]):
                 dq_reasons.append(f"{k}_missing_or_invalid")
             else:
                 f_state = freshness_by_feature.get(k, "ERROR")
