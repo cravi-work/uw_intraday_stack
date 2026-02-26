@@ -7,7 +7,11 @@ from src.ingest_engine import IngestionEngine
 @pytest.fixture
 def mock_engine_env():
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -47,7 +51,7 @@ def _run_with_features(cfg, features, caplog):
         mock_db.writer.return_value.__enter__.return_value = MagicMock()
         mock_db.get_payloads_by_event_ids.return_value = {}
 
-        engine = IngestionEngine(cfg=cfg, catalog_path="dummy.yaml", config_path="dummy.yaml")
+        engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
         with patch('src.ingest_engine.extract_all') as mock_extract:
             mock_extract.return_value = (features, [])
@@ -58,28 +62,31 @@ def _run_with_features(cfg, features, caplog):
 
 def test_missing_effective_ts_critical_feature(mock_engine_env, caplog):
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
-    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    past_utc = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
     
     features = [
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {}}},
-        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}}
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}}
     ]
     
     mock_db = _run_with_features(mock_engine_env, features, caplog)
     
     assert "feature_missing_effective_ts" in caplog.text
     
-    pred_call = mock_db.insert_prediction.call_args[0][1]
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["risk_gate_status"] == "BLOCKED"
 
 def test_misaligned_effective_ts_critical_feature(mock_engine_env, caplog):
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     now_utc = dt.datetime.now(dt.timezone.utc)
+    past_utc = (now_utc - dt.timedelta(minutes=15)).isoformat()
     stale_ts = (now_utc - dt.timedelta(seconds=2000)).isoformat() 
     
     features = [
-        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc.isoformat()}}},
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}},
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": stale_ts}}}
     ]
     
@@ -87,17 +94,19 @@ def test_misaligned_effective_ts_critical_feature(mock_engine_env, caplog):
     
     assert "alignment_violation" in caplog.text
     
-    pred_call = mock_db.insert_prediction.call_args[0][1]
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["risk_gate_status"] == "BLOCKED"
 
 def test_missing_ts_non_critical_feature_degrades(mock_engine_env, caplog):
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
-    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    past_utc = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
     
     features = [
-        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}},
-        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": now_utc}}},
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}},
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}},
         {"feature_key": "iv_rank", "feature_value": 0.5, "meta_json": {**valid_meta, "metric_lineage": {}}} 
     ]
     
@@ -105,17 +114,15 @@ def test_missing_ts_non_critical_feature_degrades(mock_engine_env, caplog):
     
     assert "feature_missing_effective_ts" in caplog.text
     
-    pred_call = mock_db.insert_prediction.call_args[0][1]
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
     assert pred_call["decision_state"] != "NO_SIGNAL" 
     assert pred_call["risk_gate_status"] == "DEGRADED"
 
 def test_naive_timestamp_rejected(mock_engine_env, caplog):
-    """
-    EVIDENCE: Explicitly verify that an ISO string missing timezone offset (+00:00) 
-    is intercepted and treated as missing rather than silently converted.
-    """
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
-    naive_ts = dt.datetime.utcnow().isoformat() # Lacks tzinfo
+    naive_ts = (dt.datetime.utcnow() - dt.timedelta(minutes=15)).isoformat() # Lacks tzinfo
     
     features = [
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": naive_ts}}},
@@ -126,18 +133,18 @@ def test_naive_timestamp_rejected(mock_engine_env, caplog):
     
     assert "feature_invalid_effective_ts (naive timezone)" in caplog.text
     
-    pred_call = mock_db.insert_prediction.call_args[0][1]
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
     assert pred_call["decision_state"] == "NO_SIGNAL"
     assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_missing_ts_count"] == 2
     assert "spot" in pred_call["meta_json"]["alignment_diagnostics"]["missing_ts_keys"]
 
 def test_misaligned_feature_does_not_pollute_ts_min_max(mock_engine_env, caplog):
-    """
-    EVIDENCE: Misaligned features are excluded entirely from source_ts_min and source_ts_max calculations.
-    """
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     now_utc = dt.datetime.now(dt.timezone.utc)
-    aligned_ts = now_utc.isoformat()
+    aligned_ts_dt = now_utc - dt.timedelta(minutes=15)
+    aligned_ts = aligned_ts_dt.isoformat()
     stale_ts = (now_utc - dt.timedelta(seconds=2000)).isoformat()
     
     features = [
@@ -149,12 +156,96 @@ def test_misaligned_feature_does_not_pollute_ts_min_max(mock_engine_env, caplog)
     
     mock_db = _run_with_features(mock_engine_env, features, caplog)
     
-    pred_call = mock_db.insert_prediction.call_args[0][1]
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
     
-    # Assert window is clean (matches 'now' exactly, ignoring the older stale_ts)
-    assert pred_call["source_ts_min_utc"] == now_utc
-    assert pred_call["source_ts_max_utc"] == now_utc
+    assert pred_call["source_ts_min_utc"] == aligned_ts_dt
+    assert pred_call["source_ts_max_utc"] == aligned_ts_dt
     
-    # Assert alignment diagnostics properly caught it
     assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_misaligned_count"] == 1
     assert any("iv_rank_delta_" in k for k in pred_call["meta_json"]["alignment_diagnostics"]["misaligned_keys"])
+
+def test_future_timestamp_within_tolerance_rejected(mock_engine_env, caplog):
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    future_utc = (now_utc + dt.timedelta(minutes=5)).isoformat()
+    past_utc = (now_utc - dt.timedelta(minutes=15)).isoformat()
+    
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}},
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": future_utc}}}
+    ]
+    
+    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"]}
+    mock_engine_env["validation"]["use_default_required_features"] = False
+    
+    mock_db = _run_with_features(mock_engine_env, features, caplog)
+    
+    assert "future_ts_violation" in caplog.text
+    
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
+    assert pred_call["decision_state"] == "NO_SIGNAL"
+    assert pred_call["risk_gate_status"] == "BLOCKED"
+    assert "oi_pressure_future_ts" in pred_call["blocked_reasons"][0]
+    assert pred_call["alignment_status"] == "MISALIGNED"
+    assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_future_ts_count"] == 1
+    assert "oi_pressure" in pred_call["meta_json"]["alignment_diagnostics"]["future_ts_keys"]
+
+def test_exact_boundary_timestamp_accepted(mock_engine_env, caplog):
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    
+    from src.scheduler import ET
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    fixed_et = now_utc.astimezone(ET)
+    fixed_utc = now_utc
+    
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_utc.isoformat()}}},
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_utc.isoformat()}}}
+    ]
+    
+    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"]}
+    mock_engine_env["validation"]["use_default_required_features"] = False
+    
+    with patch("src.ingest_engine.floor_to_interval") as mock_floor:
+        mock_floor.return_value = fixed_et
+        mock_db = _run_with_features(mock_engine_env, features, caplog)
+        
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
+    assert pred_call["decision_state"] != "NO_SIGNAL"
+    assert pred_call["alignment_status"] == "ALIGNED"
+    assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_future_ts_count"] == 0
+
+def test_to_close_and_fixed_horizons_coexist(mock_engine_env, caplog):
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    from src.scheduler import ET
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    fixed_et = now_utc.astimezone(ET)
+    fixed_utc = now_utc
+    
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_utc.isoformat()}}},
+        {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_utc.isoformat()}}}
+    ]
+    
+    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"], "to_close": ["spot"]}
+    mock_engine_env["validation"]["use_default_required_features"] = False
+    mock_engine_env["validation"]["emit_to_close_horizon"] = True
+    
+    with patch("src.ingest_engine.floor_to_interval") as mock_floor:
+        mock_floor.return_value = fixed_et
+        mock_db = _run_with_features(mock_engine_env, features, caplog)
+        
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    assert len(calls) == 2
+    
+    fixed_pred = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    close_pred = next(c for c in calls if c["horizon_kind"] == "TO_CLOSE" and c["horizon_minutes"] == 0)
+    
+    assert fixed_pred["decision_state"] != "NO_SIGNAL"
+    assert close_pred["decision_state"] != "NO_SIGNAL"
+    assert close_pred["horizon_seconds"] == 3600

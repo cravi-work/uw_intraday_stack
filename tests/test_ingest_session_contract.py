@@ -5,11 +5,12 @@ from unittest.mock import MagicMock, patch
 from src.ingest_engine import IngestionEngine
 
 def test_valid_session_labels_pass(caplog):
-    """
-    EVIDENCE: Valid canonical labels allow the cycle to proceed (no fast-fail).
-    """
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -26,12 +27,12 @@ def test_valid_session_labels_pass(caplog):
         
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
-        mock_mh.ingest_start_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
-        mock_mh.ingest_end_et = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        mock_mh.ingest_start_et = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "RTH"
         mock_gmh.return_value = mock_mh
 
-        engine = IngestionEngine(cfg=cfg, catalog_path="dummy.yaml", config_path="dummy.yaml")
+        engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
         with caplog.at_level(logging.ERROR):
             engine.run_cycle()
@@ -39,12 +40,12 @@ def test_valid_session_labels_pass(caplog):
         assert "Session contract violation" not in caplog.text
 
 def test_invalid_session_label_fails_fast(caplog):
-    """
-    EVIDENCE: Invalid session label triggers contract violation counter,
-    logs explicit context, and fails cycle before any database/prediction writes.
-    """
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {"mode": "test_replay"},
         "network": {},
@@ -61,15 +62,15 @@ def test_invalid_session_label_fails_fast(caplog):
         
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
-        mock_mh.ingest_start_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
-        mock_mh.ingest_end_et = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        mock_mh.ingest_start_et = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "REG" # Invalid legacy label
         mock_gmh.return_value = mock_mh
 
         mock_db = MagicMock()
         mock_dbw_cls.return_value = mock_db
 
-        engine = IngestionEngine(cfg=cfg, catalog_path="dummy.yaml", config_path="dummy.yaml")
+        engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
         with caplog.at_level(logging.ERROR):
             engine.run_cycle()
@@ -82,6 +83,5 @@ def test_invalid_session_label_fails_fast(caplog):
         assert getattr(violation_record, "processing_mode") == "test_replay"
         assert "AAPL" in getattr(violation_record, "tickers")
 
-        # Verify hard fail (fetch and db write never called)
         mock_fetch.assert_not_called()
         mock_db.insert_prediction.assert_not_called()

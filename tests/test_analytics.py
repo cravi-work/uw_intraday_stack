@@ -1,7 +1,6 @@
 from src.analytics import build_gex_levels
 
 def test_gex_flip_no_placeholder_magnitude():
-    """Asserts the GEX_FLIP level outputs None for magnitude rather than a silent zero."""
     payload = [
         {"strike": 100, "gamma_exposure": -500},
         {"strike": 105, "gamma_exposure": -50},
@@ -10,22 +9,21 @@ def test_gex_flip_no_placeholder_magnitude():
     ]
     
     levels = build_gex_levels(payload)
-    assert len(levels) == 3 # NEG_MAX, POS_MAX, FLIP
+    assert len(levels) == 3 
     
     flip_level = next(l for l in levels if l[0] == "GEX_FLIP")
-    assert flip_level[1] == 105 # Price closest to zero
-    assert flip_level[2] is None # Strict NA magnitude requirement
+    assert round(flip_level[1], 4) == 105.7143 
+    assert flip_level[2] is None 
 
 def test_level_meta_contract_shape():
-    """Asserts details metadata outputs properly formatted input/parsed row counts."""
     payload = [{"strike": 100, "gamma_exposure": 500}]
     levels = build_gex_levels(payload)
     
-    assert len(levels) == 2 # POS_MAX, FLIP
-    pos_level = next(l for l in levels if l[0] == "GEX_POS_MAX")
+    assert len(levels) == 1 
+    pos_level = levels[0]
     
     details = pos_level[3]
     assert isinstance(details, dict)
     assert details["input_rows"] == 1
     assert details["parsed_rows"] == 1
-    assert "raw" not in details # Raw dump explicitly disallowed
+    assert "raw" not in details

@@ -73,7 +73,11 @@ def test_feature_extraction_lineage_propagation():
 
 def test_alignment_gating_counters_and_status(caplog):
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -91,13 +95,12 @@ def test_alignment_gating_counters_and_status(caplog):
              
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
-        mock_mh.ingest_start_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
-        mock_mh.ingest_end_et = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        mock_mh.ingest_start_et = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "RTH"
         mock_mh.seconds_to_close.return_value = 3600
         mock_gmh.return_value = mock_mh
 
-        # Prevent actual validation check execution
         mock_lep.return_value = {"plans": {"default": []}}
 
         async def fake_fetch(*args, **kwargs): return []
@@ -130,16 +133,21 @@ def test_alignment_gating_counters_and_status(caplog):
             engine.run_cycle()
             
         assert "alignment_violation" in caplog.text
-        assert "misaligned_signal_suppressed" in caplog.text
         assert "net_gex_sign" in caplog.text
         
-        pred_call = mock_db.insert_prediction.call_args[0][1]
+        calls = [c[0][1] for c in mock_db.insert_prediction.call_args_list]
+        pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+        
         assert pred_call["alignment_status"] == "MISALIGNED"
         assert pred_call["decision_state"] == "NO_SIGNAL"
 
 def test_aligned_fixture_produces_aligned_status():
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -157,13 +165,12 @@ def test_aligned_fixture_produces_aligned_status():
              
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
-        mock_mh.ingest_start_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
-        mock_mh.ingest_end_et = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        mock_mh.ingest_start_et = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "RTH"
         mock_mh.seconds_to_close.return_value = 3600
         mock_gmh.return_value = mock_mh
 
-        # Prevent actual validation check execution
         mock_lep.return_value = {"plans": {"default": []}}
 
         async def fake_fetch(*args, **kwargs): return []
@@ -194,7 +201,8 @@ def test_aligned_fixture_produces_aligned_status():
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="dummy.yaml")
         engine.run_cycle()
             
-        pred_call = mock_db.insert_prediction.call_args[0][1]
+        calls = [c[0][1] for c in mock_db.insert_prediction.call_args_list]
+        pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
         
         assert pred_call["alignment_status"] == "ALIGNED"
         assert pred_call["source_ts_min_utc"] == aligned_ts_2

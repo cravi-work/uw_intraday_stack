@@ -41,7 +41,11 @@ def test_integration_premarket_missing_greeks(caplog):
     from src.ingest_engine import IngestionEngine
 
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -93,9 +97,10 @@ def test_integration_premarket_missing_greeks(caplog):
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="dummy.yaml")
         
         with patch('src.ingest_engine.extract_all') as mock_extract:
+            past_utc = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
             valid_meta = {
                 "source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {},
-                "metric_lineage": {"effective_ts_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+                "metric_lineage": {"effective_ts_utc": past_utc}
             }
             
             mock_extract.return_value = (
@@ -106,15 +111,18 @@ def test_integration_premarket_missing_greeks(caplog):
             with caplog.at_level(logging.WARNING):
                 engine.run_cycle()
             
-            # Use string sub-match instead of full exact counter dict lookup
-            assert "critical_feature_missing" in caplog.text
+            assert "critical_feature_failed" in caplog.text
             assert "dealer_vanna" in caplog.text
 
 def test_integration_horizon_aware_gating(caplog):
     from src.ingest_engine import IngestionEngine
 
     cfg = {
-        "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False},
+        "ingestion": {
+            "watchlist": ["AAPL"], "cadence_minutes": 5, "enable_market_context": False,
+            "premarket_start_et": "04:00", "regular_start_et": "09:30", "regular_end_et": "16:00",
+            "afterhours_end_et": "20:00", "ingest_start_et": "04:00", "ingest_end_et": "20:00"
+        },
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
         "system": {},
         "network": {},
@@ -176,9 +184,10 @@ def test_integration_horizon_aware_gating(caplog):
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="dummy.yaml")
         
         with patch('src.ingest_engine.extract_all') as mock_extract:
+            past_utc = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
             valid_meta = {
                 "source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {},
-                "metric_lineage": {"effective_ts_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+                "metric_lineage": {"effective_ts_utc": past_utc}
             }
             
             mock_extract.return_value = (

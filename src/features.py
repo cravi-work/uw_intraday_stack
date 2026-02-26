@@ -93,7 +93,6 @@ def _build_meta(
     ts_source = "missing"
     ts_quality = "MISSING"
     
-    # Task 3: Predictive Feature Timestamp Lineage Hardening
     if details and "effective_ts_utc" in details:
         payload_ts = details.get("effective_ts_utc")
         if payload_ts in (None, "INVALID"):
@@ -115,7 +114,7 @@ def _build_meta(
         "fields_used": lineage.get("fields_used", []),
         "units_expected": lineage.get("units_expected", "unknown"),
         "normalization": lineage.get("normalization", "none"),
-        "session_applicability": lineage.get("session_applicability", "PRE/RTH/AFT"),
+        "session_applicability": lineage.get("session_applicability", "PREMARKET/RTH/AFTERHOURS"),
         "quality_policy": lineage.get("quality_policy", "None on missing"),
         "criticality": lineage.get("criticality", "NON_CRITICAL"),
         "effective_ts_utc": eff_ts,
@@ -156,7 +155,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         "fields_used": ["close", "t"],
         "units_expected": "USD",
         "normalization": "none",
-        "session_applicability": "PRE/RTH/AFT",
+        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None if missing required explicit keys",
         "criticality": "CRITICAL"
     }
@@ -191,7 +190,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
         "session_applicability": "RTH",
         "quality_policy": "None on filtered zeros to avoid false baseline certainty",
-        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
+        "criticality": "CRITICAL"
     }
     
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
@@ -272,9 +271,9 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date"],
         "units_expected": "Notional Exposure (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
-        "session_applicability": "PRE/RTH",
+        "session_applicability": "PREMARKET/RTH",
         "quality_policy": "None on missing",
-        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
+        "criticality": "CRITICAL"
     }
     
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
@@ -303,7 +302,7 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         "fields_used": ["gamma_exposure"],
         "units_expected": "Sign (+1.0, 0.0, -1.0)",
         "normalization": "Directional sign clamping",
-        "session_applicability": "PRE/RTH",
+        "session_applicability": "PREMARKET/RTH",
         "quality_policy": "None on missing exposure fields",
         "criticality": "CRITICAL"
     }
@@ -342,7 +341,7 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "normalization": "none",
         "session_applicability": "RTH",
         "quality_policy": "None on missing",
-        "criticality": "CRITICAL" # CL-05 Formal Gating Policy Alignment
+        "criticality": "CRITICAL"
     }
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
@@ -365,7 +364,7 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
         "fields_used": ["iv_rank", "iv_percentile"],
         "units_expected": "Percentile [0,1]",
         "normalization": "none",
-        "session_applicability": "PRE/RTH/AFT",
+        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
     }
@@ -388,7 +387,7 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
         "fields_used": ["dte", "days", "iv", "implied_volatility"],
         "units_expected": "IV Spread",
         "normalization": "none",
-        "session_applicability": "PRE/RTH/AFT",
+        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
     }
@@ -420,7 +419,7 @@ def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "fields_used": ["skew", "risk_reversal", "value"],
         "units_expected": "Skew Ratio",
         "normalization": "none",
-        "session_applicability": "PRE/RTH/AFT",
+        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
     }
@@ -448,7 +447,7 @@ def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBund
         "fields_used": ["volume", "price", "size"],
         "units_expected": "Total Notional USD",
         "normalization": "none",
-        "session_applicability": "PRE/RTH/AFT",
+        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
     }

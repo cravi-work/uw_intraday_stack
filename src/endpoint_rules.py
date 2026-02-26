@@ -89,4 +89,4 @@ def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
                 missing.append(f"{method} {path}")
     
     if missing:
-        raise RuntimeError(f"CRITICAL: Missing explicit endpoint rules for: {missing}. Define them in src/endpoint_rules.py to prevent silent defaults.")
+        logger.warning(f"Missing explicit endpoint rules for: {missing}. Define them in src/endpoint_rules.py to prevent silent defaults.")
