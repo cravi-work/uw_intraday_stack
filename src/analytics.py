@@ -1,3 +1,4 @@
+# src/analytics.py
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -182,4 +183,5 @@ def build_darkpool_levels(payload: Any) -> List[Tuple[str, Optional[float], Opti
         "input_rows": len(rows), "parsed_nodes": len(agg)
     })]
 
-logger.info("Analytics module initialized successfully", extra={"event": "module_init", "module": "analytics"})
+# Fixed: Changed "module" to "module_name" to prevent LogRecord KeyErrors
+logger.info("Analytics module initialized successfully", extra={"event": "module_init", "module_name": "analytics"})

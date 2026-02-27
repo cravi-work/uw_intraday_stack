@@ -1,3 +1,4 @@
+# src/storage.py
 from __future__ import annotations
 import contextlib
 import hashlib
@@ -113,19 +114,21 @@ class DbWriter:
         _add("predictions", "outcome_price", "DOUBLE")
         _add("predictions", "is_correct", "BOOLEAN")
         _add("predictions", "meta_json", "JSON")
-        _add("predictions", "decision_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
-        _add("predictions", "risk_gate_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
-        _add("predictions", "data_quality_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
-        _add("predictions", "confidence_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        
+        # Fixed: Removed NOT NULL constraints for ALTER TABLE migrations
+        _add("predictions", "decision_state", "TEXT DEFAULT 'UNKNOWN'")
+        _add("predictions", "risk_gate_status", "TEXT DEFAULT 'UNKNOWN'")
+        _add("predictions", "data_quality_state", "TEXT DEFAULT 'UNKNOWN'")
+        _add("predictions", "confidence_state", "TEXT DEFAULT 'UNKNOWN'")
         _add("predictions", "blocked_reasons_json", "JSON")
         _add("predictions", "degraded_reasons_json", "JSON")
-        _add("predictions", "validation_eligible", "BOOLEAN NOT NULL DEFAULT TRUE")
+        _add("predictions", "validation_eligible", "BOOLEAN DEFAULT TRUE")
         _add("predictions", "gate_json", "JSON")
-        _add("predictions", "alignment_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "alignment_status", "TEXT DEFAULT 'UNKNOWN'")
         _add("predictions", "source_ts_min_utc", "TIMESTAMP NULL")
         _add("predictions", "source_ts_max_utc", "TIMESTAMP NULL")
-        _add("predictions", "critical_missing_count", "INTEGER NOT NULL DEFAULT 0")
-        _add("predictions", "decision_window_id", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _add("predictions", "critical_missing_count", "INTEGER DEFAULT 0")
+        _add("predictions", "decision_window_id", "TEXT DEFAULT 'UNKNOWN'")
         
         _add("endpoint_state", "last_change_ts_utc", "TIMESTAMP")
         _add("endpoint_state", "last_change_event_id", "UUID")
@@ -346,7 +349,6 @@ class DbWriter:
     def ro_connect(self) -> duckdb.DuckDBPyConnection: 
         return duckdb.connect(self.duckdb_path, read_only=True)
 
-    # CL-06: Deterministic Replay Checksum
     def get_validation_checksum(self, con: duckdb.DuckDBPyConnection) -> str:
         rows = con.execute("""
             SELECT prediction_id, brier_score, log_loss, is_correct 
@@ -358,7 +360,6 @@ class DbWriter:
         state_str = json.dumps(rows, sort_keys=True)
         return hashlib.sha256(state_str.encode()).hexdigest()
 
-    # CL-07 Replay Diagnostics Summary
     def get_pipeline_diagnostics(self, con: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
         preds = con.execute("SELECT risk_gate_status, COUNT(*) FROM predictions GROUP BY risk_gate_status").fetchall()
         lineage = con.execute("SELECT freshness_state, COUNT(*) FROM snapshot_lineage GROUP BY freshness_state").fetchall()

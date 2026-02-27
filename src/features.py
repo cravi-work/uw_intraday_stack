@@ -1,3 +1,4 @@
+# src/features.py
 from __future__ import annotations
 import copy
 import datetime
@@ -662,4 +663,5 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
 
     return f_rows, l_rows
 
-logger.info("Features module initialized successfully", extra={"event": "module_init", "module": "features"})
+# Fixed: Changed "module" to "module_name" to prevent LogRecord KeyErrors
+logger.info("Features module initialized successfully", extra={"event": "module_init", "module_name": "features"})
