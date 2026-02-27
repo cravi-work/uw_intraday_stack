@@ -1,4 +1,3 @@
-# src/replay_engine.py
 import duckdb
 import json
 import math
@@ -13,9 +12,9 @@ from datetime import datetime, timezone
 
 def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None):
     """
-    Task E: Centralized Parity Engine.
-    Uses the exact same generate_predictions gating logic as live ingestion 
-    to guarantee replay results are mathematically identical to production outputs.
+    Task E & Ticket 3: Centralized Parity Engine.
+    Uses the exact same generate_predictions gating logic as live ingestion.
+    Strictly forbids guessing missing lineage.
     """
     if cfg is None:
         cfg = load_yaml("src/config/config.yaml").raw
@@ -61,39 +60,57 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
                     pass
                     
             details = meta_dict.get("details", {})
+            
+            # Ticket 3 Strict Constraint: Hard-validate all explicitly requested lineage fields
+            missing_field = None
+            if f_state in ("FRESH", "STALE_CARRY", "EMPTY_VALID"):
+                if "effective_ts_utc" not in details: missing_field = "effective_ts_utc"
+                elif "endpoint_asof_ts_utc" not in details: missing_field = "endpoint_asof_ts_utc"
+                elif "truth_status" not in details: missing_field = "truth_status"
+                elif f_state == "STALE_CARRY" and "stale_age_seconds" not in details: missing_field = "stale_age_seconds"
+
             eff_ts_str = details.get("effective_ts_utc")
+            ep_asof_str = details.get("endpoint_asof_ts_utc")
             
             eff_ts_utc = None
-            if eff_ts_str:
-                try:
-                    eff_ts_utc = datetime.fromisoformat(eff_ts_str.replace('Z', '+00:00'))
-                    if eff_ts_utc.tzinfo is None:
-                        eff_ts_utc = eff_ts_utc.replace(tzinfo=timezone.utc)
-                except Exception:
-                    pass
+            ep_asof_utc = asof_ts
+            
+            if missing_field:
+                # If lineage is unrecoverable, we explicitly flag the reason 
+                # and strip the timestamps to guarantee the downstream engine blocks it exactly like real-time failures.
+                na_reason = f"replay_missing_lineage_field:{missing_field}"
+                f_state = "ERROR"
             else:
-                # Task 3 Strict Constraint: If missing for older DB rows, mark invalid.
-                # Setting na_reason acts as an explicit diagnostic marker, while eff_ts_utc=None triggers correct engine blocking.
-                if f_state in ("FRESH", "STALE_CARRY", "EMPTY_VALID"):
-                    na_reason = "missing_effective_ts_lineage_meta"
+                if eff_ts_str:
+                    try:
+                        eff_ts_utc = datetime.fromisoformat(eff_ts_str.replace('Z', '+00:00'))
+                        if eff_ts_utc.tzinfo is None:
+                            eff_ts_utc = eff_ts_utc.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                if ep_asof_str:
+                    try:
+                        ep_asof_utc = datetime.fromisoformat(ep_asof_str.replace('Z', '+00:00'))
+                        if ep_asof_utc.tzinfo is None:
+                            ep_asof_utc = ep_asof_utc.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
 
             ep_info = con.execute("SELECT method, path, signature FROM dim_endpoints WHERE endpoint_id = ?", [eid]).fetchone()
             if ep_info:
                 if asof_ts.tzinfo is None: asof_ts = asof_ts.replace(tzinfo=timezone.utc)
-                delta_sec = age if age is not None else 0
-                ep_asof = asof_ts - __import__('datetime').timedelta(seconds=delta_sec)
+                delta_sec = details.get("alignment_delta_sec", age if age is not None else 0)
 
                 contexts[eid] = EndpointContext(
                     endpoint_id=eid, method=ep_info[0], path=ep_info[1], operation_id=None, signature=ep_info[2],
                     used_event_id=str(used_eid) if used_eid else None, payload_class=p_class, freshness_state=f_state,
                     stale_age_min=(age // 60) if age is not None else None, na_reason=na_reason,
-                    endpoint_asof_ts_utc=ep_asof, alignment_delta_sec=delta_sec,
+                    endpoint_asof_ts_utc=ep_asof_utc, alignment_delta_sec=delta_sec,
                     effective_ts_utc=eff_ts_utc
                 )
                 
         f_rows, l_rows = feat.extract_all(effective_payloads, contexts)
         
-        # Apply the exact same _is_valid_num filter as production
         valid_features = []
         for f in f_rows:
             if isinstance(f, dict) and "feature_key" in f and "meta_json" in f:
@@ -104,7 +121,6 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
         
         session_enum = SessionState(sess_str)
         
-        # Execute identical gating + DQ contract
         recomputed_preds = generate_predictions(
             cfg=cfg,
             snapshot_id=snap_id,
@@ -116,16 +132,18 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
         )
 
         stored_preds = con.execute("SELECT horizon_kind, horizon_minutes, horizon_seconds, decision_state, risk_gate_status, prob_up, prob_down, prob_flat FROM predictions WHERE snapshot_id = ?", [str(snap_id)]).fetchall()
-        # Task 3 Verification Strictness: Compare explicitly across all three horizon identifiers (including TO_CLOSE seconds)
-        stored_pred_map = {(r[0], r[1], r[2]): r for r in stored_preds}
         
+        stored_pred_map = {(r[0], r[1], r[2]): r for r in stored_preds}
+        recomputed_pred_map = {(rp["horizon_kind"], rp["horizon_minutes"], rp["horizon_seconds"]): rp for rp in recomputed_preds}
+        
+        # Ticket 3: Parity comparison must not silently skip
         if stored_preds:
-            for rp in recomputed_preds:
-                sp_row = stored_pred_map.get((rp["horizon_kind"], rp["horizon_minutes"], rp["horizon_seconds"]))
-                if not sp_row:
-                    continue # Ignore explicitly skipped to_close scenarios
+            for sp_key, sp_row in stored_pred_map.items():
+                if sp_key not in recomputed_pred_map:
+                    raise RuntimeError(f"PARITY MISMATCH: Snapshot {snap_id} Horizon {sp_key} exists in stored but replay could not compute it.")
                 
+                rp = recomputed_pred_map[sp_key]
                 if sp_row[3] != rp["decision_state"] or sp_row[4] != rp["risk_gate_status"]:
-                    raise RuntimeError(f"PARITY MISMATCH: Snapshot {snap_id} Horizon {rp['horizon_kind']}_{rp['horizon_minutes']}_{rp['horizon_seconds']} Risk/Decision Governance altered. Stored: {sp_row[3]}/{sp_row[4]} | Recomputed: {rp['decision_state']}/{rp['risk_gate_status']}")
+                    raise RuntimeError(f"PARITY MISMATCH: Snapshot {snap_id} Horizon {sp_key} Risk/Decision Governance altered. Stored: {sp_row[3]}/{sp_row[4]} | Recomputed: {rp['decision_state']}/{rp['risk_gate_status']}")
 
     print("✅ Replay Parity Check Passed: Recomputed logic exactly matches stored features & decision governance across all horizons.")

@@ -18,10 +18,13 @@ def test_valid_session_labels_pass(caplog):
         "system": {},
         "network": {},
         "validation": {
-            "horizons_minutes": [5],
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {}
+            "horizon_weights_source": "explicit",
+            "horizons_minutes": [5],
+            "horizon_critical_features": {"5": []},
+            "horizon_weights": {"5": {"spot": 1.0}}
         }
     }
 
@@ -39,6 +42,9 @@ def test_valid_session_labels_pass(caplog):
         mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "RTH"
         mock_gmh.return_value = mock_mh
+
+        async def fake_fetch(*args, **kwargs): return []
+        mock_fetch.side_effect = fake_fetch
 
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
@@ -58,10 +64,13 @@ def test_invalid_session_label_fails_fast(caplog):
         "system": {"mode": "test_replay"},
         "network": {},
         "validation": {
-            "horizons_minutes": [5],
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {}
+            "horizon_weights_source": "explicit",
+            "horizons_minutes": [5],
+            "horizon_critical_features": {"5": []},
+            "horizon_weights": {"5": {"spot": 1.0}}
         }
     }
 

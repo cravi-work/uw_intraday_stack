@@ -84,11 +84,13 @@ def test_alignment_gating_counters_and_status(caplog):
         "system": {},
         "network": {},
         "validation": {
-            "horizons_minutes": [5], 
             "alignment_tolerance_sec": 300,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {"5": ["spot", "net_gex_sign"]}  # STRICT CONTRACT
+            "horizon_weights_source": "explicit",
+            "horizons_minutes": [5],
+            "horizon_critical_features": {"5": ["spot", "net_gex_sign"]},
+            "horizon_weights": {"5": {"spot": 1.0, "net_gex_sign": 0.5}}
         }
     }
 
@@ -165,11 +167,13 @@ def test_aligned_fixture_produces_aligned_status():
         "system": {},
         "network": {},
         "validation": {
-            "horizons_minutes": [5], 
             "alignment_tolerance_sec": 300,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {}
+            "horizon_weights_source": "explicit",
+            "horizons_minutes": [5],
+            "horizon_critical_features": {"5": ["spot"]},
+            "horizon_weights": {"5": {"spot": 1.0, "net_gex_sign": 0.5}}
         }
     }
 

@@ -5,6 +5,8 @@ import tempfile
 import os
 import logging
 from unittest.mock import MagicMock, patch
+
+import src.ingest_engine as ie_mod
 from src.features import extract_all
 from src.endpoint_truth import EndpointContext
 from src.ingest_engine import IngestionEngine
@@ -43,8 +45,10 @@ def test_replay_parity_matches_ingest(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
+            "horizon_weights_source": "explicit",
             "horizons_minutes": [5],
             "horizon_critical_features": {"5": ["spot", "oi_pressure"]},
             "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0}}
@@ -62,29 +66,38 @@ def test_replay_parity_matches_ingest(caplog):
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": future_utc}}}
     ]
     
-    with patch("src.ingest_engine.get_market_hours") as mock_gmh, \
-         patch("src.ingest_engine.fetch_all") as mock_fetch, \
-         patch("src.ingest_engine.load_endpoint_plan") as mock_lep, \
-         patch("src.ingest_engine.load_api_catalog"), \
-         patch("src.ingest_engine.validate_plan_coverage"), \
-         patch("src.ingest_engine.FileLock"):
+    with patch.object(ie_mod, "get_market_hours") as mock_gmh, \
+         patch.object(ie_mod, "fetch_all") as mock_fetch, \
+         patch.object(ie_mod, "load_endpoint_plan") as mock_lep, \
+         patch.object(ie_mod, "load_api_catalog") as mock_lac, \
+         patch.object(ie_mod, "validate_plan_coverage") as mock_vpc, \
+         patch.object(ie_mod, "FileLock"):
 
+        # Strict primitive types required for DuckDB insertion to succeed
         mock_mh = MagicMock()
         mock_mh.is_trading_day = True
+        mock_mh.is_early_close = False
         mock_mh.ingest_start_et = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
         mock_mh.ingest_end_et = dt.datetime(2100, 1, 1, tzinfo=dt.timezone.utc)
+        mock_mh.market_close_et = dt.datetime(2026, 1, 1, 16, 0, tzinfo=dt.timezone.utc)
+        mock_mh.post_end_et = dt.datetime(2026, 1, 1, 20, 0, tzinfo=dt.timezone.utc)
         mock_mh.get_session_label.return_value = "RTH"
         mock_mh.seconds_to_close.return_value = 3600
         mock_gmh.return_value = mock_mh
 
         mock_lep.return_value = {"plans": {"default": []}}
 
+        # String type required for DB catalog hash column
+        mock_registry = MagicMock()
+        mock_registry.catalog_hash = "mock_hash_123"
+        mock_lac.return_value = mock_registry
+
         async def fake_fetch(*args, **kwargs): return []
         mock_fetch.side_effect = fake_fetch
 
         engine = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml", config_path="src/config/config.yaml")
         
-        with patch('src.ingest_engine.extract_all') as mock_extract:
+        with patch.object(ie_mod, 'extract_all') as mock_extract:
             mock_extract.return_value = (features, [])
             with caplog.at_level(logging.WARNING):
                 engine.run_cycle()

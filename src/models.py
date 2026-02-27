@@ -224,3 +224,19 @@ def bounded_additive_score(
         meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys},
         gate=gate
     )
+
+# Ticket 2: The authoritative allowlist to strictly prevent config drift
+KNOWN_FEATURE_KEYS = frozenset({
+    "spot",
+    "smart_whale_pressure",
+    "dealer_vanna",
+    "dealer_charm",
+    "net_gex_sign",
+    "net_gamma_exposure_notional",
+    "oi_pressure",
+    "darkpool_pressure",
+    "litflow_pressure",
+    "vol_term_slope",
+    "vol_skew",
+    "iv_rank"
+})

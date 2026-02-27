@@ -20,11 +20,13 @@ def mock_engine_env():
         "system": {},
         "network": {},
         "validation": {
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": True,
+            "horizon_weights_source": "explicit",
             "horizons_minutes": [5],
-            "horizon_critical_features": {"5": ["spot", "oi_pressure"]},
-            "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0, "iv_rank": 0.5}}
+            "horizon_critical_features": {"5": ["spot", "oi_pressure"], "to_close": ["spot", "oi_pressure"]},
+            "horizon_weights": {"5": {"spot": 1.0, "oi_pressure": 1.0, "iv_rank": 0.5}, "to_close": {"spot": 1.0, "oi_pressure": 1.0}}
         }
     }
     return cfg
@@ -166,7 +168,8 @@ def test_misaligned_feature_does_not_pollute_ts_min_max(mock_engine_env, caplog)
         {"feature_key": "iv_rank", "feature_value": 0.5, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": stale_ts}}}
     ]
     
-    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot"]}
+    mock_engine_env["validation"]["horizon_critical_features"]["5"] = ["spot"]
+    mock_engine_env["validation"]["horizon_weights"]["5"] = {"spot": 1.0, "iv_rank": 0.5}
     
     mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
     
@@ -183,7 +186,6 @@ def test_future_timestamp_within_tolerance_rejected(mock_engine_env, caplog):
     fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
     valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
     
-    # Ahead of window boundaries completely
     future_utc = (fixed_asof + dt.timedelta(minutes=10)).isoformat()
     past_utc = (fixed_asof - dt.timedelta(minutes=15)).isoformat()
     
@@ -191,9 +193,6 @@ def test_future_timestamp_within_tolerance_rejected(mock_engine_env, caplog):
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": past_utc}}},
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": future_utc}}}
     ]
-    
-    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"]}
-    mock_engine_env["validation"]["use_default_required_features"] = False
     
     mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
     
@@ -218,9 +217,6 @@ def test_exact_boundary_timestamp_accepted(mock_engine_env, caplog):
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_asof.isoformat()}}}
     ]
     
-    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"]}
-    mock_engine_env["validation"]["use_default_required_features"] = False
-    
     mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
         
     calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
@@ -238,10 +234,6 @@ def test_to_close_and_fixed_horizons_coexist(mock_engine_env, caplog):
         {"feature_key": "spot", "feature_value": 150.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_asof.isoformat()}}},
         {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": {**valid_meta, "metric_lineage": {"effective_ts_utc": fixed_asof.isoformat()}}}
     ]
-    
-    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot", "oi_pressure"], "to_close": ["spot"]}
-    mock_engine_env["validation"]["use_default_required_features"] = False
-    mock_engine_env["validation"]["emit_to_close_horizon"] = True
     
     mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
         

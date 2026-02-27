@@ -51,10 +51,13 @@ def test_integration_premarket_missing_greeks(caplog):
         "system": {},
         "network": {},
         "validation": {
-            "horizons_minutes": [5],
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": True,
             "emit_to_close_horizon": False,
-            "horizon_critical_features": {}
+            "horizon_weights_source": "explicit",
+            "horizons_minutes": [5],
+            "horizon_critical_features": {"5": []},
+            "horizon_weights": {"5": {"spot": 1.0}}
         }
     }
 
@@ -133,8 +136,10 @@ def test_integration_horizon_aware_gating(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
+            "horizon_weights_source": "explicit",
             "horizons_minutes": [5, 10],
             "horizon_critical_features": {
                 "5": ["spot", "oi_pressure"],

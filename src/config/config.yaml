@@ -1,4 +1,3 @@
-# src/config/config.yaml
 system:
   timezone: America/New_York
   base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
@@ -24,17 +23,33 @@ ingestion:
   wall_top_n: 5
   gex_top_n: 7
 validation:
-  horizons_minutes:
-  - 15
-  - 60
+  horizons_minutes: [15, 60]
   flat_threshold_pct: 0.001
   realized_snapshot_tolerance_minutes: 10
   
-  # Task 4: Explicit Predictive Gating Contract
-  use_default_required_features: true
+  # NEW — REQUIRED (no defaults)
+  alignment_tolerance_sec: 900
   emit_to_close_horizon: true
-  horizon_critical_features: {}
-  
+  use_default_required_features: false
+
+  # NEW — REQUIRED: explicit weight source
+  horizon_weights_source: model   # allowed: model | explicit
+
+  # NEW — REQUIRED: must exist even if source=model
+  horizon_weights: {}
+
+  # NEW — REQUIRED if source=model (must include every horizon + to_close)
+  horizon_weights_overrides:
+    "15": {}
+    "60": {}
+    "to_close": {}
+
+  # NEW — REQUIRED: must include every horizon + to_close
+  horizon_critical_features:
+    "15": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
+    "60": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
+    "to_close": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
+
 network:
   timeout_seconds: 15
   max_retries: 3
@@ -64,16 +79,17 @@ model:
   max_flat_prob: 0.65
   flat_from_data_quality_scale: 0.9
   weights:
-    smart_whale_pressure: 0.5
-    strike_flow_imbalance: 0.35
-    net_gex_sign: 0.3
-    dealer_vanna: 0.2
-    dp_magnet_pressure: 0.2
-    term_structure_slope: 0.15
-    lit_vs_dp_divergence: 0.15
-    net_oi_change: 0.1
-    flow_premium_imbalance: 0.1
-    realized_volatility: -0.1
+    smart_whale_pressure: 1.0
+    net_gex_sign: 0.6
+    net_gamma_exposure_notional: 0.25
+    dealer_vanna: 0.5
+    dealer_charm: 0.35
+    oi_pressure: 0.55
+    darkpool_pressure: 0.35
+    litflow_pressure: 0.35
+    vol_term_slope: 0.15
+    vol_skew: 0.10
+    iv_rank: 0.05
   calibration:
     bins:
     - 0.0

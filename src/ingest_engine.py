@@ -1,4 +1,3 @@
-# src/ingest_engine.py
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +17,7 @@ from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
-from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState, SessionState, ConfidenceState
+from .models import bounded_additive_score, Prediction, DecisionGate, DataQualityState, RiskGateStatus, SignalState, SessionState, ConfidenceState, KNOWN_FEATURE_KEYS
 from .endpoint_truth import (
     EndpointContext,
     EndpointPayloadClass, 
@@ -56,18 +55,68 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         raise KeyError("Missing ingestion.watchlist")
     if "cadence_minutes" not in cfg["ingestion"]:
         raise KeyError("Missing ingestion.cadence_minutes")
-    if "horizons_minutes" not in cfg["validation"]:
+        
+    val_cfg = cfg.get("validation", {})
+    if "horizons_minutes" not in val_cfg:
         raise KeyError("Missing validation.horizons_minutes")
-        
-    # Task 4: Explicit Contract Enforcement (Fail-Fast)
-    if "use_default_required_features" not in cfg["validation"]:
-        raise KeyError("Missing validation.use_default_required_features. This key explicitly controls whether the system falls back to session-based default critical features. Must be explicitly provided as true or false.")
-        
-    if "emit_to_close_horizon" not in cfg["validation"]:
-        raise KeyError("Missing validation.emit_to_close_horizon. This key explicitly controls whether the engine emits predictions for the time remaining to market close. Must be explicitly provided as true or false.")
-        
-    if "horizon_critical_features" not in cfg["validation"]:
-        raise KeyError("Missing validation.horizon_critical_features. This key maps specific horizons to their required critical features. Must be explicitly provided, even if intentionally empty (e.g., {}).")
+
+    if "alignment_tolerance_sec" not in val_cfg:
+        raise KeyError("Missing validation.alignment_tolerance_sec")
+    if "emit_to_close_horizon" not in val_cfg:
+        raise KeyError("Missing validation.emit_to_close_horizon")
+    if "use_default_required_features" not in val_cfg:
+        raise KeyError("Missing validation.use_default_required_features")
+    if "horizon_weights_source" not in val_cfg:
+        raise KeyError("Missing validation.horizon_weights_source")
+
+    src = val_cfg["horizon_weights_source"]
+    if src not in ("model", "explicit"):
+        raise ValueError(f"validation.horizon_weights_source must be 'model' or 'explicit', got '{src}'")
+
+    horizons = [str(h) for h in val_cfg["horizons_minutes"]]
+    if val_cfg["emit_to_close_horizon"]:
+        horizons.append("to_close")
+
+    if "horizon_critical_features" not in val_cfg:
+        raise KeyError("Missing validation.horizon_critical_features")
+    
+    for h in horizons:
+        if h not in val_cfg["horizon_critical_features"]:
+            raise KeyError(f"Missing validation.horizon_critical_features for horizon '{h}'")
+
+    if src == "model":
+        if "model" not in cfg or "weights" not in cfg["model"] or not cfg["model"]["weights"]:
+            raise KeyError("Missing or empty model.weights when horizon_weights_source is 'model'")
+        if "horizon_weights_overrides" not in val_cfg:
+            raise KeyError("Missing validation.horizon_weights_overrides")
+        for h in horizons:
+            if h not in val_cfg["horizon_weights_overrides"]:
+                raise KeyError(f"Missing validation.horizon_weights_overrides for horizon '{h}'")
+    elif src == "explicit":
+        if "horizon_weights" not in val_cfg:
+            raise KeyError("Missing validation.horizon_weights")
+        for h in horizons:
+            if h not in val_cfg["horizon_weights"]:
+                raise KeyError(f"Missing validation.horizon_weights for horizon '{h}'")
+
+    unknown_keys = set()
+
+    if src == "model":
+        unknown_keys.update(k for k in cfg["model"]["weights"].keys() if k not in KNOWN_FEATURE_KEYS)
+        for h in horizons:
+            if val_cfg["horizon_weights_overrides"].get(h):
+                unknown_keys.update(k for k in val_cfg["horizon_weights_overrides"][h].keys() if k not in KNOWN_FEATURE_KEYS)
+    elif src == "explicit":
+        for h in horizons:
+            if val_cfg["horizon_weights"].get(h):
+                unknown_keys.update(k for k in val_cfg["horizon_weights"][h].keys() if k not in KNOWN_FEATURE_KEYS)
+
+    for h in horizons:
+        crit_list = val_cfg["horizon_critical_features"].get(h, [])
+        unknown_keys.update(k for k in crit_list if k not in KNOWN_FEATURE_KEYS)
+
+    if unknown_keys:
+        raise ValueError(f"Unknown feature keys in config: {sorted(list(unknown_keys))}")
 
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
     def _parse(l, market: bool = False) -> List[PlannedCall]:
@@ -157,8 +206,8 @@ def generate_predictions(
     freshness_by_feature = {f["feature_key"]: f["meta_json"].get("freshness_state", "ERROR") for f in valid_features}
     stale_age_by_feature = {f["feature_key"]: f["meta_json"].get("stale_age_min") for f in valid_features}
     
-    alignment_tolerance_sec = int(cfg.get("validation", {}).get("alignment_tolerance_sec", 1800))
-    cadence_sec = int(cfg.get("ingestion", {}).get("cadence_minutes", 5)) * 60
+    alignment_tolerance_sec = cfg["validation"]["alignment_tolerance_sec"]
+    cadence_sec = int(cfg["ingestion"]["cadence_minutes"]) * 60
     
     ts_list = []
     alignment_violations = []
@@ -254,28 +303,29 @@ def generate_predictions(
     if not feat_dict and valid_features:
         base_gate = base_gate.block("all_features_excluded_by_alignment_or_ts", invalid=True)
 
-    horizon_weights_cfg = cfg.get("validation", {}).get("horizon_weights", {})
-    
-    # Task 4: Strict dictionary access enforcing that the config validation already guaranteed presence.
-    horizon_critical_cfg = cfg["validation"]["horizon_critical_features"]
-    use_default_reqs = cfg["validation"]["use_default_required_features"]
-    
-    default_weights = {"smart_whale_pressure": 1.0, "net_gex_sign": 0.5, "dealer_vanna": 0.5}
-    session_default_criticals = {
-        SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
-        SessionState.PREMARKET: ["spot", "dealer_vanna"],
-        SessionState.AFTERHOURS: ["spot"],
-        SessionState.CLOSED: ["spot"]
-    }.get(session_enum, ["spot"])
-
     def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], float, Dict[str, Any], List[str]]:
         old_dq_state = current_base_gate.data_quality_state
         
-        base_reqs = horizon_critical_cfg.get(h_str, [])
-        weights = horizon_weights_cfg.get(h_str, default_weights)
+        base_reqs = cfg["validation"]["horizon_critical_features"][h_str]
+        
+        if cfg["validation"]["horizon_weights_source"] == "model":
+            weights = dict(cfg["model"]["weights"])
+            overrides = cfg["validation"]["horizon_weights_overrides"][h_str]
+            if overrides:
+                weights.update(overrides)
+        else:
+            weights = cfg["validation"]["horizon_weights"][h_str]
+        
+        use_default_reqs = cfg["validation"]["use_default_required_features"]
         
         reqs = list(base_reqs)
         if use_default_reqs:
+            session_default_criticals = {
+                SessionState.RTH: ["spot", "net_gex_sign", "smart_whale_pressure", "oi_pressure"],
+                SessionState.PREMARKET: ["spot", "dealer_vanna"],
+                SessionState.AFTERHOURS: ["spot"],
+                SessionState.CLOSED: ["spot"]
+            }.get(session_enum, ["spot"])
             reqs = list(set(reqs) | set(session_default_criticals))
         else:
             if not reqs:
@@ -344,7 +394,20 @@ def generate_predictions(
         missing_criticals = [k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])]
         missing_non_criticals = [k for k in weights.keys() if k not in reqs and (k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]))]
         
+        valid_target_keys = {k for k in target_features if k in feat_dict and feat_dict[k] is not None and math.isfinite(feat_dict[k])}
+
         h_gate = current_base_gate
+        
+        if len(valid_target_keys) == 0:
+            logger.warning(
+                f"no_signal_due_to_zero_targets_horizon_{h_str}", 
+                extra={
+                    "counter": "no_signal_due_to_zero_targets",
+                    "horizon": h_str
+                }
+            )
+            h_gate = h_gate.block("no_horizon_target_features_after_alignment", invalid=True)
+
         if missing_criticals:
             logger.warning(
                 f"no_signal_due_to_critical_missing_horizon_{h_str}", 
@@ -448,7 +511,6 @@ def generate_predictions(
             "decision_window_id": window_id_fixed
         })
 
-    # Task 4: Strict dictionary access enforcing that the config validation already guaranteed presence.
     emit_to_close = cfg["validation"]["emit_to_close_horizon"]
     
     if emit_to_close and sec_to_close is not None and sec_to_close > 0:
@@ -504,7 +566,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
     val_cfg = cfg.get("validation", {})
     fallback_max_age_seconds = int(val_cfg.get("fallback_max_age_minutes", 15)) * 60
     invalid_after_seconds = int(val_cfg.get("invalid_after_minutes", 60)) * 60
-    alignment_tolerance_sec = int(val_cfg.get("alignment_tolerance_sec", 1800))
 
     now_et = dt.datetime.now(ET)
     asof_et = floor_to_interval(now_et, int(cfg["ingestion"]["cadence_minutes"]))
@@ -745,6 +806,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             "missing_keys": asmnt.missing_keys
                         }
 
+                        # Ticket 3: Persist strict validation keys for Replay Parity constraint
                         lineage_meta = MetaContract(
                             source_endpoints=[src_meta],
                             freshness_state=f_state.name,
@@ -753,7 +815,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             details={
                                 "effective_ts_utc": ctx.effective_ts_utc.isoformat() if ctx.effective_ts_utc else None,
                                 "endpoint_asof_ts_utc": ctx.endpoint_asof_ts_utc.isoformat() if ctx.endpoint_asof_ts_utc else None,
-                                "alignment_delta_sec": ctx.alignment_delta_sec
+                                "alignment_delta_sec": ctx.alignment_delta_sec,
+                                "truth_status": res.payload_class.name if hasattr(res.payload_class, "name") else str(res.payload_class),
+                                "stale_age_seconds": res.stale_age_seconds
                             }
                         )
 
