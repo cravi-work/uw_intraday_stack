@@ -12,6 +12,8 @@ def test_ingestion_dry_run_reaches_feature_insertion():
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,

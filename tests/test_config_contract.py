@@ -15,6 +15,8 @@ def valid_cfg():
             }
         },
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "horizons_minutes": [15, 60],
             "alignment_tolerance_sec": 900,
             "emit_to_close_horizon": True,

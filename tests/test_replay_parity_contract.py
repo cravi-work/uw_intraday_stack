@@ -64,8 +64,13 @@ def test_replay_missing_lineage_field_fails_parity(test_db_path):
     con.close()
 
     cfg = {
+        "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
+        "system": {},
+        "network": {},
         "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900, "use_default_required_features": False, "emit_to_close_horizon": False,
             "horizon_weights_source": "explicit", "horizons_minutes": [15],
             "horizon_critical_features": {"15": []},
@@ -86,8 +91,13 @@ def test_replay_cannot_compute_silent_skip(test_db_path):
     con.close()
     
     cfg = {
+        "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "mock.lock", "writer_lock_path": "mock.lock"},
+        "system": {},
+        "network": {},
         "ingestion": {"watchlist": ["AAPL"], "cadence_minutes": 5},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900, "use_default_required_features": False, "emit_to_close_horizon": False,
             "horizon_weights_source": "explicit",
             # Config only has 15, so replay cannot compute 60! This must throw an explicit error.

@@ -18,6 +18,8 @@ def test_valid_session_labels_pass(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
@@ -64,6 +66,8 @@ def test_invalid_session_label_fails_fast(caplog):
         "system": {"mode": "test_replay"},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,

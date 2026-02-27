@@ -1,3 +1,4 @@
+# src/ingest_engine.py
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +7,7 @@ import logging
 import math
 import uuid
 import hashlib # CL-06: Deterministic generation
+import json    # FIX: Added missing json import for diagnostics
 from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,6 +68,14 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         raise KeyError("Missing validation.emit_to_close_horizon")
     if "use_default_required_features" not in val_cfg:
         raise KeyError("Missing validation.use_default_required_features")
+        
+    # Task 6: Strict checks for hidden defaults
+    for key in ["invalid_after_minutes", "fallback_max_age_minutes"]:
+        if key not in val_cfg:
+            raise KeyError(f"Missing validation.{key}")
+        if type(val_cfg[key]) is not int or val_cfg[key] <= 0:
+            raise ValueError(f"validation.{key} must be a positive integer")
+            
     if "horizon_weights_source" not in val_cfg:
         raise KeyError("Missing validation.horizon_weights_source")
 
@@ -258,6 +268,14 @@ def generate_predictions(
                 eff_ts = asof_utc
                 delta_sec = 0.0
                 normalized_future_ts_features.append(f['feature_key'])
+                
+                # Task 7: Clamp-Lineage Consistency (Explainability Must Match Gating)
+                if "metric_lineage" in meta:
+                    meta["metric_lineage"]["effective_ts_utc"] = asof_utc.isoformat()
+                if "details" not in meta:
+                    meta["details"] = {}
+                meta["details"]["clamped_future_ts"] = True
+                
             else:
                 logger.warning(
                     f"future_ts_violation: {f['feature_key']} is ahead of asof_utc by {int(drift_sec)}s", 
@@ -371,7 +389,7 @@ def generate_predictions(
                 elif f_state == "STALE_CARRY":
                     age = stale_age_by_feature.get(k)
                     if age is not None:
-                        invalid_mins = int(cfg.get("validation", {}).get("invalid_after_minutes", 60))
+                        invalid_mins = cfg["validation"]["invalid_after_minutes"]
                         penalty_ratio = min(1.0, age / float(invalid_mins)) if invalid_mins > 0 else 1.0
                         credit = max(0.1, 1.0 - penalty_ratio)
                         valid_target_count += credit
@@ -398,17 +416,39 @@ def generate_predictions(
 
         h_gate = current_base_gate
         
+        # Task 8: Stronger Gate Diagnostics for no_horizon_target_features_after_alignment
         if len(valid_target_keys) == 0:
+            expected_keys = sorted(list(target_features))
+            filter_reasons = {
+                "missing": sorted([k for k in expected_keys if k not in feature_value_map and not any(av.startswith(f"{k}_delta_") for av in alignment_violations) and k not in future_ts_features and k not in missing_ts_features]),
+                "misaligned": sorted([k for k in expected_keys if any(av.startswith(f"{k}_delta_") for av in alignment_violations)]),
+                "future_ts": sorted([k for k in expected_keys if k in future_ts_features]),
+                "missing_ts": sorted([k for k in expected_keys if k in missing_ts_features]),
+                "invalid": sorted([k for k in expected_keys if k in feature_value_map and (feature_value_map[k] is None or not math.isfinite(feature_value_map[k]))])
+            }
+            
+            actual_missing_criticals = sorted([k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])])
+            excluded_align_count = len(filter_reasons["misaligned"]) + len(filter_reasons["future_ts"]) + len(filter_reasons["missing_ts"])
+            
+            filter_str = json.dumps(filter_reasons, sort_keys=True).replace('"', "'")
+            block_reason = f"no_horizon_target_features_after_alignment | expected: {expected_keys} | filtered: {filter_str}"
+
             logger.warning(
-                f"no_signal_due_to_zero_targets_horizon_{h_str}", 
+                f"horizon_{h_str}_blocked_zero_targets",
                 extra={
-                    "counter": "no_signal_due_to_zero_targets",
-                    "horizon": h_str
+                    "counter": "horizon_blocked_zero_targets",
+                    "horizon": h_str,
+                    "blocked_reason": "no_horizon_target_features_after_alignment",
+                    "expected_targets": expected_keys,
+                    "missing_criticals": actual_missing_criticals,
+                    "excluded_by_alignment_count": excluded_align_count,
+                    "filter_reasons": filter_reasons
                 }
             )
-            h_gate = h_gate.block("no_horizon_target_features_after_alignment", invalid=True)
+            h_gate = h_gate.block(block_reason, invalid=True, missing_features=actual_missing_criticals)
 
-        if missing_criticals:
+        if missing_criticals and h_gate.risk_gate_status != RiskGateStatus.BLOCKED:
+            missing_criticals = sorted(missing_criticals)
             logger.warning(
                 f"no_signal_due_to_critical_missing_horizon_{h_str}", 
                 extra={
@@ -563,9 +603,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
     core, market = build_plan(cfg, plan_yaml)
     tickers = [t.upper() for t in cfg["ingestion"]["watchlist"]]
 
-    val_cfg = cfg.get("validation", {})
-    fallback_max_age_seconds = int(val_cfg.get("fallback_max_age_minutes", 15)) * 60
-    invalid_after_seconds = int(val_cfg.get("invalid_after_minutes", 60)) * 60
+    val_cfg = cfg["validation"]
+    fallback_max_age_seconds = val_cfg["fallback_max_age_minutes"] * 60
+    invalid_after_seconds = val_cfg["invalid_after_minutes"] * 60
 
     now_et = dt.datetime.now(ET)
     asof_et = floor_to_interval(now_et, int(cfg["ingestion"]["cadence_minutes"]))
@@ -891,10 +931,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         logger.error(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed (>20% threshold). Rollback enforced.")
                         raise RuntimeError(f"Extraction failed: {malformed_count}/{total_outputs} rows malformed.")
                     
-                    db.insert_features(con, snapshot_id, valid_features)
-                    db.insert_levels(con, snapshot_id, valid_levels)
-                    
-                    # Task E: Pass pure valid_features to the centralized replay-friendly generator
+                    # Task 7: Execute generate_predictions FIRST. It strictly evaluates and mutates 
+                    # valid_features (clamping timestamps natively into meta_json).
                     predictions = generate_predictions(
                         cfg=cfg,
                         snapshot_id=snapshot_id,
@@ -904,6 +942,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         sec_to_close=sec_to_close,
                         endpoint_coverage=endpoint_coverage
                     )
+                    
+                    # Task 7: Persist the features *after* prediction gating mutations.
+                    # This guarantees the stored JSON strictly matches what the gate utilized.
+                    db.insert_features(con, snapshot_id, valid_features)
+                    db.insert_levels(con, snapshot_id, valid_levels)
                     
                     for p in predictions:
                         db.insert_prediction(con, p)

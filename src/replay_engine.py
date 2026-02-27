@@ -1,3 +1,4 @@
+# src/replay_engine.py
 import duckdb
 import json
 import math
@@ -6,7 +7,7 @@ from dataclasses import asdict
 from src.config_loader import load_yaml
 from src import features as feat
 from src.endpoint_truth import EndpointContext
-from src.ingest_engine import generate_predictions
+from src.ingest_engine import generate_predictions, _validate_config
 from src.models import SessionState
 from datetime import datetime, timezone
 
@@ -18,6 +19,9 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
     """
     if cfg is None:
         cfg = load_yaml("src/config/config.yaml").raw
+        
+    # Task 5: Enforce strict config contract before doing any replay processing
+    _validate_config(cfg)
         
     con = duckdb.connect(db_path, read_only=True)
     print(f"--- REPLAY PARITY CHECK: {ticker.upper()} ---")

@@ -14,8 +14,6 @@ ingestion:
   regular_start_et: 09:30
   regular_end_et: '16:00'
   afterhours_end_et: '20:00'
-  fallback_max_age_minutes: 15
-  invalid_after_minutes: 60
   enable_market_context: true
   volume_profile_top_n: 7
   darkpool_band_width: 0.5
@@ -31,6 +29,8 @@ validation:
   alignment_tolerance_sec: 900
   emit_to_close_horizon: true
   use_default_required_features: false
+  fallback_max_age_minutes: 15
+  invalid_after_minutes: 60
 
   # NEW — REQUIRED: explicit weight source
   horizon_weights_source: model   # allowed: model | explicit

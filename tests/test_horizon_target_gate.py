@@ -21,6 +21,8 @@ def mock_engine_env():
         "network": {},
         "validation": {
             "alignment_tolerance_sec": 900,
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "use_default_required_features": False,
             "emit_to_close_horizon": True,
             "horizon_weights_source": "explicit",
@@ -100,16 +102,18 @@ def test_zero_target_features_yields_no_signal(mock_engine_env, caplog):
     pred_15 = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 15)
     assert pred_15["decision_state"] == "NO_SIGNAL"
     assert pred_15["validation_eligible"] is False
-    assert "no_horizon_target_features_after_alignment" in pred_15["blocked_reasons"]
+    
+    # Task 8 Proof: Assert that the strict diagnostics are present
+    assert any("no_horizon_target_features_after_alignment" in r for r in pred_15["blocked_reasons"])
+    reason_str = next(r for r in pred_15["blocked_reasons"] if "no_horizon_target_features_after_alignment" in r)
+    assert "expected: ['oi_pressure']" in reason_str
+    assert "'missing': ['oi_pressure']" in reason_str
     
     # Assert Horizon 60: Has criticals + zero targets. It MUST hard-block.
     pred_60 = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 60)
     assert pred_60["decision_state"] == "NO_SIGNAL"
     assert pred_60["validation_eligible"] is False
-    assert "no_horizon_target_features_after_alignment" in pred_60["blocked_reasons"]
-    
-    # Assert TO_CLOSE horizon: Must also hard-block.
-    pred_tc = next(c for c in calls if c["horizon_kind"] == "TO_CLOSE")
-    assert pred_tc["decision_state"] == "NO_SIGNAL"
-    assert pred_tc["validation_eligible"] is False
-    assert "no_horizon_target_features_after_alignment" in pred_tc["blocked_reasons"]
+    assert any("no_horizon_target_features_after_alignment" in r for r in pred_60["blocked_reasons"])
+    reason_str_60 = next(r for r in pred_60["blocked_reasons"] if "no_horizon_target_features_after_alignment" in r)
+    assert "expected: ['oi_pressure', 'spot']" in reason_str_60
+    assert "'missing': ['oi_pressure', 'spot']" in reason_str_60

@@ -51,6 +51,8 @@ def test_integration_premarket_missing_greeks(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": True,
             "emit_to_close_horizon": False,
@@ -136,6 +138,8 @@ def test_integration_horizon_aware_gating(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,

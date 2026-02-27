@@ -1,3 +1,4 @@
+# src/models.py
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -124,6 +125,7 @@ def bounded_additive_score(
     
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
+        missing = list(gate.critical_features_missing) if gate.critical_features_missing else list(weights.keys())
         return Prediction(
             bias=0.0, 
             confidence=0.0, 
@@ -134,7 +136,7 @@ def bounded_additive_score(
             model_name="phase0_additive", 
             model_version="1.0", 
             model_hash="BLOCKED",
-            meta={"coverage": 0.0, "dq_eff": 0.0, "missing_keys": list(weights.keys())},
+            meta={"coverage": 0.0, "dq_eff": 0.0, "missing_keys": sorted(missing)},
             gate=gate
         )
 
@@ -221,7 +223,7 @@ def bounded_additive_score(
         model_name="phase0_additive", 
         model_version="1.0", 
         model_hash=model_hash,
-        meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": missing_keys},
+        meta={"coverage": round(coverage, 2), "dq_eff": round(dq_eff, 2), "missing_keys": sorted(missing_keys)},
         gate=gate
     )
 

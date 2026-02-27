@@ -84,6 +84,8 @@ def test_alignment_gating_counters_and_status(caplog):
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 300,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
@@ -167,6 +169,8 @@ def test_aligned_fixture_produces_aligned_status():
         "system": {},
         "network": {},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 300,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,

@@ -10,7 +10,9 @@ def test_engine_initialization_contract(mock_load_catalog):
         "storage": {"duckdb_path": ":memory:", "cycle_lock_path": "lock", "writer_lock_path": "wlock"},
         "system": {},
         "network": {},
-        "validation": {"horizons_minutes": [15, 60]}
+        "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,"horizons_minutes": [15, 60]}
     }
     
     eng = IngestionEngine(cfg=cfg, catalog_path="api_catalog.generated.yaml")

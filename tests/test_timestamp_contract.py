@@ -81,6 +81,8 @@ def test_future_effective_ts_blocks_predictive_use():
     cfg = {
         "ingestion": {"cadence_minutes": 5},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,
@@ -121,6 +123,8 @@ def test_one_sided_alignment_tolerance():
     cfg = {
         "ingestion": {"cadence_minutes": 5},
         "validation": {
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": tolerance_sec,
             "use_default_required_features": False,
             "emit_to_close_horizon": False,

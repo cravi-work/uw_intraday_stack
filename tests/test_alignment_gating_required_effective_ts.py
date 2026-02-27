@@ -2,6 +2,7 @@
 import pytest
 import datetime as dt
 import logging
+import copy
 from unittest.mock import MagicMock, patch
 
 import src.ingest_engine as ie_mod
@@ -21,6 +22,8 @@ def mock_engine_env():
         "network": {},
         "validation": {
             "alignment_tolerance_sec": 900,
+            "invalid_after_minutes": 60,
+            "fallback_max_age_minutes": 15,
             "use_default_required_features": False,
             "emit_to_close_horizon": True,
             "horizon_weights_source": "explicit",
@@ -72,6 +75,40 @@ def _run_with_features(cfg, features, caplog, fixed_asof=None):
             engine.run_cycle()
                 
         return mock_db
+
+def test_clamp_future_ts_rewrites_lineage_meta(mock_engine_env, caplog):
+    """
+    Task 7 Proof: A future timestamp within cadence drift is clamped, 
+    AND its lineage JSON is explicitly rewritten to match asof_utc before database storage.
+    """
+    fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    valid_meta = {"source_endpoints": [], "freshness_state": "FRESH", "stale_age_min": 0, "na_reason": None, "details": {}}
+    
+    # 2 minutes future drift (within 5 min cadence) -> Triggers Clamp
+    future_utc = (fixed_asof + dt.timedelta(minutes=2)).isoformat()
+    
+    f1 = {"feature_key": "spot", "feature_value": 150.0, "meta_json": copy.deepcopy(valid_meta)}
+    f1["meta_json"]["metric_lineage"] = {"effective_ts_utc": future_utc}
+    f2 = {"feature_key": "oi_pressure", "feature_value": 1000.0, "meta_json": copy.deepcopy(valid_meta)}
+    f2["meta_json"]["metric_lineage"] = {"effective_ts_utc": fixed_asof.isoformat()}
+    
+    features = [f1, f2]
+    
+    mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
+    
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+    
+    assert pred_call["decision_state"] != "NO_SIGNAL"
+    assert pred_call["alignment_status"] == "ALIGNED"
+    assert pred_call["meta_json"]["alignment_diagnostics"]["normalized_future_ts_count"] == 1
+    
+    # Verify the actual list sent to DB had its lineage mutated identically
+    inserted_features = mock_db.insert_features.call_args[0][2]
+    spot_feat = next(f for f in inserted_features if f["feature_key"] == "spot")
+    
+    assert spot_feat["meta_json"]["metric_lineage"]["effective_ts_utc"] == fixed_asof.isoformat()
+    assert spot_feat["meta_json"]["details"].get("clamped_future_ts") is True
 
 def test_missing_effective_ts_critical_feature(mock_engine_env, caplog):
     fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
