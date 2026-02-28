@@ -46,6 +46,9 @@ def test_replay_parity_matches_ingest(caplog):
         "network": {},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,

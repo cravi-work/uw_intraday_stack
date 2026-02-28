@@ -1,3 +1,4 @@
+# src/main.py
 from __future__ import annotations
 
 import argparse
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     
     p_rep = subparsers.add_parser("replay", help="Replay historical snapshots")
     p_rep.add_argument("ticker", type=str, help="Ticker to replay")
+    p_rep.add_argument("--config", default="src/config/config.yaml")
     p_rep.add_argument("--log-level", default="INFO")
 
     return ap.parse_args()
@@ -95,27 +97,48 @@ def main() -> None:
             sys.exit(1)
 
     elif args.cmd == "validate":
+        # Task 12: Route strict configs into validation CLI
         from .validator import validate_pending
-        cfg = load_yaml(args.config).raw
-        db_path = cfg["storage"]["duckdb_path"]
-        con = duckdb.connect(db_path)
+        from .ingest_engine import _validate_config
         try:
+            cfg = load_yaml(args.config).raw
+            _validate_config(cfg)
+            db_path = cfg["storage"]["duckdb_path"]
+            con = duckdb.connect(db_path)
+            
             res = validate_pending(
                 con, 
                 now_utc=dt.datetime.now(dt.timezone.utc), 
-                flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct", 0.001),
-                tolerance_minutes=cfg.get("validation", {}).get("tolerance_minutes", 10)
+                flat_threshold_pct=float(cfg["validation"]["flat_threshold_pct"]),
+                tolerance_minutes=int(cfg["validation"]["tolerance_minutes"]),
+                max_horizon_drift_minutes=int(cfg["validation"]["max_horizon_drift_minutes"])
             )
             print(f"Validation successful: {res.updated} updated, {res.skipped} skipped.")
             sys.exit(0)
+        except (KeyError, ValueError) as e:
+            print(f"Config Validation Error: {e}", file=sys.stderr)
+            sys.exit(1)
         except Exception as e:
             print(f"Validation Error: {e}", file=sys.stderr)
             sys.exit(1)
             
     elif args.cmd == "replay":
         from .replay_engine import run_replay
-        run_replay(args.ticker)
-        sys.exit(0)
+        try:
+            cfg = load_yaml(args.config).raw
+            
+            db_path = cfg.get("storage", {}).get("duckdb_path")
+            if not db_path:
+                raise KeyError("Config missing section/key: storage.duckdb_path")
+                
+            run_replay(db_path, args.ticker, cfg=cfg)
+            sys.exit(0)
+        except (KeyError, ValueError) as e:
+            print(f"Config Validation Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Replay Execution Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     from .ingest_engine import IngestionEngine
     cfg = load_yaml(getattr(args, "config", "src/config/config.yaml")).raw

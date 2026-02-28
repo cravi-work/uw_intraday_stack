@@ -60,7 +60,9 @@ class DecisionGate:
     critical_features_missing: Tuple[str, ...] = field(default_factory=tuple) # CL-05 Traceability
     validation_eligible: bool = True
 
-    def block(self, reason: str, invalid: bool = False, missing_features: List[str] = None) -> 'DecisionGate':
+    # Task 11: Structurally guarantee that a BLOCKED risk gate natively forces DataQuality to INVALID 
+    # unless explicitly overridden. Eliminates the "Valid but Blocked" contradiction.
+    def block(self, reason: str, invalid: bool = True, missing_features: List[str] = None) -> 'DecisionGate':
         return replace(
             self,
             risk_gate_status=RiskGateStatus.BLOCKED,
@@ -123,6 +125,7 @@ def bounded_additive_score(
     flat_from_data_quality_scale: float = 1.0,
 ) -> Prediction:
     
+    # Task 11: When gate is blocked, forcefully zero out confidence and set state to UNKNOWN.
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         gate = replace(gate, decision_state=SignalState.NO_SIGNAL)
         missing = list(gate.critical_features_missing) if gate.critical_features_missing else list(weights.keys())
@@ -227,7 +230,6 @@ def bounded_additive_score(
         gate=gate
     )
 
-# Ticket 2: The authoritative allowlist to strictly prevent config drift
 KNOWN_FEATURE_KEYS = frozenset({
     "spot",
     "smart_whale_pressure",

@@ -12,6 +12,9 @@ def test_engine_initialization_contract(mock_load_catalog):
         "network": {},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,"horizons_minutes": [15, 60]}
     }
     

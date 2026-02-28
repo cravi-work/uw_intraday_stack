@@ -82,6 +82,9 @@ def test_future_effective_ts_blocks_predictive_use():
         "ingestion": {"cadence_minutes": 5},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
@@ -124,6 +127,9 @@ def test_one_sided_alignment_tolerance():
         "ingestion": {"cadence_minutes": 5},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": tolerance_sec,
             "use_default_required_features": False,

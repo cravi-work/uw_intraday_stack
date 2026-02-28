@@ -1,3 +1,4 @@
+# tests/test_cl06_validation.py
 import pytest
 import datetime as dt
 import uuid
@@ -32,7 +33,8 @@ def test_leakage_guard_rejection(caplog):
             mock_con, 
             now_utc=now_utc, 
             flat_threshold_pct=0.0005, 
-            tolerance_minutes=2
+            tolerance_minutes=2,
+            max_horizon_drift_minutes=10  # Task 12 Fix: Satisfy the strict signature
         )
         
     assert stats.skipped == 1
@@ -67,7 +69,8 @@ def test_to_close_semantics():
         mock_con, 
         now_utc=now_utc, 
         flat_threshold_pct=0.0005, 
-        tolerance_minutes=2
+        tolerance_minutes=2,
+        max_horizon_drift_minutes=10  # Task 12 Fix: Satisfy the strict signature
     )
     
     assert stats.updated == 1

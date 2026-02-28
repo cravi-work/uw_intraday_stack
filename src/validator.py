@@ -1,3 +1,4 @@
+# src/validator.py
 from __future__ import annotations
 
 import math
@@ -71,13 +72,14 @@ class ValidationResult:
     leakage_violations: int = 0
 
 
+# Task 12: No silent defaults in validation core signature
 def validate_pending(
     con: duckdb.DuckDBPyConnection,
     *,
     now_utc: datetime,
     flat_threshold_pct: float,
     tolerance_minutes: int,
-    max_horizon_drift_minutes: int = 10, # CL-06 Leakage bound
+    max_horizon_drift_minutes: int,
 ) -> ValidationResult:
     
     tol = timedelta(minutes=int(tolerance_minutes))

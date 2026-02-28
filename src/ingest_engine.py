@@ -69,12 +69,17 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     if "use_default_required_features" not in val_cfg:
         raise KeyError("Missing validation.use_default_required_features")
         
-    # Task 6: Strict checks for hidden defaults
-    for key in ["invalid_after_minutes", "fallback_max_age_minutes"]:
+    # Task 6 & 12: Strict checks for hidden defaults (Including validator thresholds)
+    for key in ["invalid_after_minutes", "fallback_max_age_minutes", "tolerance_minutes", "max_horizon_drift_minutes"]:
         if key not in val_cfg:
             raise KeyError(f"Missing validation.{key}")
         if type(val_cfg[key]) is not int or val_cfg[key] <= 0:
             raise ValueError(f"validation.{key} must be a positive integer")
+            
+    if "flat_threshold_pct" not in val_cfg:
+        raise KeyError("Missing validation.flat_threshold_pct")
+    if not isinstance(val_cfg["flat_threshold_pct"], (float, int)) or val_cfg["flat_threshold_pct"] < 0:
+        raise ValueError("validation.flat_threshold_pct must be a positive float")
             
     if "horizon_weights_source" not in val_cfg:
         raise KeyError("Missing validation.horizon_weights_source")
@@ -321,7 +326,7 @@ def generate_predictions(
     if not feat_dict and valid_features:
         base_gate = base_gate.block("all_features_excluded_by_alignment_or_ts", invalid=True)
 
-    def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], float, Dict[str, Any], List[str]]:
+    def evaluate_horizon_gate(h_str: str, current_base_gate: DecisionGate) -> Tuple[DecisionGate, Dict[str, float], float, Dict[str, Any], List[str], Dict[str, Any]]:
         old_dq_state = current_base_gate.data_quality_state
         
         base_reqs = cfg["validation"]["horizon_critical_features"][h_str]
@@ -358,7 +363,7 @@ def generate_predictions(
         
         if not target_features:
             logger.error(f"invalid_contract_horizon_{h_str}: No target features (critical or weighted) defined.", extra={"counter": "invalid_horizon_contract"})
-            return current_base_gate.block(f"invalid_contract_no_targets_{h_str}", invalid=True), weights, 0.0, horizon_contract, ["invalid_contract_no_targets"]
+            return current_base_gate.block(f"invalid_contract_no_targets_{h_str}", invalid=True), weights, 0.0, horizon_contract, ["invalid_contract_no_targets"], {}
             
         logger.info(
             f"resolved_horizon_{h_str}_features",
@@ -415,8 +420,9 @@ def generate_predictions(
         valid_target_keys = {k for k in target_features if k in feat_dict and feat_dict[k] is not None and math.isfinite(feat_dict[k])}
 
         h_gate = current_base_gate
+        target_diagnostics = {}
         
-        # Task 8: Stronger Gate Diagnostics for no_horizon_target_features_after_alignment
+        # Task 8 & 10: Stronger Gate Diagnostics for no_horizon_target_features_after_alignment
         if len(valid_target_keys) == 0:
             expected_keys = sorted(list(target_features))
             filter_reasons = {
@@ -425,6 +431,16 @@ def generate_predictions(
                 "future_ts": sorted([k for k in expected_keys if k in future_ts_features]),
                 "missing_ts": sorted([k for k in expected_keys if k in missing_ts_features]),
                 "invalid": sorted([k for k in expected_keys if k in feature_value_map and (feature_value_map[k] is None or not math.isfinite(feature_value_map[k]))])
+            }
+            
+            # Populate structured dictionary for meta_json storage
+            target_diagnostics = {
+                "expected_keys": expected_keys,
+                "missing_keys": filter_reasons["missing"],
+                "invalid_keys": filter_reasons["invalid"],
+                "misaligned_keys": filter_reasons["misaligned"],
+                "future_ts_keys": filter_reasons["future_ts"],
+                "missing_ts_keys": filter_reasons["missing_ts"]
             }
             
             actual_missing_criticals = sorted([k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])])
@@ -508,13 +524,13 @@ def generate_predictions(
                 }
             )
 
-        return h_gate, weights, decision_dq, horizon_contract, sorted(dq_reasons)
+        return h_gate, weights, decision_dq, horizon_contract, sorted(dq_reasons), target_diagnostics
 
     predictions = []
 
     for h in cfg["validation"]["horizons_minutes"]:
         h_str = str(h)
-        h_gate, weights, decision_dq, horizon_contract, dq_reasons = evaluate_horizon_gate(h_str, base_gate)
+        h_gate, weights, decision_dq, horizon_contract, dq_reasons, target_diags = evaluate_horizon_gate(h_str, base_gate)
         pred = bounded_additive_score(feat_dict, decision_dq, weights, gate=h_gate)
         
         window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
@@ -535,6 +551,9 @@ def generate_predictions(
         pred_meta["decision_dq"] = decision_dq
         pred_meta["dq_reason_codes"] = dq_reasons
         
+        # Task 10: Store structured gate diagnostics
+        pred_meta["gating"] = {"target_diagnostics": target_diags} if target_diags else {}
+        
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": int(h), "horizon_kind": "FIXED", 
             "horizon_seconds": None, "start_price": feat_dict.get("spot"), 
@@ -554,7 +573,7 @@ def generate_predictions(
     emit_to_close = cfg["validation"]["emit_to_close_horizon"]
     
     if emit_to_close and sec_to_close is not None and sec_to_close > 0:
-        h_gate, weights, decision_dq, horizon_contract, dq_reasons = evaluate_horizon_gate("to_close", base_gate)
+        h_gate, weights, decision_dq, horizon_contract, dq_reasons, target_diags = evaluate_horizon_gate("to_close", base_gate)
         pred = bounded_additive_score(feat_dict, decision_dq, weights, gate=h_gate)
         
         window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
@@ -574,6 +593,9 @@ def generate_predictions(
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
         pred_meta["dq_reason_codes"] = dq_reasons
+        
+        # Task 10: Store structured gate diagnostics
+        pred_meta["gating"] = {"target_diagnostics": target_diags} if target_diags else {}
         
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": 0, "horizon_kind": "TO_CLOSE", 

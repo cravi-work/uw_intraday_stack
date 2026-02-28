@@ -23,7 +23,8 @@ ingestion:
 validation:
   horizons_minutes: [15, 60]
   flat_threshold_pct: 0.001
-  realized_snapshot_tolerance_minutes: 10
+  tolerance_minutes: 10
+  max_horizon_drift_minutes: 10
   
   # NEW — REQUIRED (no defaults)
   alignment_tolerance_sec: 900

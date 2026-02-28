@@ -19,6 +19,9 @@ def test_valid_session_labels_pass(caplog):
         "network": {},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,
@@ -67,6 +70,9 @@ def test_invalid_session_label_fails_fast(caplog):
         "network": {},
         "validation": {
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "alignment_tolerance_sec": 900,
             "use_default_required_features": False,

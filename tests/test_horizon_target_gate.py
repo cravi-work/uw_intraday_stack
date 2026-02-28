@@ -22,6 +22,9 @@ def mock_engine_env():
         "validation": {
             "alignment_tolerance_sec": 900,
             "invalid_after_minutes": 60,
+            "tolerance_minutes": 10,
+            "max_horizon_drift_minutes": 10,
+            "flat_threshold_pct": 0.001,
             "fallback_max_age_minutes": 15,
             "use_default_required_features": False,
             "emit_to_close_horizon": True,
@@ -101,19 +104,32 @@ def test_zero_target_features_yields_no_signal(mock_engine_env, caplog):
     # Assert Horizon 15: It has NO criticals, but also zero valid targets. It MUST hard-block.
     pred_15 = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 15)
     assert pred_15["decision_state"] == "NO_SIGNAL"
+    assert pred_15["risk_gate_status"] == "BLOCKED"
     assert pred_15["validation_eligible"] is False
     
-    # Task 8 Proof: Assert that the strict diagnostics are present
+    # Task 11 Proof: Ensure DQ and Confidence are forced to terminal states when target block occurs
+    assert pred_15["data_quality_state"] == "INVALID"
+    assert pred_15["confidence_state"] == "UNKNOWN"
+    
     assert any("no_horizon_target_features_after_alignment" in r for r in pred_15["blocked_reasons"])
     reason_str = next(r for r in pred_15["blocked_reasons"] if "no_horizon_target_features_after_alignment" in r)
     assert "expected: ['oi_pressure']" in reason_str
-    assert "'missing': ['oi_pressure']" in reason_str
+    
+    diags_15 = pred_15["meta_json"].get("gating", {}).get("target_diagnostics", {})
+    assert diags_15, "Structured target diagnostics should be present"
+    assert diags_15["expected_keys"] == ["oi_pressure"]
+    assert diags_15["missing_keys"] == ["oi_pressure"]
     
     # Assert Horizon 60: Has criticals + zero targets. It MUST hard-block.
     pred_60 = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 60)
     assert pred_60["decision_state"] == "NO_SIGNAL"
+    assert pred_60["risk_gate_status"] == "BLOCKED"
     assert pred_60["validation_eligible"] is False
-    assert any("no_horizon_target_features_after_alignment" in r for r in pred_60["blocked_reasons"])
-    reason_str_60 = next(r for r in pred_60["blocked_reasons"] if "no_horizon_target_features_after_alignment" in r)
-    assert "expected: ['oi_pressure', 'spot']" in reason_str_60
-    assert "'missing': ['oi_pressure', 'spot']" in reason_str_60
+    
+    # Task 11 Proof: Horizon 60 must also enforce terminal semantics
+    assert pred_60["data_quality_state"] == "INVALID"
+    assert pred_60["confidence_state"] == "UNKNOWN"
+    
+    diags_60 = pred_60["meta_json"].get("gating", {}).get("target_diagnostics", {})
+    assert diags_60["expected_keys"] == ["oi_pressure", "spot"]
+    assert diags_60["missing_keys"] == ["oi_pressure", "spot"]
