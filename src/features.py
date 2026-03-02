@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
 from .analytics import build_gex_levels, build_oi_walls, build_darkpool_levels
+from .instruments import contract_scale, normalize_option_rows, normalized_contract_map
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,40 @@ def _normalize_put_call(value: Any) -> Optional[str]:
         return "PUT"
     return None
 
+def _build_contract_normalization_failure_bundle(
+    ctx: EndpointContext,
+    extractor_name: str,
+    lineage: Dict[str, Any],
+    payload: Any,
+    *,
+    feature_keys: Iterable[str],
+    meta_key: str,
+    summary: Any,
+) -> FeatureBundle:
+    reason = getattr(summary, "failure_reason", None) or "contract_normalization_invalid"
+    logger.warning(
+        "option_contract_normalization_invalid",
+        extra={"counter": "option_contract_normalization_invalid", "feature_key": meta_key, "reason": reason},
+    )
+    meta = _build_meta(
+        ctx,
+        extractor_name,
+        lineage,
+        {
+            **_extract_payload_provenance(payload),
+            "status": "suppressed_contract_normalization_invalid",
+            "suppression_reason": reason,
+            "contract_normalization": summary.as_dict(),
+        },
+    )
+    meta["na_reason"] = reason
+    return FeatureBundle({k: None for k in feature_keys}, {meta_key: meta})
+
+
+def _normalized_identity_for_row(contract_map: Mapping[int, Any], row_index: int) -> Optional[Any]:
+    return contract_map.get(row_index)
+
+
 def _build_meta(
     ctx: EndpointContext, 
     extractor_name: str, 
@@ -415,21 +450,21 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     lineage = {
         "metric_name": "smart_whale_pressure",
-        "fields_used": ["premium", "dte", "side", "put_call"],
+        "fields_used": ["premium", "dte", "side", "put_call", "option_symbol", "expiration", "multiplier", "deliverable"],
         "units_expected": "Net Premium Flow (USD)",
-        "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
+        "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
-        "quality_policy": "None on filtered zeros to avoid false baseline certainty",
+        "quality_policy": "None on filtered zeros to avoid false baseline certainty; suppress on contract normalization failure",
         "criticality": "CRITICAL"
     }
-    
+
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency")})
 
     trades = grab_list(flow_payload)
     if not trades and isinstance(flow_payload, dict) and "data" in flow_payload:
         trades = flow_payload["data"]
-        
+
     if trades and not all(isinstance(t, dict) for t in trades):
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
@@ -437,76 +472,96 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {**_extract_payload_provenance(flow_payload), "status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
+    norm_summary = normalize_option_rows(trades)
+    if norm_summary.status == "INVALID":
+        return _build_contract_normalization_failure_bundle(
+            ctx,
+            "extract_smart_whale_pressure",
+            lineage,
+            flow_payload,
+            feature_keys=["smart_whale_pressure"],
+            meta_key="flow",
+            summary=norm_summary,
+        )
+    contract_map = normalized_contract_map(norm_summary)
+
     whale_call, whale_put = 0.0, 0.0
     valid_count, skip_missing_fields, skip_bad_type, skip_bad_side, skip_threshold = 0, 0, 0, 0, 0
-    
+
     pc_map = {"C": "CALL", "CALL": "CALL", "CALLS": "CALL", "P": "PUT", "PUT": "PUT", "PUTS": "PUT"}
     side_map = {"ASK": "BULL", "BUY": "BULL", "BULLISH": "BULL", "BOT": "BULL", "BID": "BEAR", "SELL": "BEAR", "BEARISH": "BEAR", "SOLD": "BEAR"}
-    
-    for t in trades:
+
+    for idx, t in enumerate(trades):
         prem = safe_float(t.get("premium"))
         dte = safe_float(t.get("dte"))
         side_raw = t.get("side")
-        pc_raw = t.get("put_call")
-        
+        identity = _normalized_identity_for_row(contract_map, idx)
+        pc_raw = identity.put_call if identity is not None else (t.get("put_call") or t.get("option_type") or t.get("type") or t.get("pc"))
+
         if prem is None or dte is None or is_na(side_raw) or is_na(pc_raw):
             skip_missing_fields += 1
             continue
-            
-        pc_norm = pc_map.get(str(pc_raw).upper().strip())
+
+        pc_norm = pc_raw if identity is not None else pc_map.get(str(pc_raw).upper().strip())
         side_norm = side_map.get(str(side_raw).upper().strip())
-        
+
         if not pc_norm:
             skip_bad_type += 1
             continue
         if not side_norm:
-            skip_bad_side += 1 
+            skip_bad_side += 1
             continue
 
         if prem < min_premium or dte > max_dte:
             skip_threshold += 1
             continue
-            
+
         valid_count += 1
         if side_norm == "BULL":
-            if pc_norm == "CALL": 
+            if pc_norm == "CALL":
                 whale_call += prem
-            else: 
+            else:
                 whale_put += prem
         elif side_norm == "BEAR":
-            if pc_norm == "CALL": 
+            if pc_norm == "CALL":
                 whale_call -= prem
-            else: 
+            else:
                 whale_put -= prem
 
+    details = {
+        **_extract_payload_provenance(flow_payload),
+        "contract_normalization": norm_summary.as_dict(),
+        "n_raw_trades": len(trades),
+    }
+
     if valid_count == 0:
-        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {
-            **_extract_payload_provenance(flow_payload),
-            "status": "filtered_zero_treated_as_unknown", 
-            "n_raw_trades": len(trades), 
-            "skipped_threshold": skip_threshold, 
-            "confidence_impact": "DEGRADED"
+        details.update({
+            "status": "filtered_zero_treated_as_unknown",
+            "skipped_threshold": skip_threshold,
+            "confidence_impact": "DEGRADED",
         })
+        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, details)
         meta["freshness_state"] = "EMPTY_VALID"
         meta["na_reason"] = "no_trades_met_policy_thresholds"
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
     net = whale_call - whale_put
-    meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {**_extract_payload_provenance(flow_payload), "net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
+    details.update({"net_prem": net, "n_valid": valid_count})
+    meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, details)
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
     lineage = {
         "metric_name": "dealer_greeks",
-        "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date"],
+        "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date", "option_symbol", "expiration", "multiplier", "deliverable"],
         "units_expected": "Notional Exposure (USD)",
-        "normalization": f"normalize_signed [-1, 1] by {norm_scale}",
+        "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "PREMARKET/RTH",
-        "quality_policy": "None on missing",
+        "quality_policy": "None on missing; suppress on contract normalization failure",
         "criticality": "CRITICAL"
     }
-    
+
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency")})
 
@@ -514,15 +569,31 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     if not rows:
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, "no_rows")})
 
-    latest = max(rows, key=lambda r: _parse_strict_ts(r, "date"))
-    
+    norm_summary = normalize_option_rows(rows)
+    if norm_summary.status == "INVALID":
+        return _build_contract_normalization_failure_bundle(
+            ctx,
+            "extract_dealer_greeks",
+            lineage,
+            greek_payload,
+            feature_keys=keys,
+            meta_key="greeks",
+            summary=norm_summary,
+        )
+    contract_map = normalized_contract_map(norm_summary)
+
+    latest_idx, latest = max(enumerate(rows), key=lambda item: _parse_strict_ts(item[1], "date"))
+
     ts_float = _parse_strict_ts(latest, "date")
     eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
 
     prov = _extract_payload_provenance(latest)
-    prov.update({"ts": latest.get("date"), "scale_used": norm_scale, "effective_at_utc": eff_ts, "event_time_utc": eff_ts})
+    prov.update({"ts": latest.get("date"), "scale_used": norm_scale, "effective_at_utc": eff_ts, "event_time_utc": eff_ts, "contract_normalization": norm_summary.as_dict()})
+    identity = _normalized_identity_for_row(contract_map, latest_idx)
+    if identity is not None:
+        prov["canonical_contract_key"] = identity.canonical_contract_key
     meta = _build_meta(ctx, "extract_dealer_greeks", lineage, prov)
-    
+
     return FeatureBundle({
         "dealer_vanna": _normalize_signed(safe_float(latest.get("vanna_exposure")), scale=norm_scale),
         "dealer_charm": _normalize_signed(safe_float(latest.get("charm_exposure")), scale=norm_scale),
@@ -569,19 +640,32 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "oi_pressure",
-        "fields_used": ["open_interest", "strike", "put_call"],
+        "fields_used": ["open_interest", "strike", "put_call", "expiration", "option_symbol", "multiplier", "deliverable"],
         "units_expected": "Directional Imbalance Ratio [-1, 1]",
-        "normalization": "(weighted_call_oi - weighted_put_oi) / (weighted_call_oi + weighted_put_oi)",
+        "normalization": "(weighted_call_equivalent_oi - weighted_put_equivalent_oi) / (weighted_call_equivalent_oi + weighted_put_equivalent_oi) with canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
-        "quality_policy": "Suppress on missing put/call semantics or invalid directional rows",
+        "quality_policy": "Suppress on missing put/call semantics, invalid directional rows, or contract normalization failure",
         "criticality": "CRITICAL"
     }
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
-    
+
     rows = grab_list(payload)
     if not rows:
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
+
+    norm_summary = normalize_option_rows(rows)
+    if norm_summary.status == "INVALID":
+        return _build_contract_normalization_failure_bundle(
+            ctx,
+            "extract_oi",
+            lineage,
+            payload,
+            feature_keys=["oi_pressure"],
+            meta_key="oi",
+            summary=norm_summary,
+        )
+    contract_map = normalized_contract_map(norm_summary)
 
     spot_ref = _extract_spot_reference(payload)
     weighted_call_oi = 0.0
@@ -589,11 +673,13 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     directional_rows = 0
     parsed_rows = 0
     missing_put_call_rows = 0
+    normalized_contract_rows = 0
 
-    for r in rows:
+    for idx, r in enumerate(rows):
+        identity = _normalized_identity_for_row(contract_map, idx)
         oi_val = safe_float(r.get("open_interest") or r.get("oi"))
-        strike = safe_float(r.get("strike") or r.get("strike_price"))
-        pc_norm = _normalize_put_call(r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc"))
+        strike = identity.strike if identity is not None else safe_float(r.get("strike") or r.get("strike_price"))
+        pc_norm = identity.put_call if identity is not None else _normalize_put_call(r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc"))
 
         if oi_val is None or not math.isfinite(oi_val) or oi_val < 0:
             continue
@@ -607,11 +693,16 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
             spot_band = max(abs(spot_ref) * 0.02, 1.0)
             weight = 1.0 / (1.0 + abs(strike - spot_ref) / spot_band)
 
+        scale = contract_scale(identity) if identity is not None else 1.0
+        equivalent_oi = oi_val * scale
+        if identity is not None:
+            normalized_contract_rows += 1
+
         directional_rows += 1
         if pc_norm == "CALL":
-            weighted_call_oi += oi_val * weight
+            weighted_call_oi += equivalent_oi * weight
         else:
-            weighted_put_oi += oi_val * weight
+            weighted_put_oi += equivalent_oi * weight
 
     if directional_rows == 0:
         logger.warning(
@@ -620,9 +711,11 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         )
         meta = _build_meta(ctx, "extract_oi", lineage, {
             **_extract_payload_provenance(payload),
+            "contract_normalization": norm_summary.as_dict(),
             "n_rows": len(rows),
             "parsed_rows": parsed_rows,
             "missing_put_call_rows": missing_put_call_rows,
+            "normalized_contract_rows": normalized_contract_rows,
             "status": "suppressed_directionless_oi_total",
             "suppression_reason": "missing_put_call_or_directional_rows",
             "spot_reference": spot_ref,
@@ -633,9 +726,11 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     pressure = _normalize_balance(weighted_call_oi, weighted_put_oi)
     meta = _build_meta(ctx, "extract_oi", lineage, {
         **_extract_payload_provenance(payload),
+        "contract_normalization": norm_summary.as_dict(),
         "n_rows": len(rows),
         "parsed_rows": parsed_rows,
         "directional_rows": directional_rows,
+        "normalized_contract_rows": normalized_contract_rows,
         "weighted_call_oi": weighted_call_oi,
         "weighted_put_oi": weighted_put_oi,
         "spot_reference": spot_ref,

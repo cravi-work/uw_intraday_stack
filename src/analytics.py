@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # STRICT UNIDIRECTIONAL IMPORT: Only depends on neutral 'na' module. 
 # NO imports from .features are present. _find_first is explicitly removed.
 from .na import safe_float, grab_list
+from .instruments import contract_scale, normalize_option_rows, normalized_contract_map
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +80,12 @@ def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[
 def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
     """
     Computes primary Option Interest (OI) support/resistance levels.
+    Contract-level rows are normalized to canonical option identity before magnitude comparison.
     """
     rows = grab_list(payload)
     if not rows:
         return []
-    
+
     # Try to infer spot from rows if not provided explicitly
     if spot is None:
         for r in rows:
@@ -91,15 +93,26 @@ def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str
             if s is not None:
                 spot = s
                 break
-    
+
+    norm_summary = normalize_option_rows(rows)
+    if norm_summary.status == "INVALID":
+        logger.warning(
+            "option_contract_normalization_invalid",
+            extra={"counter": "option_contract_normalization_invalid", "artifact": "oi_walls", "reason": norm_summary.failure_reason or "contract_normalization_invalid"},
+        )
+        return []
+    contract_map = normalized_contract_map(norm_summary)
+
     parsed = []
     has_put_call = False
-    
-    for r in rows:
-        strike = safe_float(r.get("strike") or r.get("strike_price"))
+    normalized_contract_rows = 0
+
+    for idx, r in enumerate(rows):
+        identity = contract_map.get(idx)
+        strike = identity.strike if identity is not None else safe_float(r.get("strike") or r.get("strike_price"))
         oi = safe_float(r.get("open_interest") or r.get("oi"))
-        pc_raw = r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc")
-        
+        pc_raw = identity.put_call if identity is not None else (r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc"))
+
         if strike is not None and oi is not None:
             pc_norm = None
             if pc_raw:
@@ -109,46 +122,56 @@ def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str
                     pc_norm = "CALL"
                 elif pc_str in ("P", "PUT", "PUTS"):
                     pc_norm = "PUT"
-            
+
+            if identity is not None:
+                oi *= contract_scale(identity)
+                normalized_contract_rows += 1
+
             parsed.append({"strike": strike, "oi": oi, "put_call": pc_norm})
-            
+
     if not parsed:
         return []
-        
+
     levels = []
-    
+    base_details = {
+        "input_rows": len(rows),
+        "parsed_rows": len(parsed),
+        "normalized_contract_rows": normalized_contract_rows,
+        "contract_normalization": norm_summary.as_dict(),
+    }
+
     if not has_put_call:
         # Fallback: Generic Wall (No put_call available to separate direction)
         sorted_oi = sorted(parsed, key=lambda x: (-x["oi"], x["strike"]))
-        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], {
-            "input_rows": len(rows), "parsed_rows": len(parsed), "degraded_reason": "missing_put_call"
-        }))
+        details = dict(base_details)
+        details["degraded_reason"] = "missing_put_call"
+        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], details))
         return levels
-        
+
     if spot is None:
         # Fallback: Generic Wall (No spot available to establish above/below boundary)
         sorted_oi = sorted(parsed, key=lambda x: (-x["oi"], x["strike"]))
-        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], {
-            "input_rows": len(rows), "parsed_rows": len(parsed), "degraded_reason": "missing_spot"
-        }))
+        details = dict(base_details)
+        details["degraded_reason"] = "missing_spot"
+        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], details))
         return levels
-        
-    # Task 7: We have spot and put_call. Find Directional Walls.
+
+    # Directional Walls.
     calls = [p for p in parsed if p["put_call"] == "CALL" and p["strike"] >= spot]
     puts = [p for p in parsed if p["put_call"] == "PUT" and p["strike"] <= spot]
-    
+
     if calls:
         sorted_calls = sorted(calls, key=lambda x: (-x["oi"], x["strike"]))
-        levels.append(("CALL_WALL", sorted_calls[0]["strike"], sorted_calls[0]["oi"], {
-            "input_rows": len(rows), "parsed_rows": len(parsed), "spot_reference": spot
-        }))
-        
+        details = dict(base_details)
+        details["spot_reference"] = spot
+        levels.append(("CALL_WALL", sorted_calls[0]["strike"], sorted_calls[0]["oi"], details))
+
     if puts:
         sorted_puts = sorted(puts, key=lambda x: (-x["oi"], x["strike"]))
-        levels.append(("PUT_WALL", sorted_puts[0]["strike"], sorted_puts[0]["oi"], {
-            "input_rows": len(rows), "parsed_rows": len(parsed), "spot_reference": spot
-        }))
-        
+        details = dict(base_details)
+        details["spot_reference"] = spot
+        levels.append(("PUT_WALL", sorted_puts[0]["strike"], sorted_puts[0]["oi"], details))
+
     return levels
 
 def build_darkpool_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
