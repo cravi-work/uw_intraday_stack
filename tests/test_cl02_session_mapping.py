@@ -101,6 +101,7 @@ def test_early_close_computes_correct_post_market():
         hours = get_market_hours(date_obj, cfg)
         
         assert hours.is_early_close is True
+        assert hours.is_half_day is True
         assert hours.post_end_et.time() == dt.time(17, 0)
         
         rth_ts = dt.datetime(2026, 11, 27, 12, 0, tzinfo=ET)

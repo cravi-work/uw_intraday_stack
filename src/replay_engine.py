@@ -8,7 +8,7 @@ from src.config_loader import load_yaml
 from src import features as feat
 from src.endpoint_truth import EndpointContext
 from src.ingest_engine import generate_predictions, _validate_config
-from src.models import SessionState
+from src.scheduler import coerce_session_state
 from datetime import datetime, timezone
 
 def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None):
@@ -123,7 +123,7 @@ def run_replay(db_path: str, ticker: str, start_ts: Optional[str] = None, end_ts
                     continue
                 valid_features.append(f)
         
-        session_enum = SessionState(sess_str)
+        session_enum = coerce_session_state(sess_str)
         
         recomputed_preds = generate_predictions(
             cfg=cfg,

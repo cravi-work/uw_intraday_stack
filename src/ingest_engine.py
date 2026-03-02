@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .api_catalog_loader import load_api_catalog
 from .config_loader import load_endpoint_plan
 from .file_lock import FileLock, FileLockError
-from .scheduler import ET, UTC, floor_to_interval, get_market_hours
+from .scheduler import ET, UTC, coerce_session_state, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
 from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
@@ -644,15 +644,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
         return
 
     sess_str = hours.get_session_label(asof_et)
-    
-    canonical_labels = {
-        SessionState.PREMARKET.value,
-        SessionState.RTH.value,
-        SessionState.AFTERHOURS.value,
-        SessionState.CLOSED.value
-    }
-    
-    if sess_str not in canonical_labels:
+
+    try:
+        session_enum = coerce_session_state(sess_str)
+    except ValueError:
         logger.error(
             f"Session contract violation: Invalid session label '{sess_str}'", 
             extra={
@@ -664,8 +659,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
             }
         )
         return
-        
-    session_enum = SessionState(sess_str)
         
     close_utc = hours.market_close_et.astimezone(UTC) if hours.market_close_et else None
     post_utc = hours.post_end_et.astimezone(UTC) if hours.post_end_et else None
