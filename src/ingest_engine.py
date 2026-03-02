@@ -772,7 +772,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     resolved = resolve_effective_payload(
                         str(event_id), asof_utc, assessment, prev_state,
                         fallback_max_age_seconds=fallback_max_age_seconds,
-                        invalid_after_seconds=invalid_after_seconds
+                        invalid_after_seconds=invalid_after_seconds,
+                        received_at_raw=getattr(res, "received_at_utc", None),
+                        processed_at_raw=attempt_ts_utc,
+                        as_of_time_raw=asof_utc,
                     )
                     
                     enforced_freshness = resolved.freshness_state
@@ -854,7 +857,17 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             na_reason=n_reason,
                             endpoint_asof_ts_utc=ep_asof,
                             alignment_delta_sec=delta_sec,
-                            effective_ts_utc=res.effective_ts_utc
+                            effective_ts_utc=res.effective_ts_utc,
+                            event_time_utc=res.event_time_utc,
+                            source_publish_time_utc=res.source_publish_time_utc,
+                            received_at_utc=res.received_at_utc,
+                            processed_at_utc=res.processed_at_utc,
+                            as_of_time_utc=res.as_of_time_utc,
+                            source_revision=res.source_revision,
+                            effective_time_source=res.effective_time_source,
+                            timestamp_quality=res.timestamp_quality,
+                            lagged=res.lagged,
+                            time_provenance_degraded=res.time_provenance_degraded,
                         )
                         contexts[endpoint_id] = ctx
                             
@@ -876,10 +889,20 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             na_reason=n_reason,
                             details={
                                 "effective_ts_utc": ctx.effective_ts_utc.isoformat() if ctx.effective_ts_utc else None,
+                                "event_time_utc": ctx.event_time_utc.isoformat() if ctx.event_time_utc else None,
+                                "source_publish_time_utc": ctx.source_publish_time_utc.isoformat() if ctx.source_publish_time_utc else None,
+                                "received_at_utc": ctx.received_at_utc.isoformat() if ctx.received_at_utc else None,
+                                "processed_at_utc": ctx.processed_at_utc.isoformat() if ctx.processed_at_utc else None,
+                                "as_of_time_utc": ctx.as_of_time_utc.isoformat() if ctx.as_of_time_utc else None,
                                 "endpoint_asof_ts_utc": ctx.endpoint_asof_ts_utc.isoformat() if ctx.endpoint_asof_ts_utc else None,
                                 "alignment_delta_sec": ctx.alignment_delta_sec,
                                 "truth_status": res.payload_class.name if hasattr(res.payload_class, "name") else str(res.payload_class),
-                                "stale_age_seconds": res.stale_age_seconds
+                                "stale_age_seconds": res.stale_age_seconds,
+                                "effective_time_source": ctx.effective_time_source,
+                                "timestamp_quality": ctx.timestamp_quality,
+                                "lagged": ctx.lagged,
+                                "time_provenance_degraded": ctx.time_provenance_degraded,
+                                "source_revision": ctx.source_revision,
                             }
                         )
 

@@ -4,7 +4,7 @@ import copy
 import datetime
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping, Iterable
 from dataclasses import dataclass
 
 from .na import safe_float, is_na, grab_list
@@ -60,6 +60,25 @@ PATH_PRIORITY = {
     "/api/stock/{ticker}/historical-risk-reversal-skew": 1
 }
 
+CALL_ALIASES = {"C", "CALL", "CALLS"}
+PUT_ALIASES = {"P", "PUT", "PUTS"}
+BULLISH_SIDE_ALIASES = {"ASK", "BUY", "BULL", "BULLISH", "BOT"}
+BEARISH_SIDE_ALIASES = {"BID", "SELL", "BEAR", "BEARISH", "SOLD"}
+EVENT_TIME_KEYS = (
+    "event_time", "event_at", "executed_at", "trade_time", "occurred_at",
+    "timestamp", "time", "t", "date", "updated_at", "last_updated"
+)
+PUBLISH_TIME_KEYS = (
+    "source_publish_time", "published_at", "publish_time", "report_time", "report_date"
+)
+EFFECTIVE_TIME_KEYS = (
+    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of"
+)
+SOURCE_REVISION_KEYS = (
+    "source_revision", "revision", "rev", "version", "sequence_id", "update_id"
+)
+SPOT_KEYS = ("spot", "underlying_price", "underlying", "stock_price", "spot_price")
+
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if scale == 0: 
         return None 
@@ -79,36 +98,235 @@ def _parse_strict_ts(row: dict, key: str) -> float:
             pass
     return 0.0
 
+
+def _serialize_dtlike(value: Any) -> Any:
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        else:
+            value = value.astimezone(datetime.timezone.utc)
+        return value.isoformat()
+    return value
+
+
+def _coerce_ts_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        else:
+            value = value.astimezone(datetime.timezone.utc)
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(datetime.timezone.utc).isoformat()
+        except ValueError:
+            try:
+                return datetime.datetime.fromtimestamp(float(raw), datetime.timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                return None
+    return None
+
+
+def _iter_payload_dicts(payload: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        yield payload
+    rows = grab_list(payload)
+    if not rows and isinstance(payload, dict):
+        rows = [payload]
+    for row in rows:
+        if isinstance(row, dict):
+            yield row
+
+
+def _find_payload_timestamp(payload: Any, keys: Tuple[str, ...]) -> Tuple[Optional[str], Optional[str], bool]:
+    best_iso: Optional[str] = None
+    best_dt: Optional[datetime.datetime] = None
+    best_key: Optional[str] = None
+    saw_candidate = False
+
+    for item in _iter_payload_dicts(payload):
+        for key in keys:
+            if key not in item:
+                continue
+            saw_candidate = True
+            iso_val = _coerce_ts_iso(item.get(key))
+            if iso_val is None:
+                continue
+            dt_val = datetime.datetime.fromisoformat(iso_val)
+            if best_dt is None or dt_val > best_dt:
+                best_dt = dt_val
+                best_iso = iso_val
+                best_key = key
+
+    if best_iso is not None:
+        return best_iso, best_key, False
+    if saw_candidate:
+        return "INVALID", best_key, True
+    return None, None, False
+
+
+def _find_first_payload_value(payload: Any, keys: Tuple[str, ...]) -> Optional[Any]:
+    for item in _iter_payload_dicts(payload):
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _extract_payload_provenance(payload: Any) -> Dict[str, Any]:
+    event_iso, event_key, event_invalid = _find_payload_timestamp(payload, EVENT_TIME_KEYS)
+    publish_iso, publish_key, publish_invalid = _find_payload_timestamp(payload, PUBLISH_TIME_KEYS)
+    effective_iso, effective_key, effective_invalid = _find_payload_timestamp(payload, EFFECTIVE_TIME_KEYS)
+    revision = _find_first_payload_value(payload, SOURCE_REVISION_KEYS)
+
+    details: Dict[str, Any] = {}
+    if effective_iso is not None:
+        details["effective_at_utc"] = effective_iso
+    elif event_iso is not None:
+        details["effective_at_utc"] = event_iso
+    elif publish_iso is not None:
+        details["effective_at_utc"] = publish_iso
+    elif effective_invalid or event_invalid or publish_invalid:
+        details["effective_at_utc"] = "INVALID"
+
+    if event_iso is not None:
+        details["event_time_utc"] = event_iso
+    elif event_invalid:
+        details["event_time_utc"] = "INVALID"
+
+    if publish_iso is not None:
+        details["source_publish_time_utc"] = publish_iso
+    elif publish_invalid:
+        details["source_publish_time_utc"] = "INVALID"
+
+    if revision is not None:
+        details["source_revision"] = str(revision)
+
+    if any(k is not None for k in (event_key, publish_key, effective_key)):
+        details["payload_timestamp_keys"] = {
+            "event_time": event_key,
+            "source_publish_time": publish_key,
+            "effective_at": effective_key,
+        }
+    return details
+
+
+def _extract_spot_reference(payload: Any) -> Optional[float]:
+    for item in _iter_payload_dicts(payload):
+        for key in SPOT_KEYS:
+            spot_val = safe_float(item.get(key))
+            if spot_val is not None and math.isfinite(spot_val):
+                return spot_val
+    return None
+
+
+def _normalize_balance(pos: float, neg: float) -> Optional[float]:
+    total = pos + neg
+    if total <= 0 or not math.isfinite(total):
+        return None
+    imbalance = (pos - neg) / total
+    if not math.isfinite(imbalance):
+        return None
+    return max(-1.0, min(1.0, imbalance))
+
+
+def _normalize_put_call(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    norm = str(value).upper().strip()
+    if norm in CALL_ALIASES:
+        return "CALL"
+    if norm in PUT_ALIASES:
+        return "PUT"
+    return None
+
 def _build_meta(
     ctx: EndpointContext, 
     extractor_name: str, 
     lineage: Dict[str, Any], 
     details: Dict[str, Any] = None
 ) -> Dict[str, Any]:
-    
     d = {"extractor": extractor_name}
-    if details: 
-        d.update(details)
-        
+    if details:
+        d.update({_k: _serialize_dtlike(_v) for _k, _v in details.items()})
+
+    explicit_effective = d.get("effective_at_utc", d.get("effective_ts_utc"))
+    explicit_event_time = d.get("event_time_utc")
+    explicit_publish_time = d.get("source_publish_time_utc")
+
+    ctx_effective = _serialize_dtlike(getattr(ctx, "effective_ts_utc", None))
+    ctx_event_time = _serialize_dtlike(getattr(ctx, "event_time_utc", None))
+    ctx_publish_time = _serialize_dtlike(getattr(ctx, "source_publish_time_utc", None))
+    received_at = d.get("received_at_utc") or _serialize_dtlike(getattr(ctx, "received_at_utc", None))
+    processed_at = d.get("processed_at_utc") or _serialize_dtlike(getattr(ctx, "processed_at_utc", None))
+    as_of_time = (
+        d.get("as_of_time_utc")
+        or _serialize_dtlike(getattr(ctx, "as_of_time_utc", None))
+        or _serialize_dtlike(getattr(ctx, "endpoint_asof_ts_utc", None))
+    )
+    source_revision = d.get("source_revision") or getattr(ctx, "source_revision", None)
+
     eff_ts = None
-    ts_source = "missing"
-    ts_quality = "MISSING"
-    
-    if details and "effective_ts_utc" in details:
-        payload_ts = details.get("effective_ts_utc")
-        if payload_ts in (None, "INVALID"):
-            ts_source = "payload"
-            ts_quality = "INVALID"
-            eff_ts = None
-        else:
-            ts_source = "payload"
-            ts_quality = "VALID"
-            eff_ts = payload_ts
-    elif getattr(ctx, "effective_ts_utc", None):
-        ts_source = "endpoint_context"
-        ts_quality = "VALID"
-        eff_ts = ctx.effective_ts_utc.isoformat()
-        
+    ts_source = getattr(ctx, "effective_time_source", None) or "missing_provider_time"
+    ts_quality = getattr(ctx, "timestamp_quality", None) or "MISSING"
+
+    if explicit_effective in ("INVALID", None) and explicit_effective is not None:
+        eff_ts = None
+        ts_source = d.get("effective_time_source") or "payload_effective_time"
+        ts_quality = d.get("timestamp_quality") or "INVALID"
+    elif explicit_effective:
+        eff_ts = explicit_effective
+        ts_source = d.get("effective_time_source") or "payload_effective_time"
+        ts_quality = d.get("timestamp_quality") or "VALID"
+    elif explicit_event_time in ("INVALID", None) and explicit_event_time is not None:
+        eff_ts = None
+        ts_source = "event_time"
+        ts_quality = d.get("timestamp_quality") or "INVALID"
+    elif explicit_event_time:
+        eff_ts = explicit_event_time
+        ts_source = "event_time"
+        ts_quality = d.get("timestamp_quality") or "VALID"
+    elif explicit_publish_time in ("INVALID", None) and explicit_publish_time is not None:
+        eff_ts = None
+        ts_source = "source_publish_time"
+        ts_quality = d.get("timestamp_quality") or "INVALID"
+    elif explicit_publish_time:
+        eff_ts = explicit_publish_time
+        ts_source = "source_publish_time"
+        ts_quality = d.get("timestamp_quality") or "VALID"
+    elif ctx_effective:
+        eff_ts = ctx_effective
+        ts_source = getattr(ctx, "effective_time_source", None) or "endpoint_provenance"
+        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
+    elif ctx_event_time:
+        eff_ts = ctx_event_time
+        ts_source = "event_time"
+        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
+    elif ctx_publish_time:
+        eff_ts = ctx_publish_time
+        ts_source = "source_publish_time"
+        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
+
+    event_time = explicit_event_time or ctx_event_time
+    source_publish_time = explicit_publish_time or ctx_publish_time
+    lagged = bool(d.get("lagged", getattr(ctx, "lagged", False)))
+    time_provenance_degraded = bool(
+        d.get("time_provenance_degraded", getattr(ctx, "time_provenance_degraded", False))
+    )
+
     full_lineage = {
         "metric_name": lineage.get("metric_name", "unknown"),
         "source_path": ctx.path,
@@ -119,8 +337,17 @@ def _build_meta(
         "quality_policy": lineage.get("quality_policy", "None on missing"),
         "criticality": lineage.get("criticality", "NON_CRITICAL"),
         "effective_ts_utc": eff_ts,
+        "event_time": None if event_time == "INVALID" else event_time,
+        "source_publish_time": None if source_publish_time == "INVALID" else source_publish_time,
+        "received_at": received_at,
+        "processed_at": processed_at,
+        "effective_at": eff_ts,
+        "as_of_time": as_of_time,
+        "source_revision": source_revision,
         "timestamp_source": ts_source,
-        "timestamp_quality": ts_quality
+        "timestamp_quality": ts_quality,
+        "lagged": lagged,
+        "time_provenance_degraded": time_provenance_degraded,
     }
     
     return {
@@ -178,10 +405,12 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         
     close_float = safe_float(close_val)
     ts_float = _parse_strict_ts(latest_row, "t")
-    
+
     eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
-    
-    return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, {"last_ts": t_val, "effective_ts_utc": eff_ts})})
+    prov = _extract_payload_provenance(latest_row)
+    prov.update({"last_ts": t_val, "effective_at_utc": eff_ts, "event_time_utc": eff_ts})
+
+    return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, prov)})
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
     lineage = {
@@ -205,7 +434,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
     if not trades:
-        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"status": "computed_zero_from_empty_valid", "n_trades": 0})
+        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {**_extract_payload_provenance(flow_payload), "status": "computed_zero_from_empty_valid", "n_trades": 0})
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
     whale_call, whale_put = 0.0, 0.0
@@ -252,6 +481,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
 
     if valid_count == 0:
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {
+            **_extract_payload_provenance(flow_payload),
             "status": "filtered_zero_treated_as_unknown", 
             "n_raw_trades": len(trades), 
             "skipped_threshold": skip_threshold, 
@@ -262,7 +492,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
 
     net = whale_call - whale_put
-    meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {"net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
+    meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {**_extract_payload_provenance(flow_payload), "net_prem": net, "n_valid": valid_count, "n_raw": len(trades)})
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
@@ -288,8 +518,10 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     
     ts_float = _parse_strict_ts(latest, "date")
     eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
-    
-    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {"ts": latest.get("date"), "scale_used": norm_scale, "effective_ts_utc": eff_ts})
+
+    prov = _extract_payload_provenance(latest)
+    prov.update({"ts": latest.get("date"), "scale_used": norm_scale, "effective_at_utc": eff_ts, "event_time_utc": eff_ts})
+    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, prov)
     
     return FeatureBundle({
         "dealer_vanna": _normalize_signed(safe_float(latest.get("vanna_exposure")), scale=norm_scale),
@@ -330,18 +562,18 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         sign = 0.0
     else: 
         sign = 1.0 if tot_gamma > 0 else -1.0
-        
-    meta = _build_meta(ctx, "extract_gex_sign", lineage, {"total": tot_gamma, "n_strikes": valid_rows})
+
+    meta = _build_meta(ctx, "extract_gex_sign", lineage, {**_extract_payload_provenance(spot_exposures_payload), "total": tot_gamma, "n_strikes": valid_rows})
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "oi_pressure",
-        "fields_used": ["open_interest", "strike"],
-        "units_expected": "Contracts",
-        "normalization": "none",
+        "fields_used": ["open_interest", "strike", "put_call"],
+        "units_expected": "Directional Imbalance Ratio [-1, 1]",
+        "normalization": "(weighted_call_oi - weighted_put_oi) / (weighted_call_oi + weighted_put_oi)",
         "session_applicability": "RTH",
-        "quality_policy": "None on missing",
+        "quality_policy": "Suppress on missing put/call semantics or invalid directional rows",
         "criticality": "CRITICAL"
     }
     if is_na(payload) or ctx.freshness_state == "ERROR":
@@ -350,14 +582,66 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     rows = grab_list(payload)
     if not rows:
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
-        
-    total_oi = 0.0
+
+    spot_ref = _extract_spot_reference(payload)
+    weighted_call_oi = 0.0
+    weighted_put_oi = 0.0
+    directional_rows = 0
+    parsed_rows = 0
+    missing_put_call_rows = 0
+
     for r in rows:
-        val = safe_float(r.get("open_interest", 0.0))
-        if val is not None and math.isfinite(val):
-            total_oi += val
-            
-    return FeatureBundle({"oi_pressure": total_oi}, {"oi": _build_meta(ctx, "extract_oi", lineage, {"n_rows": len(rows)})})
+        oi_val = safe_float(r.get("open_interest") or r.get("oi"))
+        strike = safe_float(r.get("strike") or r.get("strike_price"))
+        pc_norm = _normalize_put_call(r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc"))
+
+        if oi_val is None or not math.isfinite(oi_val) or oi_val < 0:
+            continue
+        parsed_rows += 1
+        if pc_norm is None:
+            missing_put_call_rows += 1
+            continue
+
+        weight = 1.0
+        if spot_ref is not None and strike is not None and math.isfinite(strike):
+            spot_band = max(abs(spot_ref) * 0.02, 1.0)
+            weight = 1.0 / (1.0 + abs(strike - spot_ref) / spot_band)
+
+        directional_rows += 1
+        if pc_norm == "CALL":
+            weighted_call_oi += oi_val * weight
+        else:
+            weighted_put_oi += oi_val * weight
+
+    if directional_rows == 0:
+        logger.warning(
+            "unsafe_oi_pressure_suppressed",
+            extra={"counter": "unsafe_directional_metric_suppressed", "feature_key": "oi_pressure", "reason": "missing_put_call_or_directional_rows"},
+        )
+        meta = _build_meta(ctx, "extract_oi", lineage, {
+            **_extract_payload_provenance(payload),
+            "n_rows": len(rows),
+            "parsed_rows": parsed_rows,
+            "missing_put_call_rows": missing_put_call_rows,
+            "status": "suppressed_directionless_oi_total",
+            "suppression_reason": "missing_put_call_or_directional_rows",
+            "spot_reference": spot_ref,
+        })
+        meta["na_reason"] = "missing_put_call_or_directional_rows"
+        return FeatureBundle({"oi_pressure": None}, {"oi": meta})
+
+    pressure = _normalize_balance(weighted_call_oi, weighted_put_oi)
+    meta = _build_meta(ctx, "extract_oi", lineage, {
+        **_extract_payload_provenance(payload),
+        "n_rows": len(rows),
+        "parsed_rows": parsed_rows,
+        "directional_rows": directional_rows,
+        "weighted_call_oi": weighted_call_oi,
+        "weighted_put_oi": weighted_put_oi,
+        "spot_reference": spot_ref,
+        "weighting": "near_spot_inverse_distance" if spot_ref is not None else "unweighted_call_put_balance",
+    })
+    return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
 
 def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -380,7 +664,7 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
     if val is None or not math.isfinite(val):
         return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, "missing_iv_rank")})
     
-    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, {})})
+    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, _extract_payload_provenance(payload))})
 
 def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -412,7 +696,7 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
     valid_pts.sort(key=lambda x: x[0])
     slope = valid_pts[-1][1] - valid_pts[0][1]
     
-    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {"n_rows": len(valid_pts)})})
+    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)})})
 
 def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
@@ -440,16 +724,16 @@ def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     if skew_val is None or not math.isfinite(skew_val):
         return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "missing_or_invalid_skew")})
         
-    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, {})})
+    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, _extract_payload_provenance(payload))})
 
 def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "darkpool_pressure",
-        "fields_used": ["volume", "price", "size"],
-        "units_expected": "Total Notional USD",
-        "normalization": "none",
+        "fields_used": ["volume", "price", "size", "side"],
+        "units_expected": "Directional Imbalance Ratio [-1, 1]",
+        "normalization": "Suppress unless explicit side semantics exist; otherwise (buy_notional - sell_notional) / total_notional",
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
-        "quality_policy": "None on missing",
+        "quality_policy": "Suppress on directionless totals",
         "criticality": "NON_CRITICAL"
     }
     if is_na(payload) or ctx.freshness_state == "ERROR":
@@ -458,23 +742,50 @@ def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBund
     rows = grab_list(payload)
     if not rows:
         return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, "no_rows")})
-        
-    total_notional = 0.0
+
+    buy_notional = 0.0
+    sell_notional = 0.0
+    explicit_side_rows = 0
+    valid_rows = 0
     for r in rows:
         vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
         price = safe_float(r.get("price", 0)) or 0.0
         notional = vol * price
-        if math.isfinite(notional):
-            total_notional += notional
-            
-    return FeatureBundle({"darkpool_pressure": total_notional}, {"darkpool": _build_meta(ctx, "extract_darkpool", lineage, {"n_rows": len(rows)})})
+        if not math.isfinite(notional):
+            continue
+        valid_rows += 1
+        side = str(r.get("side", "")).upper().strip()
+        if side in BULLISH_SIDE_ALIASES:
+            buy_notional += notional
+            explicit_side_rows += 1
+        elif side in BEARISH_SIDE_ALIASES:
+            sell_notional += notional
+            explicit_side_rows += 1
+
+    if explicit_side_rows == 0:
+        logger.warning(
+            "unsafe_darkpool_pressure_suppressed",
+            extra={"counter": "unsafe_directional_metric_suppressed", "feature_key": "darkpool_pressure", "reason": "directionless_total"},
+        )
+        meta = _build_meta(ctx, "extract_darkpool", lineage, {
+            **_extract_payload_provenance(payload),
+            "n_rows": len(rows),
+            "valid_rows": valid_rows,
+            "status": "suppressed_directionless_darkpool_total",
+            "suppression_reason": "directionless_total",
+        })
+        meta["na_reason"] = "directionless_total"
+        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": meta})
+
+    pressure = _normalize_balance(buy_notional, sell_notional)
+    return FeatureBundle({"darkpool_pressure": pressure}, {"darkpool": _build_meta(ctx, "extract_darkpool", lineage, {**_extract_payload_provenance(payload), "n_rows": len(rows), "explicit_side_rows": explicit_side_rows, "buy_notional": buy_notional, "sell_notional": sell_notional})})
 
 def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = {
         "metric_name": "litflow_pressure",
         "fields_used": ["volume", "price", "side", "size"],
-        "units_expected": "Net Notional USD",
-        "normalization": "none",
+        "units_expected": "Directional Imbalance Ratio [-1, 1]",
+        "normalization": "(buy_notional - sell_notional) / total_notional",
         "session_applicability": "RTH",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
@@ -485,8 +796,10 @@ def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundl
     rows = grab_list(payload)
     if not rows:
         return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, "no_rows")})
-        
-    net_notional = 0.0
+
+    buy_notional = 0.0
+    sell_notional = 0.0
+    side_rows = 0
     for r in rows:
         vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
         price = safe_float(r.get("price", 0)) or 0.0
@@ -496,12 +809,22 @@ def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundl
         if not math.isfinite(notional):
             continue
             
-        if side in ("ASK", "BUY", "BULL", "BULLISH"):
-            net_notional += notional
-        elif side in ("BID", "SELL", "BEAR", "BEARISH"):
-            net_notional -= notional
-            
-    return FeatureBundle({"litflow_pressure": net_notional}, {"litflow": _build_meta(ctx, "extract_litflow", lineage, {"n_rows": len(rows)})})
+        if side in BULLISH_SIDE_ALIASES:
+            buy_notional += notional
+            side_rows += 1
+        elif side in BEARISH_SIDE_ALIASES:
+            sell_notional += notional
+            side_rows += 1
+
+    pressure = _normalize_balance(buy_notional, sell_notional)
+    meta = _build_meta(ctx, "extract_litflow", lineage, {
+        **_extract_payload_provenance(payload),
+        "n_rows": len(rows),
+        "side_rows": side_rows,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+    })
+    return FeatureBundle({"litflow_pressure": pressure}, {"litflow": meta})
 
 EXTRACTOR_REGISTRY = {
     "/api/stock/{ticker}/spot-exposures": "GEX",

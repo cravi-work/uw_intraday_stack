@@ -85,9 +85,9 @@ model:
     net_gamma_exposure_notional: 0.25
     dealer_vanna: 0.5
     dealer_charm: 0.35
-    oi_pressure: 0.55
-    darkpool_pressure: 0.35
-    litflow_pressure: 0.35
+    oi_pressure: 0.30
+    darkpool_pressure: 0.0
+    litflow_pressure: 0.25
     vol_term_slope: 0.15
     vol_skew: 0.10
     iv_rank: 0.05
