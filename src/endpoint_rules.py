@@ -83,10 +83,12 @@ def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
     missing = []
     for tier, eps in plan_yaml.get("plans", {}).items():
         for ep in eps:
+            if str(ep.get("purpose", "")).strip() == "disabled":
+                continue
             method = ep.get("method", "GET").upper()
             path = ep.get("path", "")
             if (method, path) not in RULE_REGISTRY:
                 missing.append(f"{method} {path}")
-    
+
     if missing:
         logger.warning(f"Missing explicit endpoint rules for: {missing}. Define them in src/endpoint_rules.py to prevent silent defaults.")

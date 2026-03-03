@@ -18,10 +18,23 @@ def test_prediction_schema_columns_freeze():
     EVIDENCE: Prediction schema columns used by validation/reporting are frozen.
     """
     schema_upper = SCHEMA_SQL.upper()
+    assert "PREDICTION_BUSINESS_KEY" in schema_upper
+    assert "TARGET_NAME" in schema_upper
+    assert "TARGET_VERSION" in schema_upper
+    assert "LABEL_VERSION" in schema_upper
+    assert "FEATURE_VERSION" in schema_upper
+    assert "CALIBRATION_VERSION" in schema_upper
+    assert "THRESHOLD_POLICY_VERSION" in schema_upper
+    assert "REPLAY_MODE" in schema_upper
+    assert "OOD_STATE" in schema_upper
+    assert "SUPPRESSION_REASON" in schema_upper
+    assert "PROBABILITY_CONTRACT_JSON" in schema_upper
     assert "DECISION_STATE" in schema_upper
     assert "ALIGNMENT_STATUS" in schema_upper
     assert "DECISION_WINDOW_ID" in schema_upper
     assert "CRITICAL_MISSING_COUNT" in schema_upper
+    assert "SOURCE_PUBLISH_TIME_UTC" in schema_upper
+    assert "SOURCE_REVISION" in schema_upper
 
 def test_decision_gate_shape_freeze():
     """

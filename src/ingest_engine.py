@@ -12,8 +12,15 @@ from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .api_catalog_loader import load_api_catalog
-from .config_loader import load_endpoint_plan
+from .adapt import validate_adapt_config
+from .config_loader import (
+    find_unsupported_config_keys,
+    load_endpoint_plan,
+    normalize_runtime_config,
+    summarize_effective_runtime_config,
+)
 from .file_lock import FileLock, FileLockError
+from .logging_config import log_prediction_decision, structured_log
 from .scheduler import ET, UTC, coerce_session_state, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
@@ -62,22 +69,32 @@ class PlannedCall:
     path_params: Dict[str, Any]
     query_params: Dict[str, Any]
     is_market: bool
+    purpose: str = "signal-critical"
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
+    normalized = normalize_runtime_config(cfg)
+    cfg.clear()
+    cfg.update(normalized)
+
     req = ["ingestion", "storage", "system", "network", "validation"]
     for s in req:
         if s not in cfg:
             raise KeyError(f"Config missing section: {s}")
-            
+
+    unsupported = find_unsupported_config_keys(cfg)
+    if unsupported:
+        first_path = sorted(unsupported.keys())[0]
+        raise ValueError(f"Unsupported config key '{first_path}': {unsupported[first_path]}")
+
     for k in ["duckdb_path", "cycle_lock_path", "writer_lock_path"]:
         if k not in cfg["storage"]:
             raise KeyError(f"Missing storage.{k}")
-            
+
     if "watchlist" not in cfg["ingestion"]:
         raise KeyError("Missing ingestion.watchlist")
     if "cadence_minutes" not in cfg["ingestion"]:
         raise KeyError("Missing ingestion.cadence_minutes")
-        
+
     val_cfg = cfg.get("validation", {})
     if "horizons_minutes" not in val_cfg:
         raise KeyError("Missing validation.horizons_minutes")
@@ -88,19 +105,18 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         raise KeyError("Missing validation.emit_to_close_horizon")
     if "use_default_required_features" not in val_cfg:
         raise KeyError("Missing validation.use_default_required_features")
-        
-    # Task 6 & 12: Strict checks for hidden defaults (Including validator thresholds)
+
     for key in ["invalid_after_minutes", "fallback_max_age_minutes", "tolerance_minutes", "max_horizon_drift_minutes"]:
         if key not in val_cfg:
             raise KeyError(f"Missing validation.{key}")
         if type(val_cfg[key]) is not int or val_cfg[key] <= 0:
             raise ValueError(f"validation.{key} must be a positive integer")
-            
+
     if "flat_threshold_pct" not in val_cfg:
         raise KeyError("Missing validation.flat_threshold_pct")
     if not isinstance(val_cfg["flat_threshold_pct"], (float, int)) or val_cfg["flat_threshold_pct"] < 0:
         raise ValueError("validation.flat_threshold_pct must be a positive float")
-            
+
     if "horizon_weights_source" not in val_cfg:
         raise KeyError("Missing validation.horizon_weights_source")
 
@@ -114,7 +130,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
 
     if "horizon_critical_features" not in val_cfg:
         raise KeyError("Missing validation.horizon_critical_features")
-    
+
     for h in horizons:
         if h not in val_cfg["horizon_critical_features"]:
             raise KeyError(f"Missing validation.horizon_critical_features for horizon '{h}'")
@@ -127,12 +143,51 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         for h in horizons:
             if h not in val_cfg["horizon_weights_overrides"]:
                 raise KeyError(f"Missing validation.horizon_weights_overrides for horizon '{h}'")
+        inactive_explicit = val_cfg.get("horizon_weights") or {}
+        if isinstance(inactive_explicit, dict) and any(bool(v) for v in inactive_explicit.values()):
+            raise ValueError("validation.horizon_weights must be empty when validation.horizon_weights_source='model'")
     elif src == "explicit":
         if "horizon_weights" not in val_cfg:
             raise KeyError("Missing validation.horizon_weights")
         for h in horizons:
             if h not in val_cfg["horizon_weights"]:
                 raise KeyError(f"Missing validation.horizon_weights for horizon '{h}'")
+        inactive_overrides = val_cfg.get("horizon_weights_overrides") or {}
+        if isinstance(inactive_overrides, dict) and any(bool(v) for v in inactive_overrides.values()):
+            raise ValueError("validation.horizon_weights_overrides must be empty when validation.horizon_weights_source='explicit'")
+
+    label_contract = val_cfg.get("label_contract")
+    if label_contract is not None:
+        if not isinstance(label_contract, dict):
+            raise ValueError("validation.label_contract must be a mapping")
+        for key in ["label_version", "session_boundary_rule", "flat_threshold_policy", "threshold_policy_version"]:
+            if key not in label_contract or not str(label_contract[key]).strip():
+                raise KeyError(f"Missing validation.label_contract.{key}")
+
+    model_cfg = cfg.get("model", {})
+    if model_cfg:
+        if not isinstance(model_cfg, dict):
+            raise ValueError("model section must be a mapping")
+        target_spec = model_cfg.get("target_spec")
+        if target_spec is not None:
+            if not isinstance(target_spec, dict):
+                raise ValueError("model.target_spec must be a mapping")
+            for key in ["target_name", "target_version"]:
+                if key not in target_spec or not str(target_spec[key]).strip():
+                    raise KeyError(f"Missing model.target_spec.{key}")
+        calibration = model_cfg.get("calibration")
+        if calibration is not None:
+            if not isinstance(calibration, dict):
+                raise ValueError("model.calibration must be a mapping")
+            for key in ["artifact_name", "artifact_version", "bins", "mapped"]:
+                if key not in calibration:
+                    raise KeyError(f"Missing model.calibration.{key}")
+            bins = calibration.get("bins") or []
+            mapped = calibration.get("mapped") or []
+            if len(bins) != len(mapped) or len(bins) < 2:
+                raise ValueError("model.calibration bins/mapped must be same length and contain at least 2 points")
+
+    validate_adapt_config(cfg)
 
     unknown_keys = set()
 
@@ -153,24 +208,67 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     if unknown_keys:
         raise ValueError(f"Unknown feature keys in config: {sorted(list(unknown_keys))}")
 
+    logger.info(
+        "Runtime config contract validated",
+        extra={"json": {"effective_runtime_config": summarize_effective_runtime_config(cfg)}},
+    )
+
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
-    def _parse(l, market: bool = False) -> List[PlannedCall]:
-        return [
-            PlannedCall(
-                x["name"], 
-                x["method"], 
-                x["path"], 
-                x.get("path_params", {}) or {}, 
-                x.get("query_params", {}) or {}, 
-                market
-            ) for x in (l or [])
-        ]
-        
+    def _parse(entries, market: bool = False) -> List[PlannedCall]:
+        planned: List[PlannedCall] = []
+        for x in (entries or []):
+            purpose = str(x.get("purpose", "signal-critical")).strip() or "signal-critical"
+            if purpose == "disabled":
+                continue
+            planned.append(
+                PlannedCall(
+                    x["name"],
+                    x["method"],
+                    x["path"],
+                    x.get("path_params", {}) or {},
+                    x.get("query_params", {}) or {},
+                    market,
+                    purpose,
+                )
+            )
+        return planned
+
     core = _parse(plan_yaml.get("plans", {}).get("default", []))
     market = []
     if cfg["ingestion"].get("enable_market_context"):
         market = _parse(plan_yaml.get("plans", {}).get("market_context", []), True)
     return core, market
+
+
+
+def summarize_effective_endpoint_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Dict[str, Any]:
+    plans = plan_yaml.get("plans", {}) or {}
+    market_enabled = bool(cfg.get("ingestion", {}).get("enable_market_context"))
+
+    def _entries(section: str, market: bool) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for entry in plans.get(section, []) or []:
+            purpose = str(entry.get("purpose", "signal-critical")).strip() or "signal-critical"
+            items.append({
+                "name": entry.get("name"),
+                "method": str(entry.get("method", "GET")).upper(),
+                "path": entry.get("path"),
+                "purpose": purpose,
+                "is_market": market,
+            })
+        return items
+
+    default_entries = _entries("default", False)
+    market_entries = _entries("market_context", True)
+    fetched_market_entries = [x for x in market_entries if market_enabled and x["purpose"] != "disabled"]
+
+    return {
+        "market_context_enabled": market_enabled,
+        "fetched_default": [x for x in default_entries if x["purpose"] != "disabled"],
+        "disabled_default": [x for x in default_entries if x["purpose"] == "disabled"],
+        "fetched_market_context": fetched_market_entries,
+        "disabled_market_context": [x for x in market_entries if x["purpose"] == "disabled"],
+    }
 
 def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     def _sub(v):
@@ -256,71 +354,92 @@ def _assessment_dq_reason(feature_key: str, assessment: Optional[FeaturePolicyAs
 
 def _log_feature_policy_assessment(assessment: FeaturePolicyAssessment) -> None:
     feature_key = assessment.feature_key
+    shared = {
+        "feature_key": feature_key,
+        "reason": assessment.reason.value,
+        "reason_detail": assessment.reason_detail,
+        "policy": assessment.policy.name,
+        "lag_class": assessment.policy.lag_class.value,
+        "criticality": assessment.policy.criticality.value,
+        "join_skew_tolerance_seconds": assessment.policy.join_skew_tolerance_seconds,
+        "max_tolerated_age_seconds": assessment.policy.max_tolerated_age_seconds,
+        "delta_sec": int(assessment.delta_seconds or 0) if assessment.delta_seconds is not None else None,
+        "stale_age_seconds": assessment.stale_age_seconds,
+        "policy_source": assessment.policy_source,
+        "dq_reason_code": assessment.dq_reason_code,
+    }
+
     if assessment.reason == FeatureDecisionReason.MISSING_EFFECTIVE_TS:
-        logger.warning(
-            f"feature_missing_effective_ts: {feature_key}",
-            extra={"counter": "feature_missing_effective_ts", "feature_key": feature_key},
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="missing_effective_timestamp",
+            msg=f"feature_missing_effective_ts: {feature_key}",
+            counter="feature_missing_effective_ts",
+            **shared,
         )
     elif assessment.reason == FeatureDecisionReason.INVALID_EFFECTIVE_TS:
-        detail = assessment.reason_detail or "malformed"
-        if detail == "naive_timezone":
-            logger.warning(
-                f"feature_invalid_effective_ts (naive timezone): {feature_key}",
-                extra={"counter": "feature_invalid_effective_ts", "feature_key": feature_key},
-            )
-        else:
-            logger.warning(
-                f"feature_invalid_effective_ts (malformed): {feature_key}",
-                extra={"counter": "feature_invalid_effective_ts", "feature_key": feature_key},
-            )
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="invalid_effective_timestamp",
+            msg=(f"feature_invalid_effective_ts (naive timezone): {feature_key}" if assessment.reason_detail == "naive_timezone" else f"feature_invalid_effective_ts (malformed): {feature_key}"),
+            counter="feature_invalid_effective_ts",
+            **shared,
+        )
     elif assessment.reason == FeatureDecisionReason.FUTURE_TS_VIOLATION:
-        logger.warning(
-            f"future_ts_violation: {feature_key} is ahead of asof_utc by {abs(int(assessment.delta_seconds or 0))}s",
-            extra={
-                "counter": "future_ts_violation_count",
-                "feature_key": feature_key,
-                "delta_sec": int(assessment.delta_seconds or 0),
-            },
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="future_timestamp_violation",
+            msg=f"future_ts_violation: {feature_key} is ahead of asof_utc by {abs(int(assessment.delta_seconds or 0))}s",
+            counter="future_ts_violation_count",
+            **shared,
         )
     elif assessment.reason == FeatureDecisionReason.JOIN_SKEW_VIOLATION:
-        delta_sec = int(assessment.delta_seconds or 0)
-        logger.warning(
-            f"alignment_violation: {feature_key} misaligned by {delta_sec}s",
-            extra={
-                "counter": "join_skew_violation_count",
-                "feature_key": feature_key,
-                "delta_sec": delta_sec,
-                "policy": assessment.policy.name,
-            },
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="join_skew_failure",
+            msg=f"alignment_violation: {feature_key} misaligned by {int(assessment.delta_seconds or 0)}s",
+            counter="join_skew_violation_count",
+            **shared,
         )
     elif assessment.reason == FeatureDecisionReason.STALE_ENDPOINT_REJECTED:
-        logger.warning(
-            f"stale_endpoint_rejected: {feature_key}",
-            extra={
-                "counter": "stale_endpoint_rejection_count",
-                "feature_key": feature_key,
-                "reason": assessment.reason_detail,
-                "policy": assessment.policy.name,
-            },
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="stale_endpoint",
+            msg=f"stale_endpoint_rejected: {feature_key}",
+            counter="stale_endpoint_rejection_count",
+            **shared,
         )
     elif assessment.reason == FeatureDecisionReason.CARRY_FORWARD_SUPPRESSED:
-        logger.warning(
-            f"carry_forward_suppressed: {feature_key}",
-            extra={
-                "counter": "carry_forward_suppression_count",
-                "feature_key": feature_key,
-                "reason": assessment.reason_detail,
-                "policy": assessment.policy.name,
-            },
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="carry_forward_suppressed",
+            msg=f"carry_forward_suppressed: {feature_key}",
+            counter="carry_forward_suppression_count",
+            **shared,
         )
     elif assessment.reason == FeatureDecisionReason.TIME_PROVENANCE_SUPPRESSED:
-        logger.warning(
-            f"time_provenance_suppressed: {feature_key}",
-            extra={
-                "counter": "time_provenance_suppression_count",
-                "feature_key": feature_key,
-                "policy": assessment.policy.name,
-            },
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="time_provenance_suppressed",
+            msg=f"time_provenance_suppressed: {feature_key}",
+            counter="time_provenance_suppression_count",
+            **shared,
+        )
+    elif assessment.reason == FeatureDecisionReason.MISSING_OR_INVALID_VALUE:
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="invalid_feature",
+            msg=f"feature missing or invalid value: {feature_key}",
+            counter="invalid_feature_count",
+            **shared,
         )
 
 
@@ -802,6 +921,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
     validate_plan_coverage(plan_yaml)
     
     core, market = build_plan(cfg, plan_yaml)
+    logger.info(
+        "Endpoint plan resolved",
+        extra={"json": {"effective_endpoint_plan": summarize_effective_endpoint_plan(cfg, plan_yaml)}},
+    )
     tickers = [t.upper() for t in cfg["ingestion"]["watchlist"]]
 
     val_cfg = cfg["validation"]
@@ -850,7 +973,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
         
         async with UwClient(
             registry=registry, 
-            base_url=net.get("base_url", "https://api.unusualwhales.com"),
+            base_url=net.get("base_url") or sys_cfg.get("base_url") or "https://api.unusualwhales.com",
             api_key_env=sys_cfg.get("api_key_env", "UW_API_KEY"), 
             timeout_seconds=net.get("timeout_seconds", 10.0),
             max_retries=net.get("max_retries", 3), 
@@ -1097,9 +1220,16 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             f_val = f.get("feature_value")
                             
                             if f_val is not None and not _is_valid_num(f_val):
-                                logger.warning(
-                                    f"Malformed feature row (non-finite value): {f}", 
-                                    extra={"counter": "malformed_rows_dropped"}
+                                structured_log(
+                                    logger,
+                                    logging.WARNING,
+                                    event="invalid_feature",
+                                    msg="malformed feature row dropped (non-finite value)",
+                                    counter="invalid_feature_count",
+                                    row_type="feature",
+                                    feature_key=f_key,
+                                    row=f,
+                                    reason="non_finite_value",
                                 )
                                 malformed_count += 1
                                 continue
@@ -1113,9 +1243,15 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 valid_features.append(f) 
                                 continue
                         
-                        logger.warning(
-                            f"Malformed feature row skipped: {f}", 
-                            extra={"counter": "malformed_rows_dropped"}
+                        structured_log(
+                            logger,
+                            logging.WARNING,
+                            event="invalid_feature",
+                            msg="malformed feature row dropped",
+                            counter="invalid_feature_count",
+                            row_type="feature",
+                            row=f,
+                            reason="contract_shape_invalid",
                         )
                         malformed_count += 1
 
@@ -1125,9 +1261,16 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             m = l.get("magnitude")
                             
                             if (p is not None and not _is_valid_num(p)) or (m is not None and not _is_valid_num(m)):
-                                logger.warning(
-                                    f"Malformed level row (non-finite value): {l}", 
-                                    extra={"counter": "malformed_rows_dropped"}
+                                structured_log(
+                                    logger,
+                                    logging.WARNING,
+                                    event="invalid_feature",
+                                    msg="malformed derived level dropped (non-finite value)",
+                                    counter="invalid_feature_count",
+                                    row_type="derived_level",
+                                    level_type=l.get("level_type"),
+                                    row=l,
+                                    reason="non_finite_value",
                                 )
                                 malformed_count += 1
                                 continue
@@ -1137,9 +1280,15 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 valid_levels.append(l) 
                                 continue
                         
-                        logger.warning(
-                            f"Malformed level row skipped: {l}", 
-                            extra={"counter": "malformed_rows_dropped"}
+                        structured_log(
+                            logger,
+                            logging.WARNING,
+                            event="invalid_feature",
+                            msg="malformed derived level dropped",
+                            counter="invalid_feature_count",
+                            row_type="derived_level",
+                            row=l,
+                            reason="contract_shape_invalid",
                         )
                         malformed_count += 1
 
@@ -1166,7 +1315,10 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     db.insert_levels(con, snapshot_id, valid_levels)
                     
                     for p in predictions:
-                        db.insert_prediction(con, p)
+                        prediction_id = db.insert_prediction(con, p)
+                        if isinstance(p, dict):
+                            p.setdefault("prediction_id", prediction_id)
+                        log_prediction_decision(logger, p, ticker=tkr, asof_ts_utc=asof_utc)
 
                 db.end_run(con, run_id)
 

@@ -2,59 +2,106 @@
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-# STRICT UNIDIRECTIONAL IMPORT: Only depends on neutral 'na' module. 
+# STRICT UNIDIRECTIONAL IMPORT: Only depends on neutral 'na' module.
 # NO imports from .features are present. _find_first is explicitly removed.
 from .na import safe_float, grab_list
 from .instruments import contract_scale, normalize_option_rows, normalized_contract_map
 
 logger = logging.getLogger(__name__)
 
+DERIVED_LEVEL_USAGE_CONTRACT_VERSION = "derived_level_usage/v1"
+DERIVED_LEVEL_DECISION_PATH_ROLE = "report-only"
+DERIVED_LEVEL_FEATURE_CONTRACT_STATE = "DEMOTED"
+DERIVED_LEVEL_DEMOTION_REASON = "not_promoted_to_bounded_feature_contract"
+
+_DERIVED_LEVEL_FAMILY_BY_TYPE = {
+    "GEX_POS_MAX": "GEX",
+    "GEX_NEG_MAX": "GEX",
+    "GEX_FLIP": "GEX",
+    "OI_GENERIC_WALL": "OI",
+    "CALL_WALL": "OI",
+    "PUT_WALL": "OI",
+    "DARKPOOL_MAX_VOL": "DARKPOOL",
+}
+
+
+def derived_level_usage_contract(level_type: str) -> Dict[str, Any]:
+    """Return the explicit model-usage contract for a persisted derived level."""
+    level_type_str = str(level_type or "UNKNOWN")
+    return {
+        "contract_version": DERIVED_LEVEL_USAGE_CONTRACT_VERSION,
+        "level_type": level_type_str,
+        "level_family": _DERIVED_LEVEL_FAMILY_BY_TYPE.get(level_type_str, "UNKNOWN"),
+        "decision_path_role": DERIVED_LEVEL_DECISION_PATH_ROLE,
+        "prediction_consumed": False,
+        "model_input_eligible": False,
+        "feature_contract_state": DERIVED_LEVEL_FEATURE_CONTRACT_STATE,
+        "demotion_reason": DERIVED_LEVEL_DEMOTION_REASON,
+        "reporting_visible": True,
+    }
+
+
+def reporting_only_derived_level_types() -> Tuple[str, ...]:
+    return tuple(sorted(_DERIVED_LEVEL_FAMILY_BY_TYPE.keys()))
+
+
+def is_prediction_consumed_derived_level(level_type: str) -> bool:
+    return bool(derived_level_usage_contract(level_type).get("prediction_consumed", False))
+
+
+def _attach_reporting_contract(level_type: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged = dict(details or {})
+    merged["derived_level_contract"] = derived_level_usage_contract(level_type)
+    return merged
+
+
 def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
     """
     Computes key gamma exposure (GEX) levels from spot-exposures payload.
+    These levels are persisted for reporting/analytics only and are not model inputs.
     Returns: list of (level_type, price, magnitude, details)
     """
     rows = grab_list(payload)
     if not rows:
         return []
-        
+
     parsed = []
     for r in rows:
         strike = safe_float(r.get("strike") or r.get("strike_price"))
         gex = safe_float(r.get("gamma_exposure") or r.get("gex") or r.get("gamma") or r.get("total_gamma"))
         if strike is not None and gex is not None:
             parsed.append({"strike": strike, "gex": gex})
-            
+
     if not parsed:
         return []
-        
+
     pos_sorted = sorted([p for p in parsed if p["gex"] > 0], key=lambda x: (-x["gex"], x["strike"]))
     neg_sorted = sorted([p for p in parsed if p["gex"] < 0], key=lambda x: (x["gex"], x["strike"]))
-    
+
     levels = []
     if pos_sorted:
-        levels.append(("GEX_POS_MAX", pos_sorted[0]["strike"], pos_sorted[0]["gex"], {
+        levels.append(("GEX_POS_MAX", pos_sorted[0]["strike"], pos_sorted[0]["gex"], _attach_reporting_contract("GEX_POS_MAX", {
             "input_rows": len(rows), "parsed_rows": len(parsed)
-        }))
-        
+        })))
+
     if neg_sorted:
-        levels.append(("GEX_NEG_MAX", neg_sorted[0]["strike"], neg_sorted[0]["gex"], {
+        levels.append(("GEX_NEG_MAX", neg_sorted[0]["strike"], neg_sorted[0]["gex"], _attach_reporting_contract("GEX_NEG_MAX", {
             "input_rows": len(rows), "parsed_rows": len(parsed)
-        }))
-        
+        })))
+
     # Task 6: True Sign-Crossing Interpolation for GEX_FLIP
     strike_sorted = sorted(parsed, key=lambda x: x["strike"])
     crossings = []
-    
+
     for i in range(len(strike_sorted) - 1):
         p1 = strike_sorted[i]
         p2 = strike_sorted[i+1]
-        
+
         # Detect adjacent strikes where gamma exposure changes sign
         if p1["gex"] * p2["gex"] < 0:
             g_range = p2["gex"] - p1["gex"]
             s_range = p2["strike"] - p1["strike"]
-            
+
             if g_range != 0:
                 flip_strike = p1["strike"] - p1["gex"] * (s_range / g_range)
                 crossings.append({
@@ -63,24 +110,26 @@ def build_gex_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[
                     "p1_strike": p1["strike"],
                     "p2_strike": p2["strike"]
                 })
-                
+
     if crossings:
         # Pick the crossing with the most significant gamma transition
         best_crossing = sorted(crossings, key=lambda x: (-x["gradient"], x["flip_strike"]))[0]
-        levels.append(("GEX_FLIP", round(best_crossing["flip_strike"], 4), None, {
-            "input_rows": len(rows), 
-            "parsed_rows": len(parsed), 
+        levels.append(("GEX_FLIP", round(best_crossing["flip_strike"], 4), None, _attach_reporting_contract("GEX_FLIP", {
+            "input_rows": len(rows),
+            "parsed_rows": len(parsed),
             "method": "sign_crossing_interpolation",
             "p1_strike": best_crossing["p1_strike"],
             "p2_strike": best_crossing["p2_strike"]
-        }))
-        
+        })))
+
     return levels
+
 
 def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
     """
     Computes primary Option Interest (OI) support/resistance levels.
     Contract-level rows are normalized to canonical option identity before magnitude comparison.
+    These levels are persisted for reporting/analytics only and are not model inputs.
     """
     rows = grab_list(payload)
     if not rows:
@@ -145,7 +194,7 @@ def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str
         sorted_oi = sorted(parsed, key=lambda x: (-x["oi"], x["strike"]))
         details = dict(base_details)
         details["degraded_reason"] = "missing_put_call"
-        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], details))
+        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], _attach_reporting_contract("OI_GENERIC_WALL", details)))
         return levels
 
     if spot is None:
@@ -153,7 +202,7 @@ def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str
         sorted_oi = sorted(parsed, key=lambda x: (-x["oi"], x["strike"]))
         details = dict(base_details)
         details["degraded_reason"] = "missing_spot"
-        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], details))
+        levels.append(("OI_GENERIC_WALL", sorted_oi[0]["strike"], sorted_oi[0]["oi"], _attach_reporting_contract("OI_GENERIC_WALL", details)))
         return levels
 
     # Directional Walls.
@@ -164,47 +213,50 @@ def build_oi_walls(payload: Any, spot: Optional[float] = None) -> List[Tuple[str
         sorted_calls = sorted(calls, key=lambda x: (-x["oi"], x["strike"]))
         details = dict(base_details)
         details["spot_reference"] = spot
-        levels.append(("CALL_WALL", sorted_calls[0]["strike"], sorted_calls[0]["oi"], details))
+        levels.append(("CALL_WALL", sorted_calls[0]["strike"], sorted_calls[0]["oi"], _attach_reporting_contract("CALL_WALL", details)))
 
     if puts:
         sorted_puts = sorted(puts, key=lambda x: (-x["oi"], x["strike"]))
         details = dict(base_details)
         details["spot_reference"] = spot
-        levels.append(("PUT_WALL", sorted_puts[0]["strike"], sorted_puts[0]["oi"], details))
+        levels.append(("PUT_WALL", sorted_puts[0]["strike"], sorted_puts[0]["oi"], _attach_reporting_contract("PUT_WALL", details)))
 
     return levels
+
 
 def build_darkpool_levels(payload: Any) -> List[Tuple[str, Optional[float], Optional[float], Dict[str, Any]]]:
     """
     Computes key darkpool block levels based on volume clustering.
+    These levels are persisted for reporting/analytics only and are not model inputs.
     """
     rows = grab_list(payload)
     if not rows:
         return []
-        
+
     parsed = []
     for r in rows:
         price = safe_float(r.get("price"))
         vol = safe_float(r.get("volume")) or safe_float(r.get("size"))
         if price is not None and vol is not None:
             parsed.append({"price": price, "vol": vol})
-            
+
     if not parsed:
         return []
-        
+
     # Aggregate volume by tight price node
     agg = {}
     for p in parsed:
         pr = round(p["price"], 2)
         agg[pr] = agg.get(pr, 0.0) + p["vol"]
-        
+
     if not agg:
         return []
-        
+
     sorted_levels = sorted(agg.items(), key=lambda x: (-x[1], x[0]))
-    return [("DARKPOOL_MAX_VOL", sorted_levels[0][0], sorted_levels[0][1], {
+    return [("DARKPOOL_MAX_VOL", sorted_levels[0][0], sorted_levels[0][1], _attach_reporting_contract("DARKPOOL_MAX_VOL", {
         "input_rows": len(rows), "parsed_nodes": len(agg)
-    })]
+    }))]
+
 
 # Fixed: Changed "module" to "module_name" to prevent LogRecord KeyErrors
 logger.info("Analytics module initialized successfully", extra={"event": "module_init", "module_name": "analytics"})

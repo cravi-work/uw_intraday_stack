@@ -162,3 +162,47 @@ def test_unparseable_display_symbol_suppresses_greek_metric():
     assert bundle.features["net_gamma_exposure_notional"] is None
     assert bundle.meta["greeks"]["na_reason"] == "display_symbol_only_identity"
     assert bundle.meta["greeks"]["details"]["contract_normalization"]["status"] == "INVALID"
+
+
+
+def test_missing_multiplier_suppresses_contract_level_oi_metric():
+    ctx = _mock_ctx()
+    payload = [
+        {
+            "underlying": "AAPL",
+            "expiration": "2026-06-19",
+            "strike": 150.0,
+            "put_call": "CALL",
+            "open_interest": 10.0,
+        }
+    ]
+
+    bundle = extract_oi_features(payload, ctx)
+
+    assert bundle.features["oi_pressure"] is None
+    assert bundle.meta["oi"]["na_reason"] == "missing_multiplier"
+    assert bundle.meta["oi"]["details"]["contract_normalization"]["status"] == "INVALID"
+
+
+
+def test_unparsed_deliverable_suppresses_contract_level_flow_metric():
+    ctx = _mock_ctx("/api/stock/{ticker}/flow-recent")
+    payload = [
+        {
+            "underlying": "AAPL",
+            "expiration": "2026-06-19",
+            "strike": 150.0,
+            "put_call": "CALL",
+            "premium": 50000.0,
+            "dte": 5.0,
+            "side": "BUY",
+            "multiplier": 100.0,
+            "deliverable": "cash + rights",
+        }
+    ]
+
+    bundle = extract_smart_whale_pressure(payload, ctx)
+
+    assert bundle.features["smart_whale_pressure"] is None
+    assert bundle.meta["flow"]["na_reason"] == "unparsed_deliverable"
+    assert bundle.meta["flow"]["details"]["contract_normalization"]["status"] == "INVALID"

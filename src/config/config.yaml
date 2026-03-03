@@ -1,8 +1,7 @@
 system:
-  timezone: America/New_York
-  base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
   api_key_env: UW_API_KEY
 ingestion:
+  timezone: America/New_York
   watchlist:
   - INTC
   - NFLX
@@ -25,33 +24,29 @@ validation:
   flat_threshold_pct: 0.001
   tolerance_minutes: 10
   max_horizon_drift_minutes: 10
-  
-  # NEW — REQUIRED (no defaults)
   alignment_tolerance_sec: 900
   emit_to_close_horizon: true
   use_default_required_features: false
   fallback_max_age_minutes: 15
   invalid_after_minutes: 60
-
-  # NEW — REQUIRED: explicit weight source
-  horizon_weights_source: model   # allowed: model | explicit
-
-  # NEW — REQUIRED: must exist even if source=model
+  horizon_weights_source: model
   horizon_weights: {}
-
-  # NEW — REQUIRED if source=model (must include every horizon + to_close)
   horizon_weights_overrides:
     "15": {}
     "60": {}
     "to_close": {}
-
-  # NEW — REQUIRED: must include every horizon + to_close
   horizon_critical_features:
     "15": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
     "60": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
     "to_close": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
-
+  label_contract:
+    label_version: 2026.02.0
+    session_boundary_rule: TRUNCATE_TO_SESSION_CLOSE
+    flat_threshold_policy: ABS_RETURN_BAND
+    threshold_policy_version: 2026.02.0
+    contract_source: runtime_config
 network:
+  base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
   timeout_seconds: 15
   max_retries: 3
   backoff_seconds:
@@ -77,7 +72,6 @@ model:
     class_labels: [UP, DOWN, FLAT]
     contract_source: runtime_config
     probability_tolerance: 1.0e-06
-  safe_mode_enabled: true
   confidence_cap: 0.55
   min_confidence: 0.35
   neutral_threshold: 0.55
@@ -126,7 +120,7 @@ model:
     - 0.92
     - 0.98
 adapt:
-  enabled: true
+  enabled: false
   rolling_window_predictions: 500
   drift:
     brier_warn: 0.25

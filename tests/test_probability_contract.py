@@ -236,3 +236,58 @@ def test_label_contract_builder_persists_versions_and_threshold_policy():
     assert label_contract.threshold_policy_version == "thresholds_v2"
     assert label_contract.neutral_threshold == pytest.approx(0.55)
     assert label_contract.direction_margin == pytest.approx(0.08)
+
+
+
+def test_missing_calibration_preserves_raw_vector_but_suppresses_calibrated_output():
+    _, target_spec, _ = _contract()
+
+    pred = bounded_additive_score(
+        {"smart_whale_pressure": 0.65, "net_gex_sign": 0.20},
+        data_quality_score=1.0,
+        weights={"smart_whale_pressure": 0.8, "net_gex_sign": 0.2},
+        gate=DecisionGate(
+            data_quality_state=DataQualityState.VALID,
+            risk_gate_status=RiskGateStatus.PASS,
+            decision_state=SignalState.NEUTRAL,
+        ),
+        target_spec=target_spec,
+    )
+
+    assert pred.raw_score > 0.0
+    assert pred.probability_output.raw_probability_vector is not None
+    assert pred.probability_output.calibrated_probability_vector is None
+    assert pred.prob_up is None
+    assert pred.prob_down is None
+    assert pred.prob_flat is None
+    assert pred.suppression_reason == "MISSING_CALIBRATION_ARTIFACT"
+
+
+
+def test_invalid_target_spec_suppresses_probability_output_before_emission():
+    bad_target_spec = PredictionTargetSpec(
+        target_name="intraday_direction_3class",
+        target_version="",
+    )
+    _, _, cal_ref = _contract()
+
+    pred = bounded_additive_score(
+        {"smart_whale_pressure": 0.75},
+        data_quality_score=1.0,
+        weights={"smart_whale_pressure": 1.0},
+        gate=DecisionGate(
+            data_quality_state=DataQualityState.VALID,
+            risk_gate_status=RiskGateStatus.PASS,
+            decision_state=SignalState.NEUTRAL,
+        ),
+        target_spec=bad_target_spec,
+        calibration_artifact_ref=cal_ref,
+    )
+
+    assert pred.raw_score > 0.0
+    assert pred.probability_output.raw_probability_vector is not None
+    assert pred.probability_output.calibrated_probability_vector is None
+    assert pred.prob_up is None
+    assert pred.prob_down is None
+    assert pred.prob_flat is None
+    assert pred.suppression_reason == "INVALID_TARGET_SPEC"

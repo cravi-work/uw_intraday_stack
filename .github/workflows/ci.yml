@@ -2,39 +2,37 @@ name: Institutional CI
 
 on:
   push:
-    branches: [ "master", "main" ]
+    branches: ["master", "main"]
   pull_request:
-    branches: [ "master", "main" ]
+    branches: ["master", "main"]
 
 jobs:
   test-and-audit:
     name: Run Tests and Audit
     runs-on: windows-latest
-    
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: "pip"
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest
+      - name: Run Repo Guard
+        run: python scripts/repo_guard.py --root .
 
-    - name: Run Repo Guard (Artifact Audit)
-      run: python scripts/repo_guard.py
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run Unit Tests
-      run: pytest -q tests/
+      - name: Run Unit Tests
+        run: pytest -q tests/
 
-    - name: Validate Capabilities against empty schema
-      # Proves the schema initializes properly with zero API calls/data
-      run: |
-        python -c "import duckdb; from src.storage import DbWriter; con=duckdb.connect('test_ci.duckdb'); DbWriter('test_ci.duckdb').ensure_schema(con); con.close()"
-        python -m src.main capabilities --catalog api_catalog.generated.yaml --db test_ci.duckdb --plan src/config/endpoint_plan.yaml --format json
+      - name: Validate Capabilities against empty schema
+        run: |
+          python -c "import duckdb; from src.storage import DbWriter; con=duckdb.connect('test_ci.duckdb'); DbWriter('test_ci.duckdb').ensure_schema(con); con.close()"
+          python -m src.main capabilities --catalog api_catalog.generated.yaml --db test_ci.duckdb --plan src/config/endpoint_plan.yaml --format json

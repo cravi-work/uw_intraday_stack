@@ -25,24 +25,25 @@ def test_replay_cli_invalid_config_exits(capsys):
 
 def test_replay_cli_validation_intercept(capsys):
     """
-    Ensure the CLI catches KeyError from _validate_config inside run_replay and translates it to exit code 1.
+    Replay now performs config-contract validation before dispatching into run_replay.
+    Invalid configs should fail fast with a config error.
     """
     test_args = ["main.py", "replay", "AAPL", "--config", "dummy.yaml"]
-    
+
     with patch("sys.argv", test_args), \
          patch("src.main.load_yaml") as mock_load, \
          patch("src.replay_engine.run_replay") as mock_run:
-         
+
          mock_load.return_value.raw = {"storage": {"duckdb_path": "test.duckdb"}}
-         mock_run.side_effect = KeyError("Missing validation.alignment_tolerance_sec")
-         
+
          with pytest.raises(SystemExit) as exc:
              main()
-             
+
          assert exc.value.code == 1
          stderr = capsys.readouterr().err
          assert "Config Validation Error:" in stderr
-         assert "Missing validation.alignment_tolerance_sec" in stderr
+         assert "Config missing section: validation" in stderr
+         mock_run.assert_not_called()
 
 def test_replay_cli_valid_config_routes():
     """

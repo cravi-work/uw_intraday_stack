@@ -1,11 +1,18 @@
 # Explicit endpoint plan.
 # IMPORTANT: The runner validates (method,path,query params) against api_catalog.generated.yaml
-# before calling. Do NOT add endpoints that are not in the catalog.
+# before calling. Every endpoint must declare an explicit runtime purpose.
+#
+# purpose meanings:
+#   signal-critical -> contributes directly to extracted model features or signal-path fallbacks
+#   context-only    -> fetched only for operator/market context, not for ticker signal scoring
+#   report-only     -> supports persisted reporting artifacts but not live directional scoring
+#   disabled        -> visible in the plan for auditability, but not fetched by default
 
 plans:
   default:
-    # Price & microstructure
+    # Price / core signal path
     - name: ohlc_1m
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/ohlc/{candle_size}
       path_params:
@@ -15,6 +22,7 @@ plans:
         limit: 700
 
     - name: stock_volume_price_levels
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/stock-volume-price-levels
       path_params: {}
@@ -23,6 +31,7 @@ plans:
 
     # Dealer / GEX / Greeks
     - name: spot_exposures
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/spot-exposures
       path_params: {}
@@ -30,6 +39,7 @@ plans:
         date: "{date}"
 
     - name: spot_exposures_strike
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/spot-exposures/strike
       path_params: {}
@@ -38,6 +48,7 @@ plans:
         limit: 500
 
     - name: greek_exposure
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/greek-exposure
       path_params: {}
@@ -46,6 +57,7 @@ plans:
 
     # Options flow / pressure
     - name: flow_per_strike_intraday
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/flow-per-strike-intraday
       path_params: {}
@@ -53,12 +65,14 @@ plans:
         date: "{date}"
 
     - name: flow_recent
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/flow-recent
       path_params: {}
       query_params: {}
 
     - name: net_prem_ticks
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/net-prem-ticks
       path_params: {}
@@ -66,8 +80,8 @@ plans:
         date: "{date}"
 
     # OI / chain structure
-    # (Expanded: Generates OI Wall levels and directional OI pressure)
     - name: oi_per_strike
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/oi-per-strike
       path_params: {}
@@ -75,6 +89,7 @@ plans:
         date: "{date}"
 
     - name: oi_change
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/oi-change
       path_params: {}
@@ -84,6 +99,7 @@ plans:
         order: "desc"
 
     - name: volume_oi_expiry
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/option/volume-oi-expiry
       path_params: {}
@@ -91,8 +107,8 @@ plans:
         date: "{date}"
 
     # Volatility
-    # (Expanded: Real derived features extracted for term structure slope and historical skew)
     - name: term_structure
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/volatility/term-structure
       path_params: {}
@@ -100,6 +116,7 @@ plans:
         date: "{date}"
 
     - name: interpolated_iv
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/interpolated-iv
       path_params: {}
@@ -107,6 +124,7 @@ plans:
         date: "{date}"
 
     - name: realized_vol
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/volatility/realized
       path_params: {}
@@ -114,15 +132,16 @@ plans:
         date: "{date}"
 
     - name: iv_rank
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/iv-rank
       path_params: {}
       query_params:
         date: "{date}"
 
-    # Liquidity / DP / Lit
-    # (Expanded: Computes direct notional pressure rather than acting as presence flags)
+    # Liquidity / darkpool / lit flow
     - name: darkpool_ticker
+      purpose: report-only
       method: GET
       path: /api/darkpool/{ticker}
       path_params: {}
@@ -131,6 +150,7 @@ plans:
         limit: 500
 
     - name: litflow_ticker
+      purpose: signal-critical
       method: GET
       path: /api/lit-flow/{ticker}
       path_params: {}
@@ -139,47 +159,65 @@ plans:
         limit: 500
 
     - name: option_stock_price_levels
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/option/stock-price-levels
       path_params: {}
       query_params:
         date: "{date}"
 
-    # Key levels
     - name: max_pain
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/max-pain
       path_params: {}
       query_params:
         date: "{date}"
-    
+
+    # Alternate/fallback signal-path families
     - name: greek-exposure-strike
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/greek-exposure/strike
+
     - name: greek-exposure-expiry
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/greek-exposure/expiry
+
     - name: spot-exposures-expiry-strike
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/spot-exposures/expiry-strike
+
     - name: flow-per-strike
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/flow-per-strike
+
     - name: flow-alerts
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/flow-alerts
+
     - name: option-chains
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/option-chains
+
     - name: option-contracts
+      purpose: disabled
       method: GET
       path: /api/stock/{ticker}/option-contracts
+
     - name: historical-risk-reversal-skew
+      purpose: signal-critical
       method: GET
       path: /api/stock/{ticker}/historical-risk-reversal-skew
 
   market_context:
     - name: market_tide
+      purpose: context-only
       method: GET
       path: /api/market/market-tide
       path_params: {}
@@ -188,13 +226,18 @@ plans:
         interval_5m: true
 
     - name: economic_calendar
+      purpose: context-only
       method: GET
       path: /api/market/economic-calendar
       path_params: {}
       query_params: {}
+
     - name: market-top-net-impact
+      purpose: context-only
       method: GET
       path: /api/market/top-net-impact
+
     - name: market-total-options-volume
+      purpose: context-only
       method: GET
       path: /api/market/total-options-volume

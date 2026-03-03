@@ -124,13 +124,15 @@ def main() -> None:
             
     elif args.cmd == "replay":
         from .replay_engine import run_replay
+        from .ingest_engine import _validate_config
         try:
             cfg = load_yaml(args.config).raw
-            
+            _validate_config(cfg)
+
             db_path = cfg.get("storage", {}).get("duckdb_path")
             if not db_path:
                 raise KeyError("Config missing section/key: storage.duckdb_path")
-                
+
             run_replay(db_path, args.ticker, cfg=cfg)
             sys.exit(0)
         except (KeyError, ValueError) as e:
@@ -140,9 +142,14 @@ def main() -> None:
             print(f"Replay Execution Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    from .ingest_engine import IngestionEngine
-    cfg = load_yaml(getattr(args, "config", "src/config/config.yaml")).raw
-    engine = IngestionEngine(cfg=cfg, catalog_path=args.catalog, config_path=getattr(args, "config", "src/config/config.yaml"))
+    from .ingest_engine import IngestionEngine, _validate_config
+    try:
+        cfg = load_yaml(getattr(args, "config", "src/config/config.yaml")).raw
+        _validate_config(cfg)
+        engine = IngestionEngine(cfg=cfg, catalog_path=args.catalog, config_path=getattr(args, "config", "src/config/config.yaml"))
+    except (KeyError, ValueError) as e:
+        print(f"Config Validation Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.cmd == "ingest-once":
         engine.run_cycle()

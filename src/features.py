@@ -9,8 +9,14 @@ from dataclasses import dataclass
 
 from .na import safe_float, is_na, grab_list
 from .endpoint_truth import EndpointContext
-from .analytics import build_gex_levels, build_oi_walls, build_darkpool_levels
+from .analytics import (
+    build_darkpool_levels,
+    build_gex_levels,
+    build_oi_walls,
+    derived_level_usage_contract,
+)
 from .instruments import contract_scale, normalize_option_rows, normalized_contract_map
+from .logging_config import structured_log
 
 logger = logging.getLogger(__name__)
 
@@ -265,9 +271,15 @@ def _build_contract_normalization_failure_bundle(
     summary: Any,
 ) -> FeatureBundle:
     reason = getattr(summary, "failure_reason", None) or "contract_normalization_invalid"
-    logger.warning(
-        "option_contract_normalization_invalid",
-        extra={"counter": "option_contract_normalization_invalid", "feature_key": meta_key, "reason": reason},
+    structured_log(
+        logger,
+        logging.WARNING,
+        event="normalization_failure",
+        msg="option contract normalization invalid",
+        counter="normalization_failure_count",
+        feature_key=meta_key,
+        reason=reason,
+        extractor=extractor_name,
     )
     meta = _build_meta(
         ctx,
@@ -410,6 +422,19 @@ def _build_error_meta(
     meta = _build_meta(ctx, extractor_name, lineage)
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
+    return meta
+
+
+def _annotate_level_usage_contract(meta: Dict[str, Any], level_type: str) -> Dict[str, Any]:
+    contract = copy.deepcopy(derived_level_usage_contract(level_type))
+    meta["level_usage_contract"] = contract
+    meta.setdefault("details", {}).setdefault("derived_level_contract", copy.deepcopy(contract))
+
+    metric_lineage = meta.setdefault("metric_lineage", {})
+    metric_lineage["decision_path_role"] = contract["decision_path_role"]
+    metric_lineage["prediction_consumed"] = contract["prediction_consumed"]
+    metric_lineage["contract_version"] = contract["contract_version"]
+    metric_lineage["feature_contract_state"] = contract["feature_contract_state"]
     return meta
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
@@ -983,6 +1008,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 levels = build_gex_levels(payload)
                 for l_type, price, mag, details in levels:
                     meta = _build_meta(ctx, "build_gex_levels", {"metric_name": "gex_levels", "fields_used": ["strike", "gamma_exposure"]}, details)
+                    meta = _annotate_level_usage_contract(meta, l_type)
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
                 
         elif routing_key == "FLOW":
@@ -1008,6 +1034,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 levels = build_oi_walls(payload)
                 for l_type, price, mag, details in levels:
                     meta = _build_meta(ctx, "build_oi_walls", {"metric_name": "oi_walls", "fields_used": ["strike", "open_interest"]}, details)
+                    meta = _annotate_level_usage_contract(meta, l_type)
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
                 
         elif routing_key == "VOL":
@@ -1033,6 +1060,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 levels = build_darkpool_levels(payload)
                 for l_type, price, mag, details in levels:
                     meta = _build_meta(ctx, "build_darkpool_levels", {"metric_name": "darkpool_levels", "fields_used": ["price", "volume"]}, details)
+                    meta = _annotate_level_usage_contract(meta, l_type)
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
 
         elif routing_key == "LITFLOW":
