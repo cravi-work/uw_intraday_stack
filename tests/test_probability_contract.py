@@ -10,6 +10,7 @@ from src.models import (
     OODState,
     PredictionTargetSpec,
     ReplayMode,
+    build_label_contract_spec,
     RiskGateStatus,
     SignalState,
     bounded_additive_score,
@@ -212,3 +213,26 @@ def test_invalid_calibration_artifact_suppresses_output():
 
     assert pred.suppression_reason == "INVALID_CALIBRATION_ARTIFACT"
     assert pred.probability_output.calibrated_probability_vector is None
+
+
+def test_label_contract_builder_persists_versions_and_threshold_policy():
+    model_cfg = {
+        "neutral_threshold": 0.55,
+        "direction_margin": 0.08,
+    }
+    validation_cfg = {
+        "flat_threshold_pct": 0.001,
+        "label_contract": {
+            "label_version": "label_v2",
+            "threshold_policy_version": "thresholds_v2",
+            "session_boundary_rule": "TRUNCATE_TO_SESSION_CLOSE",
+        },
+    }
+
+    label_contract = build_label_contract_spec(model_cfg, validation_cfg, flat_threshold_pct=0.001)
+
+    assert label_contract.is_valid()
+    assert label_contract.label_version == "label_v2"
+    assert label_contract.threshold_policy_version == "thresholds_v2"
+    assert label_contract.neutral_threshold == pytest.approx(0.55)
+    assert label_contract.direction_margin == pytest.approx(0.08)

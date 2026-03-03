@@ -142,6 +142,49 @@ class PredictionTargetSpec:
 
 
 @dataclass(frozen=True)
+class LabelContractSpec:
+    label_version: str
+    session_boundary_rule: str
+    flat_threshold_pct: float
+    flat_threshold_policy: str = "ABS_RETURN_BAND"
+    threshold_policy_version: str = "runtime_v1"
+    neutral_threshold: Optional[float] = None
+    direction_margin: Optional[float] = None
+    contract_source: str = "runtime_config"
+
+    def is_valid(self) -> bool:
+        if not self.label_version or not str(self.label_version).strip():
+            return False
+        if not self.session_boundary_rule or not str(self.session_boundary_rule).strip():
+            return False
+        if self.session_boundary_rule not in {"TRUNCATE_TO_SESSION_CLOSE", "REQUIRE_TARGET_WITHIN_SESSION"}:
+            return False
+        if not math.isfinite(float(self.flat_threshold_pct)) or float(self.flat_threshold_pct) < 0.0:
+            return False
+        if not self.flat_threshold_policy or not str(self.flat_threshold_policy).strip():
+            return False
+        if not self.threshold_policy_version or not str(self.threshold_policy_version).strip():
+            return False
+        if self.neutral_threshold is not None and not math.isfinite(float(self.neutral_threshold)):
+            return False
+        if self.direction_margin is not None and not math.isfinite(float(self.direction_margin)):
+            return False
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "label_version": self.label_version,
+            "session_boundary_rule": self.session_boundary_rule,
+            "flat_threshold_pct": float(self.flat_threshold_pct),
+            "flat_threshold_policy": self.flat_threshold_policy,
+            "threshold_policy_version": self.threshold_policy_version,
+            "neutral_threshold": self.neutral_threshold,
+            "direction_margin": self.direction_margin,
+            "contract_source": self.contract_source,
+        }
+
+
+@dataclass(frozen=True)
 class CalibrationArtifactRef:
     artifact_name: str
     artifact_version: str
@@ -308,6 +351,43 @@ def build_prediction_target_spec(
         flat_threshold_pct=float(flat_threshold_pct) if flat_threshold_pct is not None else spec_cfg.get("flat_threshold_pct"),
         probability_tolerance=float(spec_cfg.get("probability_tolerance", 1e-6)),
         contract_source=str(spec_cfg.get("contract_source") or "runtime_config"),
+    )
+
+
+def build_label_contract_spec(
+    model_cfg: Optional[Mapping[str, Any]],
+    validation_cfg: Optional[Mapping[str, Any]] = None,
+    *,
+    flat_threshold_pct: Optional[float] = None,
+    session_boundary_rule: Optional[str] = None,
+) -> LabelContractSpec:
+    cfg = dict(model_cfg or {})
+    val_cfg = dict(validation_cfg or {})
+    label_cfg = val_cfg.get("label_contract") or cfg.get("label_contract") or {}
+    if not isinstance(label_cfg, Mapping):
+        label_cfg = {}
+
+    def _maybe_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        return float(value)
+
+    resolved_flat = flat_threshold_pct
+    if resolved_flat is None:
+        resolved_flat = label_cfg.get("flat_threshold_pct", val_cfg.get("flat_threshold_pct", 0.0))
+
+    neutral_threshold = label_cfg.get("neutral_threshold", cfg.get("neutral_threshold"))
+    direction_margin = label_cfg.get("direction_margin", cfg.get("direction_margin"))
+
+    return LabelContractSpec(
+        label_version=str(label_cfg.get("label_version") or val_cfg.get("label_version") or "runtime_v1"),
+        session_boundary_rule=str(session_boundary_rule or label_cfg.get("session_boundary_rule") or "TRUNCATE_TO_SESSION_CLOSE"),
+        flat_threshold_pct=float(resolved_flat),
+        flat_threshold_policy=str(label_cfg.get("flat_threshold_policy") or "ABS_RETURN_BAND"),
+        threshold_policy_version=str(label_cfg.get("threshold_policy_version") or label_cfg.get("policy_version") or "runtime_v1"),
+        neutral_threshold=_maybe_float(neutral_threshold),
+        direction_margin=_maybe_float(direction_margin),
+        contract_source=str(label_cfg.get("contract_source") or "runtime_config"),
     )
 
 

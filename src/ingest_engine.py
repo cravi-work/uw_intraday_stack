@@ -30,6 +30,7 @@ from .models import (
     ConfidenceState,
     KNOWN_FEATURE_KEYS,
     build_prediction_target_spec,
+    build_label_contract_spec,
     build_calibration_artifact_ref,
     OODState,
     ReplayMode,
@@ -621,7 +622,7 @@ def generate_predictions(
 
         return h_gate, weights, decision_dq, horizon_contract, sorted(set(dq_reasons)), target_diagnostics
 
-    def _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags):
+    def _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract):
         pred_meta = pred.meta
         pred_meta["endpoint_coverage"] = endpoint_coverage
         pred_meta["alignment_diagnostics"] = {
@@ -657,6 +658,15 @@ def generate_predictions(
                 for k, a in assessments_by_feature.items()
             },
         }
+        pred_meta["prediction_contract"] = {
+            "target_name": target_spec.target_name,
+            "target_version": target_spec.target_version,
+            "label_version": label_contract.label_version,
+            "session_boundary_rule": label_contract.session_boundary_rule,
+            "threshold_policy_version": label_contract.threshold_policy_version,
+            "target_spec": target_spec.to_dict(),
+            "label_contract": label_contract.to_dict(),
+        }
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
         pred_meta["dq_reason_codes"] = dq_reasons
@@ -677,6 +687,12 @@ def generate_predictions(
             horizon_kind="FIXED",
             horizon_minutes=int(h),
             flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
+        )
+        label_contract = build_label_contract_spec(
+            model_cfg,
+            cfg.get("validation", {}),
+            flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
+            session_boundary_rule="TRUNCATE_TO_SESSION_CLOSE",
         )
         calibration_artifact_ref = build_calibration_artifact_ref(model_cfg, target_spec=target_spec)
         pred = bounded_additive_score(
@@ -701,7 +717,7 @@ def generate_predictions(
 
         window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
 
-        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags)
+        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract)
 
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": int(h), "horizon_kind": "FIXED",
@@ -729,6 +745,12 @@ def generate_predictions(
             horizon_minutes=0,
             flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
         )
+        label_contract = build_label_contract_spec(
+            model_cfg,
+            cfg.get("validation", {}),
+            flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
+            session_boundary_rule="TRUNCATE_TO_SESSION_CLOSE",
+        )
         calibration_artifact_ref = build_calibration_artifact_ref(model_cfg, target_spec=target_spec)
         pred = bounded_additive_score(
             feat_dict,
@@ -752,7 +774,7 @@ def generate_predictions(
 
         window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
 
-        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags)
+        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract)
 
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": 0, "horizon_kind": "TO_CLOSE",
