@@ -71,6 +71,12 @@ storage:
 model:
   model_name: bounded_additive_score
   model_version: 1.0.0
+  target_spec:
+    target_name: intraday_direction_3class
+    target_version: 2026.02.0
+    class_labels: [UP, DOWN, FLAT]
+    contract_source: runtime_config
+    probability_tolerance: 1.0e-06
   safe_mode_enabled: true
   confidence_cap: 0.55
   min_confidence: 0.35
@@ -92,6 +98,9 @@ model:
     vol_skew: 0.10
     iv_rank: 0.05
   calibration:
+    artifact_name: bounded_additive_score_calibration
+    artifact_version: 2026.02.0
+    artifact_source: runtime_config
     bins:
     - 0.0
     - 0.1

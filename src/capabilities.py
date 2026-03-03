@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 
 import duckdb
 
+from .freshness_policy import resolve_endpoint_policy
+
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
@@ -113,12 +115,10 @@ def extract_db_truth(con: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
             # Endpoint is only considered responsive if its last attempt was successful
             if (http_status is not None and 200 <= http_status < 300) and (err_type is None):
                 
-                # Dynamic Endpoint-specific SLAs
-                # Market price updates should be strictly fresh (e.g. 60s)
-                # Options flows can safely drift longer based on regimes (e.g. 90m = 5400s)
-                allowed_sla = 60 if "ohlc" in path else 5400
-                
-                if change_age is not None and change_age > allowed_sla: 
+                policy = resolve_endpoint_policy(method, path, {"validation": {"invalid_after_minutes": 90, "alignment_tolerance_sec": 900}})
+                allowed_sla = policy.max_tolerated_age_seconds
+
+                if change_age is not None and change_age > allowed_sla:
                     health_status = "STALE"
                 else:
                     health_status = "HEALTHY"

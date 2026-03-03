@@ -286,3 +286,129 @@ def test_to_close_and_fixed_horizons_coexist(mock_engine_env, caplog):
     assert fixed_pred["decision_state"] != "NO_SIGNAL"
     assert close_pred["decision_state"] != "NO_SIGNAL"
     assert close_pred["horizon_seconds"] == 3600
+def test_registry_join_skew_overrides_global_alignment_tolerance(mock_engine_env, caplog):
+    fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    past_70s = (fixed_asof - dt.timedelta(seconds=70)).isoformat()
+
+    live_price_meta = {
+        "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/ohlc/{candle_size}"}],
+        "freshness_state": "FRESH",
+        "stale_age_min": 0,
+        "na_reason": None,
+        "details": {},
+        "metric_lineage": {"effective_ts_utc": past_70s},
+    }
+
+    features = [
+        {"feature_key": "spot", "feature_value": 150.0, "meta_json": copy.deepcopy(live_price_meta)},
+        {
+            "feature_key": "oi_pressure",
+            "feature_value": 0.25,
+            "meta_json": {
+                "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/oi-per-strike"}],
+                "freshness_state": "FRESH",
+                "stale_age_min": 0,
+                "na_reason": None,
+                "details": {},
+                "metric_lineage": {"effective_ts_utc": (fixed_asof - dt.timedelta(seconds=10)).isoformat()},
+            },
+        },
+    ]
+
+    mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+
+    assert pred_call["decision_state"] == "NO_SIGNAL"
+    assert pred_call["risk_gate_status"] == "BLOCKED"
+    assert pred_call["alignment_status"] == "MISALIGNED"
+    assert pred_call["meta_json"]["alignment_diagnostics"]["excluded_misaligned_count"] == 1
+    assert any("spot_delta_70s" in k for k in pred_call["meta_json"]["alignment_diagnostics"]["misaligned_keys"])
+    assert pred_call["meta_json"]["freshness_registry_diagnostics"]["feature_policies"]["spot"]["join_skew_tolerance_seconds"] == 60
+    assert "alignment_violation" in caplog.text
+
+
+def test_live_price_carry_forward_is_suppressed_by_registry(mock_engine_env, caplog):
+    fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    mock_engine_env["validation"]["horizon_critical_features"] = {"5": ["spot"], "to_close": ["spot"]}
+    mock_engine_env["validation"]["horizon_weights"] = {"5": {"spot": 1.0, "oi_pressure": 0.5}, "to_close": {"spot": 1.0}}
+
+    features = [
+        {
+            "feature_key": "spot",
+            "feature_value": 150.0,
+            "meta_json": {
+                "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/ohlc/{candle_size}"}],
+                "freshness_state": "STALE_CARRY",
+                "stale_age_min": 1,
+                "na_reason": None,
+                "details": {},
+                "metric_lineage": {"effective_ts_utc": (fixed_asof - dt.timedelta(seconds=30)).isoformat()},
+            },
+        },
+        {
+            "feature_key": "oi_pressure",
+            "feature_value": 0.25,
+            "meta_json": {
+                "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/oi-per-strike"}],
+                "freshness_state": "FRESH",
+                "stale_age_min": 0,
+                "na_reason": None,
+                "details": {},
+                "metric_lineage": {"effective_ts_utc": (fixed_asof - dt.timedelta(seconds=10)).isoformat()},
+            },
+        },
+    ]
+
+    mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+
+    assert pred_call["decision_state"] == "NO_SIGNAL"
+    assert pred_call["risk_gate_status"] == "BLOCKED"
+    diag = pred_call["meta_json"]["freshness_registry_diagnostics"]
+    assert diag["carry_forward_suppressed_count"] == 1
+    assert diag["carry_forward_suppressed_keys"] == ["spot"]
+    assert "carry_forward_suppressed" in caplog.text
+
+
+def test_snapshot_feature_too_old_is_rejected_by_registry(mock_engine_env, caplog):
+    fixed_asof = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+    features = [
+        {
+            "feature_key": "spot",
+            "feature_value": 150.0,
+            "meta_json": {
+                "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/ohlc/{candle_size}"}],
+                "freshness_state": "FRESH",
+                "stale_age_min": 0,
+                "na_reason": None,
+                "details": {},
+                "metric_lineage": {"effective_ts_utc": fixed_asof.isoformat()},
+            },
+        },
+        {
+            "feature_key": "oi_pressure",
+            "feature_value": 0.25,
+            "meta_json": {
+                "source_endpoints": [{"method": "GET", "path": "/api/stock/{ticker}/oi-per-strike"}],
+                "freshness_state": "STALE_CARRY",
+                "stale_age_min": 100,
+                "na_reason": None,
+                "details": {},
+                "metric_lineage": {"effective_ts_utc": (fixed_asof - dt.timedelta(minutes=100)).isoformat()},
+            },
+        },
+    ]
+
+    mock_db = _run_with_features(mock_engine_env, features, caplog, fixed_asof)
+    calls = [call[0][1] for call in mock_db.insert_prediction.call_args_list]
+    pred_call = next(c for c in calls if c["horizon_kind"] == "FIXED" and c["horizon_minutes"] == 5)
+
+    assert pred_call["decision_state"] == "NO_SIGNAL"
+    assert pred_call["risk_gate_status"] == "BLOCKED"
+    diag = pred_call["meta_json"]["freshness_registry_diagnostics"]
+    assert diag["stale_endpoint_rejected_count"] == 1
+    assert diag["stale_endpoint_rejected_keys"] == ["oi_pressure"]
+    assert "stale_endpoint_rejected" in caplog.text

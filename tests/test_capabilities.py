@@ -103,3 +103,21 @@ def test_extract_db_truth():
     assert mkt_ep["health_status"] == "HEALTHY"
     assert mkt_ep["attempt_age_s"] == 0
     assert mkt_ep["payload_change_age_s"] >= 120
+class MockConDataOhlc:
+    def execute(self, query):
+        return self
+
+    def fetchall(self):
+        now = datetime.datetime.now(timezone.utc)
+        stale_time = now - datetime.timedelta(seconds=130)
+        return [
+            ("AAPL", "GET", "/api/stock/{ticker}/ohlc/{candle_size}", now, now, stale_time, 200, None, None),
+        ]
+
+
+def test_extract_db_truth_uses_registry_sla_for_ohlc_paths():
+    con = MockConDataOhlc()
+    truth = extract_db_truth(con)
+    aapl_ep = truth["AAPL"]["endpoints"]["GET /api/stock/{ticker}/ohlc/{candle_size}"]
+    assert aapl_ep["health_status"] == "STALE"
+    assert aapl_ep["payload_change_age_s"] >= 120
