@@ -52,8 +52,7 @@ MARKET_CONTEXT_PATHS = {
 }
 
 
-
-def test_endpoint_plan_requires_explicit_supported_purpose(tmp_path):
+def test_endpoint_plan_requires_explicit_supported_purpose_and_runtime_contract(tmp_path):
     missing = tmp_path / "missing.yaml"
     missing.write_text(
         "plans:\n  default:\n    - name: foo\n      method: GET\n      path: /api/foo\n",
@@ -64,7 +63,7 @@ def test_endpoint_plan_requires_explicit_supported_purpose(tmp_path):
 
     invalid = tmp_path / "invalid.yaml"
     invalid.write_text(
-        "plans:\n  default:\n    - name: foo\n      purpose: maybe-later\n      method: GET\n      path: /api/foo\n",
+        "plans:\n  default:\n    - name: foo\n      purpose: maybe-later\n      decision_path: false\n      missing_affects_confidence: false\n      stale_affects_confidence: false\n      method: GET\n      path: /api/foo\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="invalid purpose"):
@@ -72,12 +71,27 @@ def test_endpoint_plan_requires_explicit_supported_purpose(tmp_path):
 
     wrong_section = tmp_path / "wrong_section.yaml"
     wrong_section.write_text(
-        "plans:\n  market_context:\n    - name: foo\n      purpose: signal-critical\n      method: GET\n      path: /api/market/foo\n",
+        "plans:\n  market_context:\n    - name: foo\n      purpose: signal-critical\n      decision_path: true\n      missing_affects_confidence: true\n      stale_affects_confidence: true\n      method: GET\n      path: /api/market/foo\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="invalid for section 'market_context'"):
         load_endpoint_plan(wrong_section)
 
+    missing_contract_field = tmp_path / "missing_contract_field.yaml"
+    missing_contract_field.write_text(
+        "plans:\n  default:\n    - name: foo\n      purpose: signal-critical\n      decision_path: true\n      missing_affects_confidence: true\n      method: GET\n      path: /api/foo\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing required 'stale_affects_confidence'"):
+        load_endpoint_plan(missing_contract_field)
+
+    incompatible_contract = tmp_path / "incompatible_contract.yaml"
+    incompatible_contract.write_text(
+        "plans:\n  default:\n    - name: foo\n      purpose: report-only\n      decision_path: true\n      missing_affects_confidence: false\n      stale_affects_confidence: false\n      method: GET\n      path: /api/foo\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="incompatible with purpose 'report-only'"):
+        load_endpoint_plan(incompatible_contract)
 
 
 def test_default_plan_dry_run_excludes_disabled_overfetch_and_exposes_purposes():
@@ -94,13 +108,20 @@ def test_default_plan_dry_run_excludes_disabled_overfetch_and_exposes_purposes()
     assert all(call.purpose in {"signal-critical", "report-only"} for call in core)
     assert core_paths.issubset(set(EXTRACTOR_REGISTRY.keys()))
     assert core_purposes["/api/darkpool/{ticker}"] == "report-only"
+    assert all(call.purpose_contract_version == "v1" for call in core)
+    assert all(call.decision_path == (call.purpose == "signal-critical") for call in core)
+    assert all(call.missing_affects_confidence == call.decision_path for call in core)
+    assert all(call.stale_affects_confidence == call.decision_path for call in core)
     assert len(core) == 17
 
     summary = summarize_effective_endpoint_plan(cfg, plan)
     assert {item["name"] for item in summary["disabled_default"]} == DISABLED_DEFAULT_NAMES
     assert {item["purpose"] for item in summary["fetched_default"]} == {"signal-critical", "report-only"}
+    assert all(item["purpose_contract_version"] == "v1" for item in summary["fetched_default"])
+    assert all(item["decision_path"] == (item["purpose"] == "signal-critical") for item in summary["fetched_default"])
+    assert all(item["missing_affects_confidence"] == item["decision_path"] for item in summary["fetched_default"])
+    assert all(item["stale_affects_confidence"] == item["decision_path"] for item in summary["fetched_default"])
     assert summary["fetched_market_context"] == []
-
 
 
 def test_market_context_plan_fetches_only_context_endpoints_when_enabled():
@@ -113,7 +134,13 @@ def test_market_context_plan_fetches_only_context_endpoints_when_enabled():
 
     assert market_paths == MARKET_CONTEXT_PATHS
     assert all(call.purpose == "context-only" for call in market)
+    assert all(call.decision_path is False for call in market)
+    assert all(call.missing_affects_confidence is False for call in market)
+    assert all(call.stale_affects_confidence is False for call in market)
 
     summary = summarize_effective_endpoint_plan(cfg, plan)
     assert {item["path"] for item in summary["fetched_market_context"]} == MARKET_CONTEXT_PATHS
     assert all(item["purpose"] == "context-only" for item in summary["fetched_market_context"])
+    assert all(item["decision_path"] is False for item in summary["fetched_market_context"])
+    assert all(item["missing_affects_confidence"] is False for item in summary["fetched_market_context"])
+    assert all(item["stale_affects_confidence"] is False for item in summary["fetched_market_context"])

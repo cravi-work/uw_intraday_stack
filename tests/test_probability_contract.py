@@ -105,6 +105,7 @@ def test_adversarial_unsigned_totals_no_long_saturation():
         ),
         target_spec=target_spec,
         calibration_artifact_ref=cal_ref,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert huge_oi is None
@@ -126,6 +127,7 @@ def test_probability_output_suppressed_without_target_spec():
             risk_gate_status=RiskGateStatus.PASS,
             decision_state=SignalState.NEUTRAL,
         ),
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is None
@@ -149,6 +151,7 @@ def test_missing_calibration_suppresses_probabilities_and_degrades_confidence():
             decision_state=SignalState.NEUTRAL,
         ),
         target_spec=target_spec,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is None
@@ -175,7 +178,7 @@ def test_model_and_contract_versions_propagate():
         target_spec=target_spec,
         calibration_artifact_ref=cal_ref,
         replay_mode=ReplayMode.UNKNOWN,
-        ood_state=OODState.UNKNOWN,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.model_name == "bounded_additive_score"
@@ -209,6 +212,7 @@ def test_invalid_calibration_artifact_suppresses_output():
         ),
         target_spec=target_spec,
         calibration_artifact_ref=bad_cal_ref,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.suppression_reason == "INVALID_CALIBRATION_ARTIFACT"
@@ -252,6 +256,7 @@ def test_missing_calibration_preserves_raw_vector_but_suppresses_calibrated_outp
             decision_state=SignalState.NEUTRAL,
         ),
         target_spec=target_spec,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.raw_score > 0.0
@@ -282,6 +287,7 @@ def test_invalid_target_spec_suppresses_probability_output_before_emission():
         ),
         target_spec=bad_target_spec,
         calibration_artifact_ref=cal_ref,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.raw_score > 0.0

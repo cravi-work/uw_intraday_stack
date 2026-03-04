@@ -7,9 +7,26 @@ on:
     branches: ["master", "main"]
 
 jobs:
+  repo-guard:
+    name: Repo Guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Repo Guard
+        run: python scripts/repo_guard.py --root .
+
   test-and-audit:
     name: Run Tests and Audit
     runs-on: windows-latest
+    needs: repo-guard
 
     steps:
       - name: Checkout repository
@@ -20,9 +37,6 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Run Repo Guard
-        run: python scripts/repo_guard.py --root .
 
       - name: Install dependencies
         run: |

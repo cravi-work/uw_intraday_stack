@@ -41,11 +41,55 @@ def _valid_cfg() -> dict:
                 "target_name": "intraday_direction_3class",
                 "target_version": "2026.02.0",
             },
-            "calibration": {
-                "artifact_name": "bounded_additive_score_calibration",
-                "artifact_version": "2026.02.0",
-                "bins": [0.0, 0.5, 1.0],
-                "mapped": [0.05, 0.5, 0.95],
+            "ood_assessment_policy": {
+                "contract_version": "ood_assessment/v1",
+                "degraded_coverage_threshold": 0.85,
+                "out_coverage_threshold": 0.50,
+                "boundary_slack": 1.0e-06,
+                "require_assessment_before_emission": True,
+            },
+            "ood_probability_policy": {
+                "contract_version": "ood_probability/v1",
+                "out_confidence_scale": 0.0,
+                "out_emit_calibrated": False,
+                "unknown_confidence_scale": 0.0,
+                "unknown_emit_calibrated": False,
+                "degraded_confidence_scale": 0.50,
+                "degraded_emit_calibrated": True,
+            },
+            "calibration_registry": {
+                "contract_version": "calibration_registry/v1",
+                "registry_version": "2026.03.0",
+                "default_regime": "DEFAULT",
+                "selection_policy": {
+                    "require_scope_match": True,
+                    "allow_legacy_fallback": False,
+                },
+                "compatibility_rules": {
+                    "require_target_match": True,
+                    "require_horizon_match": True,
+                    "require_session_match": True,
+                    "require_regime_match": True,
+                    "require_replay_mode_match": True,
+                    "require_artifact_hash": True,
+                },
+                "artifacts": [
+                    {
+                        "artifact_name": "bounded_additive_score_calibration",
+                        "artifact_version": "2026.03.0.fixed15.any",
+                        "target_name": "intraday_direction_3class",
+                        "target_version": "2026.02.0",
+                        "scope": {
+                            "horizon_kind": "FIXED",
+                            "horizon_minutes": 15,
+                            "session": "ANY",
+                            "regime": "DEFAULT",
+                            "replay_mode": "ANY",
+                        },
+                        "bins": [0.0, 0.5, 1.0],
+                        "mapped": [0.05, 0.5, 0.95],
+                    }
+                ],
             },
         },
         "validation": {
@@ -65,6 +109,15 @@ def _valid_cfg() -> dict:
             },
             "horizon_critical_features": {
                 "15": ["spot"],
+            },
+            "decision_path_policy": {
+                "contract_version": "decision_path/v1",
+                "zero_weight_is_non_decision": True,
+                "require_feature_metadata": True,
+                "allow_explicit_zero_weight_critical_override": True,
+                "explicit_zero_weight_critical_features": {
+                    "15": [],
+                },
             },
             "label_contract": {
                 "label_version": "2026.02.0",

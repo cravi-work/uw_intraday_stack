@@ -86,6 +86,78 @@ SOURCE_REVISION_KEYS = (
 )
 SPOT_KEYS = ("spot", "underlying_price", "underlying", "stock_price", "spot_price")
 
+
+FEATURE_USE_CONTRACT_VERSION = "feature_use/v1"
+FEATURE_USE_ROLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "signal-critical": {
+        "decision_path": True,
+        "missing_affects_confidence": True,
+        "stale_affects_confidence": True,
+    },
+    "context-only": {
+        "decision_path": False,
+        "missing_affects_confidence": False,
+        "stale_affects_confidence": False,
+    },
+    "report-only": {
+        "decision_path": False,
+        "missing_affects_confidence": False,
+        "stale_affects_confidence": False,
+    },
+    "disabled": {
+        "decision_path": False,
+        "missing_affects_confidence": False,
+        "stale_affects_confidence": False,
+    },
+}
+LEGACY_PATH_USE_ROLE_OVERRIDES: Dict[str, str] = {
+    "/api/darkpool/{ticker}": "report-only",
+}
+
+
+def _resolve_feature_use_contract(ctx: EndpointContext) -> Dict[str, Any]:
+    explicit_role = getattr(ctx, "endpoint_purpose", None)
+    role_source = "endpoint_context"
+    if explicit_role in FEATURE_USE_ROLE_DEFAULTS:
+        use_role = str(explicit_role)
+    else:
+        fallback_role = LEGACY_PATH_USE_ROLE_OVERRIDES.get(ctx.path)
+        if fallback_role in FEATURE_USE_ROLE_DEFAULTS:
+            use_role = str(fallback_role)
+            role_source = "path_fallback"
+        else:
+            use_role = "signal-critical"
+            role_source = "default_signal_critical"
+
+    defaults = FEATURE_USE_ROLE_DEFAULTS[use_role]
+    raw_decision_path = getattr(ctx, "decision_path", None)
+    raw_missing_affects_confidence = getattr(ctx, "missing_affects_confidence", None)
+    raw_stale_affects_confidence = getattr(ctx, "stale_affects_confidence", None)
+
+    decision_path = defaults["decision_path"] if raw_decision_path is None else bool(raw_decision_path)
+    missing_affects_confidence = (
+        defaults["missing_affects_confidence"] if raw_missing_affects_confidence is None else bool(raw_missing_affects_confidence)
+    )
+    stale_affects_confidence = (
+        defaults["stale_affects_confidence"] if raw_stale_affects_confidence is None else bool(raw_stale_affects_confidence)
+    )
+
+    decision_eligible = bool(use_role == "signal-critical" and decision_path)
+    if not decision_eligible:
+        missing_affects_confidence = False
+        stale_affects_confidence = False
+
+    return {
+        "contract_version": str(getattr(ctx, "purpose_contract_version", None) or FEATURE_USE_CONTRACT_VERSION),
+        "use_role": use_role,
+        "decision_path": decision_path,
+        "decision_eligible": decision_eligible,
+        "missing_affects_confidence": missing_affects_confidence,
+        "stale_affects_confidence": stale_affects_confidence,
+        "endpoint_name": getattr(ctx, "endpoint_name", None),
+        "contract_source": role_source,
+    }
+
 def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
     if scale == 0: 
         return None 
@@ -374,6 +446,7 @@ def _build_meta(
         d.get("time_provenance_degraded", getattr(ctx, "time_provenance_degraded", False))
     )
 
+    feature_use_contract = _resolve_feature_use_contract(ctx)
     full_lineage = {
         "metric_name": lineage.get("metric_name", "unknown"),
         "source_path": ctx.path,
@@ -395,8 +468,13 @@ def _build_meta(
         "timestamp_quality": ts_quality,
         "lagged": lagged,
         "time_provenance_degraded": time_provenance_degraded,
+        "decision_path_role": feature_use_contract["use_role"],
+        "decision_eligible": feature_use_contract["decision_eligible"],
+        "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
+        "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
+        "feature_use_contract_version": feature_use_contract["contract_version"],
     }
-    
+
     return {
         "source_endpoints": [{
             "method": ctx.method,
@@ -404,11 +482,22 @@ def _build_meta(
             "operation_id": ctx.operation_id,
             "endpoint_id": ctx.endpoint_id,
             "used_event_id": ctx.used_event_id,
-            "signature": ctx.signature
+            "signature": ctx.signature,
+            "endpoint_name": getattr(ctx, "endpoint_name", None),
+            "purpose": feature_use_contract["use_role"],
+            "decision_path": feature_use_contract["decision_path"],
+            "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
+            "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
+            "purpose_contract_version": feature_use_contract["contract_version"],
         }],
         "freshness_state": ctx.freshness_state,
         "stale_age_min": ctx.stale_age_min,
         "na_reason": ctx.na_reason,
+        "feature_use_contract": feature_use_contract,
+        "use_role": feature_use_contract["use_role"],
+        "decision_eligible": feature_use_contract["decision_eligible"],
+        "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
+        "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
         "metric_lineage": full_lineage,
         "details": d
     }

@@ -1,7 +1,7 @@
 import datetime as dt
 
 from src.endpoint_rules import EmptyPayloadPolicy
-from src.endpoint_truth import EndpointPayloadClass, EndpointStateRow, FreshnessState, PayloadAssessment, resolve_effective_payload
+from src.endpoint_truth import EndpointPayloadClass, EndpointStateRow, FreshnessState, PayloadAssessment, infer_source_time_hints, resolve_effective_payload
 
 
 def test_resolved_lineage_carries_explicit_time_fields():
@@ -158,3 +158,115 @@ def test_empty_means_stale_carry_forward_is_marked_lagged_not_live():
     assert resolved.timestamp_quality == "LAGGED"
     assert resolved.lagged is True
     assert resolved.effective_ts_utc == prev_state.last_success_ts_utc
+
+
+def test_nested_payload_provider_timestamps_reduce_degraded_fallback():
+    asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "price": 150.0,
+                    "executed_at": "2026-01-01T11:59:20+00:00",
+                    "published_at": "2026-01-01T11:59:40+00:00",
+                    "revision": "rev-nested-1",
+                }
+            ]
+        }
+    }
+
+    hints = infer_source_time_hints(payload_json=payload)
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
+        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
+        is_empty=False,
+        changed=True,
+        error_reason=None,
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="evt-nested",
+        current_ts_raw=asof_utc,
+        assessment=assessment,
+        prev_state=None,
+        as_of_time_raw=asof_utc,
+        source_event_time_raw=hints.event_time_utc,
+        source_publish_time_raw=hints.source_publish_time_utc,
+        effective_time_raw=hints.effective_time_utc,
+        source_revision=hints.source_revision,
+    )
+
+    assert hints.event_time_utc == dt.datetime(2026, 1, 1, 11, 59, 20, tzinfo=dt.timezone.utc)
+    assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 40, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-nested-1"
+    assert resolved.effective_ts_utc == hints.event_time_utc
+    assert resolved.effective_time_source == "event_time"
+    assert resolved.timestamp_quality == "VALID"
+    assert resolved.time_provenance_degraded is False
+
+
+def test_response_header_publish_time_and_revision_are_used_when_payload_is_timestamp_poor():
+    asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    headers = {
+        "Last-Modified": "Thu, 01 Jan 2026 11:59:30 GMT",
+        "ETag": "rev-header-2",
+    }
+
+    hints = infer_source_time_hints(payload_json={"data": [{"close": 150.0}]}, response_headers=headers)
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
+        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
+        is_empty=False,
+        changed=True,
+        error_reason=None,
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="evt-header",
+        current_ts_raw=asof_utc,
+        assessment=assessment,
+        prev_state=None,
+        as_of_time_raw=asof_utc,
+        source_event_time_raw=hints.event_time_utc,
+        source_publish_time_raw=hints.source_publish_time_utc,
+        effective_time_raw=hints.effective_time_utc,
+        source_revision=hints.source_revision,
+    )
+
+    assert hints.event_time_utc is None
+    assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 30, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-header-2"
+    assert resolved.effective_ts_utc == hints.source_publish_time_utc
+    assert resolved.source_publish_time_utc == hints.source_publish_time_utc
+    assert resolved.source_revision == "rev-header-2"
+    assert resolved.effective_time_source == "source_publish_time"
+    assert resolved.timestamp_quality == "VALID"
+    assert resolved.time_provenance_degraded is False
+
+
+def test_explicit_provider_fields_override_inferred_payload_and_header_values():
+    payload = {
+        "data": [{
+            "executed_at": "2026-01-01T11:58:00+00:00",
+            "published_at": "2026-01-01T11:58:30+00:00",
+            "revision": "rev-payload",
+        }]
+    }
+    headers = {
+        "Last-Modified": "Thu, 01 Jan 2026 11:58:45 GMT",
+        "ETag": "rev-header",
+    }
+
+    hints = infer_source_time_hints(
+        payload_json=payload,
+        response_headers=headers,
+        explicit_event_time_raw="2026-01-01T11:59:10+00:00",
+        explicit_publish_time_raw="2026-01-01T11:59:20+00:00",
+        explicit_effective_time_raw="2026-01-01T11:59:25+00:00",
+        explicit_revision="rev-explicit",
+    )
+
+    assert hints.event_time_utc == dt.datetime(2026, 1, 1, 11, 59, 10, tzinfo=dt.timezone.utc)
+    assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 20, tzinfo=dt.timezone.utc)
+    assert hints.effective_time_utc == dt.datetime(2026, 1, 1, 11, 59, 25, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-explicit"

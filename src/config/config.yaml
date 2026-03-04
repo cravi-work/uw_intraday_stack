@@ -20,7 +20,9 @@ ingestion:
   wall_top_n: 5
   gex_top_n: 7
 validation:
-  horizons_minutes: [15, 60]
+  horizons_minutes:
+  - 15
+  - 60
   flat_threshold_pct: 0.001
   tolerance_minutes: 10
   max_horizon_drift_minutes: 10
@@ -32,19 +34,40 @@ validation:
   horizon_weights_source: model
   horizon_weights: {}
   horizon_weights_overrides:
-    "15": {}
-    "60": {}
-    "to_close": {}
+    '15': {}
+    '60': {}
+    to_close: {}
   horizon_critical_features:
-    "15": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
-    "60": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
-    "to_close": ["spot", "smart_whale_pressure", "net_gex_sign", "oi_pressure"]
+    '15':
+    - spot
+    - smart_whale_pressure
+    - net_gex_sign
+    - oi_pressure
+    '60':
+    - spot
+    - smart_whale_pressure
+    - net_gex_sign
+    - oi_pressure
+    to_close:
+    - spot
+    - smart_whale_pressure
+    - net_gex_sign
+    - oi_pressure
   label_contract:
     label_version: 2026.02.0
     session_boundary_rule: TRUNCATE_TO_SESSION_CLOSE
     flat_threshold_policy: ABS_RETURN_BAND
     threshold_policy_version: 2026.02.0
     contract_source: runtime_config
+  decision_path_policy:
+    contract_version: decision_path/v1
+    zero_weight_is_non_decision: true
+    require_feature_metadata: true
+    allow_explicit_zero_weight_critical_override: true
+    explicit_zero_weight_critical_features:
+      '15': []
+      '60': []
+      to_close: []
 network:
   base_url: ${UW_BASE_URL:-https://api.unusualwhales.com}
   timeout_seconds: 15
@@ -69,7 +92,10 @@ model:
   target_spec:
     target_name: intraday_direction_3class
     target_version: 2026.02.0
-    class_labels: [UP, DOWN, FLAT]
+    class_labels:
+    - UP
+    - DOWN
+    - FLAT
     contract_source: runtime_config
     probability_tolerance: 1.0e-06
   confidence_cap: 0.55
@@ -85,40 +111,210 @@ model:
     net_gamma_exposure_notional: 0.25
     dealer_vanna: 0.5
     dealer_charm: 0.35
-    oi_pressure: 0.30
+    oi_pressure: 0.3
     darkpool_pressure: 0.0
     litflow_pressure: 0.25
     vol_term_slope: 0.15
-    vol_skew: 0.10
+    vol_skew: 0.1
     iv_rank: 0.05
-  calibration:
-    artifact_name: bounded_additive_score_calibration
-    artifact_version: 2026.02.0
-    artifact_source: runtime_config
-    bins:
-    - 0.0
-    - 0.1
-    - 0.2
-    - 0.3
-    - 0.4
-    - 0.5
-    - 0.6
-    - 0.7
-    - 0.8
-    - 0.9
-    - 1.0
-    mapped:
-    - 0.02
-    - 0.08
-    - 0.16
-    - 0.26
-    - 0.38
-    - 0.5
-    - 0.62
-    - 0.74
-    - 0.84
-    - 0.92
-    - 0.98
+  calibration_registry:
+    registry_version: 2026.03.0
+    default_regime: DEFAULT
+    selection_policy:
+      require_scope_match: true
+      allow_legacy_fallback: false
+    artifacts:
+    - artifact_name: bounded_additive_score_calibration
+      artifact_version: 2026.03.0.fixed15.rth
+      target_name: intraday_direction_3class
+      target_version: 2026.02.0
+      scope:
+        horizon_kind: FIXED
+        horizon_minutes: 15
+        session: RTH
+        regime: DEFAULT
+        replay_mode: ANY
+      bins:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      mapped:
+      - 0.02
+      - 0.08
+      - 0.16
+      - 0.26
+      - 0.38
+      - 0.5
+      - 0.62
+      - 0.74
+      - 0.84
+      - 0.92
+      - 0.98
+    - artifact_name: bounded_additive_score_calibration
+      artifact_version: 2026.03.0.fixed15.any
+      target_name: intraday_direction_3class
+      target_version: 2026.02.0
+      scope:
+        horizon_kind: FIXED
+        horizon_minutes: 15
+        session: ANY
+        regime: DEFAULT
+        replay_mode: ANY
+      bins:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      mapped:
+      - 0.02
+      - 0.08
+      - 0.16
+      - 0.26
+      - 0.38
+      - 0.5
+      - 0.62
+      - 0.74
+      - 0.84
+      - 0.92
+      - 0.98
+    - artifact_name: bounded_additive_score_calibration
+      artifact_version: 2026.03.0.fixed60.rth
+      target_name: intraday_direction_3class
+      target_version: 2026.02.0
+      scope:
+        horizon_kind: FIXED
+        horizon_minutes: 60
+        session: RTH
+        regime: DEFAULT
+        replay_mode: ANY
+      bins:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      mapped:
+      - 0.02
+      - 0.08
+      - 0.16
+      - 0.26
+      - 0.38
+      - 0.5
+      - 0.62
+      - 0.74
+      - 0.84
+      - 0.92
+      - 0.98
+    - artifact_name: bounded_additive_score_calibration
+      artifact_version: 2026.03.0.fixed60.any
+      target_name: intraday_direction_3class
+      target_version: 2026.02.0
+      scope:
+        horizon_kind: FIXED
+        horizon_minutes: 60
+        session: ANY
+        regime: DEFAULT
+        replay_mode: ANY
+      bins:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      mapped:
+      - 0.02
+      - 0.08
+      - 0.16
+      - 0.26
+      - 0.38
+      - 0.5
+      - 0.62
+      - 0.74
+      - 0.84
+      - 0.92
+      - 0.98
+    - artifact_name: bounded_additive_score_calibration
+      artifact_version: 2026.03.0.toclose.rth
+      target_name: intraday_direction_3class
+      target_version: 2026.02.0
+      scope:
+        horizon_kind: TO_CLOSE
+        session: RTH
+        regime: DEFAULT
+        replay_mode: ANY
+      bins:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      mapped:
+      - 0.02
+      - 0.08
+      - 0.16
+      - 0.26
+      - 0.38
+      - 0.5
+      - 0.62
+      - 0.74
+      - 0.84
+      - 0.92
+      - 0.98
+    contract_version: calibration_registry/v1
+    compatibility_rules:
+      require_target_match: true
+      require_horizon_match: true
+      require_session_match: true
+      require_regime_match: true
+      require_replay_mode_match: true
+      require_artifact_hash: true
+  ood_assessment_policy:
+    contract_version: ood_assessment/v1
+    degraded_coverage_threshold: 0.85
+    out_coverage_threshold: 0.5
+    boundary_slack: 1.0e-06
+    require_assessment_before_emission: true
+  ood_probability_policy:
+    contract_version: ood_probability/v1
+    out_confidence_scale: 0.0
+    out_emit_calibrated: false
+    unknown_confidence_scale: 0.0
+    unknown_emit_calibrated: false
+    degraded_confidence_scale: 0.5
+    degraded_emit_calibrated: true
 adapt:
   enabled: false
   rolling_window_predictions: 500

@@ -34,6 +34,7 @@ class HttpResult:
     error_type: Optional[str]
     error_message: Optional[str]
     retry_count: int
+    response_headers: Optional[Dict[str, str]] = None
 
 
 class CircuitBreaker:
@@ -145,6 +146,22 @@ class UwClient:
         tail = self.backoff_seconds[-1] if self.backoff_seconds else 1.0
         return float(tail * (2 ** max(0, attempt - len(self.backoff_seconds) + 1)))
 
+    def _extract_response_headers(self, headers: Mapping[str, str]) -> Dict[str, str]:
+        keep = {
+            "last-modified",
+            "etag",
+            "x-source-publish-time",
+            "x-published-at",
+            "x-source-revision",
+            "x-revision",
+        }
+        out: Dict[str, str] = {}
+        for key, value in headers.items():
+            norm_key = str(key).strip().lower()
+            if norm_key in keep and value not in (None, ""):
+                out[norm_key] = str(value).strip()
+        return out
+
     async def request(
         self,
         method: str,
@@ -176,6 +193,7 @@ class UwClient:
                 error_type="CircuitOpen",
                 error_message="Circuit breaker open",
                 retry_count=0,
+                response_headers=None,
             ), self._cb.snapshot_state(endpoint_sig)
 
         url_path = path
@@ -192,6 +210,7 @@ class UwClient:
                         resp = await self._client.request(method_u, url_path, params=qp)
                 received_at = time.time()
                 latency_ms = int((received_at - requested_at) * 1000)
+                response_headers = self._extract_response_headers(resp.headers)
 
                 if 200 <= resp.status_code < 300:
                     try:
@@ -203,7 +222,7 @@ class UwClient:
                             payload_json=None, payload_text=resp.text, payload_hash=None,
                             requested_at_utc=requested_at, received_at_utc=received_at,
                             latency_ms=latency_ms, error_type="JsonDecodeError", error_message=str(je),
-                            retry_count=attempt,
+                            retry_count=attempt, response_headers=response_headers,
                         )
                         self._cb.on_failure(endpoint_sig)
                         break
@@ -213,14 +232,14 @@ class UwClient:
                         ok=True, status_code=resp.status_code,
                         payload_json=payload_json, payload_text=None, payload_hash=payload_hash,
                         requested_at_utc=requested_at, received_at_utc=received_at, latency_ms=latency_ms,
-                        error_type=None, error_message=None, retry_count=attempt,
+                        error_type=None, error_message=None, retry_count=attempt, response_headers=response_headers,
                     ), self._cb.snapshot_state(endpoint_sig)
 
                 last_err = HttpResult(
                     ok=False, status_code=resp.status_code,
                     payload_json=None, payload_text=resp.text, payload_hash=None,
                     requested_at_utc=requested_at, received_at_utc=received_at, latency_ms=latency_ms,
-                    error_type="HttpStatusError", error_message=f"HTTP {resp.status_code}", retry_count=attempt,
+                    error_type="HttpStatusError", error_message=f"HTTP {resp.status_code}", retry_count=attempt, response_headers=response_headers,
                 )
                 self._cb.on_failure(endpoint_sig)
                 if resp.status_code >= 500 and attempt < self.max_retries:
@@ -235,7 +254,7 @@ class UwClient:
                     ok=False, status_code=None,
                     payload_json=None, payload_text=None, payload_hash=None,
                     requested_at_utc=requested_at, received_at_utc=received_at, latency_ms=latency_ms,
-                    error_type=type(ne).__name__, error_message=str(ne), retry_count=attempt,
+                    error_type=type(ne).__name__, error_message=str(ne), retry_count=attempt, response_headers=None,
                 )
                 self._cb.on_failure(endpoint_sig)
                 if attempt < self.max_retries:
@@ -251,7 +270,7 @@ class UwClient:
                     ok=False, status_code=None,
                     payload_json=None, payload_text=None, payload_hash=None,
                     requested_at_utc=requested_at, received_at_utc=received_at, latency_ms=latency_ms,
-                    error_type=type(e).__name__, error_message=str(e), retry_count=attempt,
+                    error_type=type(e).__name__, error_message=str(e), retry_count=attempt, response_headers=None,
                 )
                 self._cb.on_failure(endpoint_sig)
                 break

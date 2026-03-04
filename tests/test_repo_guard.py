@@ -39,6 +39,16 @@ def test_repo_guard_fails_on_root_type_expression_artifact(tmp_path: Path):
     assert "Optional[str]" in result.stdout
 
 
+def test_repo_guard_fails_on_root_generated_output_placeholder(tmp_path: Path):
+    (tmp_path / "derived_levels").write_text("", encoding="utf-8")
+
+    result = _run_guard(tmp_path)
+
+    assert result.returncode == 2
+    assert "Root generated-output placeholder" in result.stdout
+    assert "derived_levels" in result.stdout
+
+
 def test_repo_guard_fails_on_root_patch_helper(tmp_path: Path):
     (tmp_path / "patch_tests.py").write_text("print('oops')\n", encoding="utf-8")
 

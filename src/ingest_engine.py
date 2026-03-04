@@ -17,6 +17,11 @@ from .config_loader import (
     find_unsupported_config_keys,
     load_endpoint_plan,
     normalize_runtime_config,
+    resolve_calibration_governance,
+    resolve_decision_path_policy,
+    resolve_endpoint_purpose_contract,
+    resolve_ood_assessment_policy,
+    resolve_ood_probability_policy,
     summarize_effective_runtime_config,
 )
 from .file_lock import FileLock, FileLockError
@@ -38,7 +43,6 @@ from .models import (
     KNOWN_FEATURE_KEYS,
     build_prediction_target_spec,
     build_label_contract_spec,
-    build_calibration_artifact_ref,
     OODState,
     ReplayMode,
 )
@@ -50,6 +54,7 @@ from .endpoint_truth import (
     NaReasonCode,
     PayloadAssessment,
     classify_payload, 
+    infer_source_time_hints,
     resolve_effective_payload, 
     to_utc_dt
 )
@@ -58,6 +63,8 @@ from .freshness_policy import (
     FeaturePolicyAssessment,
     assess_feature_freshness,
 )
+from .ood import OODAssessment, assess_operational_ood, resolve_ood_policy
+from .calibration_registry import CalibrationSelectionResult, resolve_calibration_regime, select_calibration_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +77,204 @@ class PlannedCall:
     query_params: Dict[str, Any]
     is_market: bool
     purpose: str = "signal-critical"
+    decision_path: bool = True
+    missing_affects_confidence: bool = True
+    stale_affects_confidence: bool = True
+    purpose_contract_version: str = "v1"
+
+
+def _require_mapping(mapping: Dict[str, Any], key: str, path: str) -> Dict[str, Any]:
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        raise KeyError(f"Missing {path}")
+    return value
+
+
+def _require_nonempty_str(mapping: Dict[str, Any], key: str, path: str) -> str:
+    value = mapping.get(key)
+    if value is None or not str(value).strip():
+        raise KeyError(f"Missing {path}")
+    return str(value).strip()
+
+
+def _require_bool(mapping: Dict[str, Any], key: str, path: str) -> bool:
+    if key not in mapping or type(mapping[key]) is not bool:
+        raise KeyError(f"Missing {path}")
+    return bool(mapping[key])
+
+
+def _require_float(mapping: Dict[str, Any], key: str, path: str, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
+    if key not in mapping:
+        raise KeyError(f"Missing {path}")
+    value = mapping[key]
+    if not isinstance(value, (float, int)) or not math.isfinite(float(value)):
+        raise ValueError(f"{path} must be a finite float")
+    value_f = float(value)
+    if minimum is not None and value_f < minimum:
+        raise ValueError(f"{path} must be >= {minimum}")
+    if maximum is not None and value_f > maximum:
+        raise ValueError(f"{path} must be <= {maximum}")
+    return value_f
+
+
+def _effective_weights_for_horizon(cfg: Dict[str, Any], horizon: str) -> Dict[str, float]:
+    val_cfg = cfg.get("validation", {}) or {}
+    src = val_cfg.get("horizon_weights_source")
+    if src == "model":
+        base = dict((cfg.get("model", {}) or {}).get("weights", {}) or {})
+        overrides = dict((val_cfg.get("horizon_weights_overrides", {}) or {}).get(horizon, {}) or {})
+        base.update(overrides)
+        return {str(k): float(v) for k, v in base.items()}
+    return {str(k): float(v) for k, v in dict((val_cfg.get("horizon_weights", {}) or {}).get(horizon, {}) or {}).items()}
+
+
+def _validate_governance_contract(cfg: Dict[str, Any], horizons: List[str]) -> None:
+    val_cfg = cfg.get("validation", {}) or {}
+    model_cfg = cfg.get("model", {}) or {}
+
+    decision_path_policy = resolve_decision_path_policy(cfg)
+    dp_section = val_cfg.get("decision_path_policy")
+    if dp_section is not None and not isinstance(dp_section, dict):
+        raise ValueError("validation.decision_path_policy must be a mapping")
+
+    if isinstance(dp_section, dict):
+        _require_nonempty_str(dp_section, "contract_version", "validation.decision_path_policy.contract_version")
+        _require_bool(dp_section, "zero_weight_is_non_decision", "validation.decision_path_policy.zero_weight_is_non_decision")
+        _require_bool(dp_section, "require_feature_metadata", "validation.decision_path_policy.require_feature_metadata")
+        allow_zero_weight_override = _require_bool(
+            dp_section,
+            "allow_explicit_zero_weight_critical_override",
+            "validation.decision_path_policy.allow_explicit_zero_weight_critical_override",
+        )
+        overrides_raw = _require_mapping(
+            dp_section,
+            "explicit_zero_weight_critical_features",
+            "validation.decision_path_policy.explicit_zero_weight_critical_features",
+        )
+        for horizon in horizons:
+            if horizon not in overrides_raw:
+                raise KeyError(
+                    f"Missing validation.decision_path_policy.explicit_zero_weight_critical_features for horizon '{horizon}'"
+                )
+            if not isinstance(overrides_raw[horizon], list):
+                raise ValueError(
+                    f"validation.decision_path_policy.explicit_zero_weight_critical_features['{horizon}'] must be a list"
+                )
+    else:
+        allow_zero_weight_override = bool(decision_path_policy["allow_explicit_zero_weight_critical_override"])
+        overrides_raw = {horizon: [] for horizon in horizons}
+
+    if decision_path_policy["zero_weight_is_non_decision"] is not True:
+        raise ValueError("validation.decision_path_policy.zero_weight_is_non_decision must be true")
+    if decision_path_policy["require_feature_metadata"] is not True:
+        raise ValueError("validation.decision_path_policy.require_feature_metadata must be true")
+
+    for horizon in horizons:
+        effective_weights = _effective_weights_for_horizon(cfg, horizon)
+        zero_weight_keys = {k for k, v in effective_weights.items() if float(v) == 0.0}
+        criticals = set(val_cfg.get("horizon_critical_features", {}).get(horizon, []) or [])
+        overrides = set(overrides_raw.get(horizon, []) or [])
+        invalid_override_targets = overrides - set(effective_weights.keys())
+        if invalid_override_targets:
+            raise ValueError(
+                f"validation.decision_path_policy explicit override references unknown weighted features for horizon '{horizon}': {sorted(invalid_override_targets)}"
+            )
+        nonzero_override_targets = overrides - zero_weight_keys
+        if nonzero_override_targets:
+            raise ValueError(
+                f"validation.decision_path_policy explicit override references non-zero-weight features for horizon '{horizon}': {sorted(nonzero_override_targets)}"
+            )
+        leaking_zero_weight_criticals = zero_weight_keys & criticals
+        if leaking_zero_weight_criticals and not allow_zero_weight_override:
+            raise ValueError(
+                f"Zero-weight critical features are not allowed by validation.decision_path_policy for horizon '{horizon}': {sorted(leaking_zero_weight_criticals)}"
+            )
+        missing_explicit_override = leaking_zero_weight_criticals - overrides
+        if missing_explicit_override:
+            raise ValueError(
+                f"Zero-weight critical features require explicit override in validation.decision_path_policy for horizon '{horizon}': {sorted(missing_explicit_override)}"
+            )
+
+    ood_assessment_raw = model_cfg.get("ood_assessment_policy")
+    ood_assessment_policy = resolve_ood_assessment_policy(cfg)
+    if ood_assessment_raw is not None:
+        if not isinstance(ood_assessment_raw, dict):
+            raise ValueError("model.ood_assessment_policy must be a mapping")
+        _require_nonempty_str(ood_assessment_raw, "contract_version", "model.ood_assessment_policy.contract_version")
+        _require_bool(ood_assessment_raw, "require_assessment_before_emission", "model.ood_assessment_policy.require_assessment_before_emission")
+        degraded_threshold = _require_float(
+            ood_assessment_raw, "degraded_coverage_threshold", "model.ood_assessment_policy.degraded_coverage_threshold", minimum=0.0, maximum=1.0
+        )
+        out_threshold = _require_float(
+            ood_assessment_raw, "out_coverage_threshold", "model.ood_assessment_policy.out_coverage_threshold", minimum=0.0, maximum=1.0
+        )
+        _require_float(ood_assessment_raw, "boundary_slack", "model.ood_assessment_policy.boundary_slack", minimum=0.0)
+        if out_threshold > degraded_threshold:
+            raise ValueError("model.ood_assessment_policy.out_coverage_threshold must be <= degraded_coverage_threshold")
+    if bool(ood_assessment_policy.get("require_assessment_before_emission", False)) is not True:
+        raise ValueError("model.ood_assessment_policy.require_assessment_before_emission must be true")
+
+    ood_probability_raw = model_cfg.get("ood_probability_policy")
+    ood_probability_policy = resolve_ood_probability_policy(cfg)
+    if ood_probability_raw is not None:
+        if not isinstance(ood_probability_raw, dict):
+            raise ValueError("model.ood_probability_policy must be a mapping")
+        _require_nonempty_str(ood_probability_raw, "contract_version", "model.ood_probability_policy.contract_version")
+        for field in ("out_confidence_scale", "unknown_confidence_scale", "degraded_confidence_scale"):
+            _require_float(ood_probability_raw, field, f"model.ood_probability_policy.{field}", minimum=0.0, maximum=1.0)
+        for field in ("out_emit_calibrated", "unknown_emit_calibrated", "degraded_emit_calibrated"):
+            _require_bool(ood_probability_raw, field, f"model.ood_probability_policy.{field}")
+    if bool(ood_probability_policy.get("out_emit_calibrated")):
+        raise ValueError("model.ood_probability_policy.out_emit_calibrated must be false")
+    if bool(ood_probability_policy.get("unknown_emit_calibrated")):
+        raise ValueError("model.ood_probability_policy.unknown_emit_calibrated must be false")
+
+    calibration_registry_raw = model_cfg.get("calibration_registry")
+    calibration_governance = resolve_calibration_governance(cfg)
+    if calibration_registry_raw is not None:
+        if not isinstance(calibration_registry_raw, dict):
+            raise ValueError("model.calibration_registry must be a mapping")
+        _require_nonempty_str(calibration_registry_raw, "contract_version", "model.calibration_registry.contract_version")
+        _require_nonempty_str(calibration_registry_raw, "registry_version", "model.calibration_registry.registry_version")
+        _require_nonempty_str(calibration_registry_raw, "default_regime", "model.calibration_registry.default_regime")
+        selection_policy_raw = _require_mapping(calibration_registry_raw, "selection_policy", "model.calibration_registry.selection_policy")
+        compatibility_rules_raw = _require_mapping(calibration_registry_raw, "compatibility_rules", "model.calibration_registry.compatibility_rules")
+        _require_bool(selection_policy_raw, "require_scope_match", "model.calibration_registry.selection_policy.require_scope_match")
+        _require_bool(selection_policy_raw, "allow_legacy_fallback", "model.calibration_registry.selection_policy.allow_legacy_fallback")
+        if calibration_governance["selection_policy"]["require_scope_match"] is not True:
+            raise ValueError("model.calibration_registry.selection_policy.require_scope_match must be true")
+        if calibration_governance["selection_policy"]["allow_legacy_fallback"] is not False:
+            raise ValueError("model.calibration_registry.selection_policy.allow_legacy_fallback must be false")
+        required_compatibility_rules = (
+            "require_target_match",
+            "require_horizon_match",
+            "require_session_match",
+            "require_regime_match",
+            "require_replay_mode_match",
+            "require_artifact_hash",
+        )
+        for key in required_compatibility_rules:
+            _require_bool(compatibility_rules_raw, key, f"model.calibration_registry.compatibility_rules.{key}")
+            if calibration_governance["compatibility_rules"][key] is not True:
+                raise ValueError(f"model.calibration_registry.compatibility_rules.{key} must be true")
+        artifacts = calibration_registry_raw.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("model.calibration_registry.artifacts must be a non-empty list")
+        if model_cfg.get("calibration") is not None:
+            raise ValueError("model.calibration legacy mapping must be removed when model.calibration_registry governs forward probabilities")
+    else:
+        calibration = model_cfg.get("calibration")
+        if calibration is not None:
+            if not isinstance(calibration, dict):
+                raise ValueError("model.calibration must be a mapping")
+            for key in ["artifact_name", "artifact_version", "bins", "mapped"]:
+                if key not in calibration:
+                    raise KeyError(f"Missing model.calibration.{key}")
+            bins = calibration.get("bins") or []
+            mapped = calibration.get("mapped") or []
+            if len(bins) != len(mapped) or len(bins) < 2:
+                raise ValueError("model.calibration bins/mapped must be same length and contain at least 2 points")
+
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
     normalized = normalize_runtime_config(cfg)
@@ -175,18 +380,8 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
             for key in ["target_name", "target_version"]:
                 if key not in target_spec or not str(target_spec[key]).strip():
                     raise KeyError(f"Missing model.target_spec.{key}")
-        calibration = model_cfg.get("calibration")
-        if calibration is not None:
-            if not isinstance(calibration, dict):
-                raise ValueError("model.calibration must be a mapping")
-            for key in ["artifact_name", "artifact_version", "bins", "mapped"]:
-                if key not in calibration:
-                    raise KeyError(f"Missing model.calibration.{key}")
-            bins = calibration.get("bins") or []
-            mapped = calibration.get("mapped") or []
-            if len(bins) != len(mapped) or len(bins) < 2:
-                raise ValueError("model.calibration bins/mapped must be same length and contain at least 2 points")
 
+    _validate_governance_contract(cfg, horizons)
     validate_adapt_config(cfg)
 
     unknown_keys = set()
@@ -213,30 +408,40 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
         extra={"json": {"effective_runtime_config": summarize_effective_runtime_config(cfg)}},
     )
 
+
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
-    def _parse(entries, market: bool = False) -> List[PlannedCall]:
+    def _parse(entries, *, section_name: str, market: bool = False) -> List[PlannedCall]:
         planned: List[PlannedCall] = []
-        for x in (entries or []):
-            purpose = str(x.get("purpose", "signal-critical")).strip() or "signal-critical"
-            if purpose == "disabled":
+        for idx, raw_entry in enumerate(entries or []):
+            entry = resolve_endpoint_purpose_contract(
+                raw_entry,
+                section_name=section_name,
+                entry_index=idx,
+                require_explicit=False,
+            )
+            if entry["purpose"] == "disabled":
                 continue
             planned.append(
                 PlannedCall(
-                    x["name"],
-                    x["method"],
-                    x["path"],
-                    x.get("path_params", {}) or {},
-                    x.get("query_params", {}) or {},
+                    entry["name"],
+                    entry["method"],
+                    entry["path"],
+                    entry["path_params"],
+                    entry["query_params"],
                     market,
-                    purpose,
+                    entry["purpose"],
+                    entry["decision_path"],
+                    entry["missing_affects_confidence"],
+                    entry["stale_affects_confidence"],
+                    entry["purpose_contract_version"],
                 )
             )
         return planned
 
-    core = _parse(plan_yaml.get("plans", {}).get("default", []))
+    core = _parse(plan_yaml.get("plans", {}).get("default", []), section_name="default")
     market = []
     if cfg["ingestion"].get("enable_market_context"):
-        market = _parse(plan_yaml.get("plans", {}).get("market_context", []), True)
+        market = _parse(plan_yaml.get("plans", {}).get("market_context", []), section_name="market_context", market=True)
     return core, market
 
 
@@ -247,13 +452,22 @@ def summarize_effective_endpoint_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, 
 
     def _entries(section: str, market: bool) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
-        for entry in plans.get(section, []) or []:
-            purpose = str(entry.get("purpose", "signal-critical")).strip() or "signal-critical"
+        for idx, raw_entry in enumerate(plans.get(section, []) or []):
+            entry = resolve_endpoint_purpose_contract(
+                raw_entry,
+                section_name=section,
+                entry_index=idx,
+                require_explicit=False,
+            )
             items.append({
-                "name": entry.get("name"),
-                "method": str(entry.get("method", "GET")).upper(),
-                "path": entry.get("path"),
-                "purpose": purpose,
+                "name": entry["name"],
+                "method": entry["method"],
+                "path": entry["path"],
+                "purpose": entry["purpose"],
+                "decision_path": entry["decision_path"],
+                "missing_affects_confidence": entry["missing_affects_confidence"],
+                "stale_affects_confidence": entry["stale_affects_confidence"],
+                "purpose_contract_version": entry["purpose_contract_version"],
                 "is_market": market,
             })
         return items
@@ -465,6 +679,293 @@ def _freshness_credit(assessment: Optional[FeaturePolicyAssessment]) -> float:
 
 
 
+ZERO_WEIGHT_ABS_TOLERANCE = 1e-12
+
+
+def _is_zero_weight(weight: Any) -> bool:
+    try:
+        return math.isclose(float(weight), 0.0, abs_tol=ZERO_WEIGHT_ABS_TOLERANCE)
+    except (TypeError, ValueError):
+        return True
+
+
+def _extract_feature_use_contract(meta_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    meta = meta_json if isinstance(meta_json, dict) else {}
+    raw_contract = meta.get("feature_use_contract") or {}
+    if not isinstance(raw_contract, dict):
+        raw_contract = {}
+
+    source_endpoints = meta.get("source_endpoints") or []
+    primary_source = source_endpoints[0] if source_endpoints and isinstance(source_endpoints[0], dict) else {}
+    metric_lineage = meta.get("metric_lineage") or {}
+
+    use_role = str(
+        raw_contract.get("use_role")
+        or meta.get("use_role")
+        or primary_source.get("purpose")
+        or metric_lineage.get("decision_path_role")
+        or "signal-critical"
+    )
+    decision_path = raw_contract.get("decision_path")
+    if decision_path is None:
+        decision_path = primary_source.get("decision_path")
+    if decision_path is None:
+        decision_path = bool(use_role == "signal-critical")
+
+    decision_eligible = raw_contract.get("decision_eligible")
+    if decision_eligible is None:
+        decision_eligible = meta.get("decision_eligible")
+    if decision_eligible is None:
+        decision_eligible = bool(use_role == "signal-critical" and decision_path)
+
+    missing_affects_confidence = raw_contract.get("missing_affects_confidence")
+    if missing_affects_confidence is None:
+        missing_affects_confidence = meta.get("missing_affects_confidence")
+    if missing_affects_confidence is None:
+        missing_affects_confidence = bool(decision_eligible)
+
+    stale_affects_confidence = raw_contract.get("stale_affects_confidence")
+    if stale_affects_confidence is None:
+        stale_affects_confidence = meta.get("stale_affects_confidence")
+    if stale_affects_confidence is None:
+        stale_affects_confidence = bool(decision_eligible)
+
+    contract = {
+        "contract_version": str(
+            raw_contract.get("contract_version")
+            or primary_source.get("purpose_contract_version")
+            or metric_lineage.get("feature_use_contract_version")
+            or "feature_use/v1"
+        ),
+        "use_role": use_role,
+        "decision_path": bool(decision_path),
+        "decision_eligible": bool(decision_eligible),
+        "missing_affects_confidence": bool(missing_affects_confidence),
+        "stale_affects_confidence": bool(stale_affects_confidence),
+    }
+    if not contract["decision_eligible"]:
+        contract["missing_affects_confidence"] = False
+        contract["stale_affects_confidence"] = False
+    return contract
+
+
+def _build_feature_use_contract_index(valid_features: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(feature.get("feature_key")): _extract_feature_use_contract(feature.get("meta_json"))
+        for feature in valid_features
+        if feature.get("feature_key") is not None
+    }
+
+
+def _resolve_horizon_decision_contract(
+    *,
+    raw_weights: Dict[str, float],
+    required_features: List[str],
+    feature_use_contracts: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    required_set = set(required_features)
+    candidate_keys = sorted(set(raw_weights.keys()) | required_set)
+
+    decision_weights: Dict[str, float] = {}
+    decision_required: List[str] = []
+    zero_weight_excluded: List[str] = []
+    report_only_excluded: List[str] = []
+    context_only_excluded: List[str] = []
+    disabled_excluded: List[str] = []
+    non_decision_eligible_excluded: List[str] = []
+    explicit_critical_overrides: List[str] = []
+    contract_violation_features: List[str] = []
+    contract_snapshot: Dict[str, Dict[str, Any]] = {}
+
+    for feature_key in candidate_keys:
+        feature_contract = feature_use_contracts.get(feature_key)
+        if feature_contract is not None:
+            contract_snapshot[feature_key] = dict(feature_contract)
+
+        has_weight = feature_key in raw_weights
+        raw_weight = raw_weights.get(feature_key)
+        has_nonzero_weight = has_weight and not _is_zero_weight(raw_weight)
+        explicit_critical_override = feature_key in required_set
+
+        if feature_contract is not None and not bool(feature_contract.get("decision_eligible")):
+            use_role = str(feature_contract.get("use_role") or "non-decision")
+            if use_role == "report-only":
+                report_only_excluded.append(feature_key)
+            elif use_role == "context-only":
+                context_only_excluded.append(feature_key)
+            elif use_role == "disabled":
+                disabled_excluded.append(feature_key)
+            else:
+                non_decision_eligible_excluded.append(feature_key)
+
+            if has_weight and not has_nonzero_weight and not explicit_critical_override:
+                zero_weight_excluded.append(feature_key)
+            if has_nonzero_weight or explicit_critical_override:
+                contract_violation_features.append(feature_key)
+            continue
+
+        if has_weight and not has_nonzero_weight and not explicit_critical_override:
+            zero_weight_excluded.append(feature_key)
+            continue
+
+        if has_nonzero_weight:
+            decision_weights[feature_key] = float(raw_weight)
+        if explicit_critical_override:
+            decision_required.append(feature_key)
+            if not has_nonzero_weight:
+                explicit_critical_overrides.append(feature_key)
+
+    target_features = sorted(set(decision_weights.keys()) | set(decision_required))
+
+    return {
+        "configured_weight_features": sorted(raw_weights.keys()),
+        "configured_zero_weight_features": sorted([k for k, v in raw_weights.items() if _is_zero_weight(v)]),
+        "resolved_weight_features": sorted(decision_weights.keys()),
+        "resolved_critical_features": sorted(set(decision_required)),
+        "resolved_target_features": target_features,
+        "zero_weight_excluded_features": sorted(set(zero_weight_excluded)),
+        "report_only_excluded_features": sorted(set(report_only_excluded)),
+        "context_only_excluded_features": sorted(set(context_only_excluded)),
+        "disabled_excluded_features": sorted(set(disabled_excluded)),
+        "non_decision_eligible_excluded_features": sorted(set(non_decision_eligible_excluded)),
+        "explicit_critical_override_features": sorted(set(explicit_critical_overrides)),
+        "contract_violation_features": sorted(set(contract_violation_features)),
+        "feature_contracts": contract_snapshot,
+        "decision_weights": decision_weights,
+    }
+
+
+def _log_horizon_decision_path_exclusions(horizon: str, horizon_contract: Dict[str, Any]) -> None:
+    exclusion_specs = (
+        ("zero_weight_feature_excluded_count", "zero_weight_feature_excluded", logging.INFO, horizon_contract.get("zero_weight_excluded_features", [])),
+        ("report_only_feature_excluded_count", "report_only_feature_excluded", logging.INFO, horizon_contract.get("report_only_excluded_features", [])),
+        ("context_only_feature_excluded_count", "context_only_feature_excluded", logging.INFO, horizon_contract.get("context_only_excluded_features", [])),
+        ("disabled_feature_excluded_count", "disabled_feature_excluded", logging.INFO, horizon_contract.get("disabled_excluded_features", [])),
+        ("non_decision_feature_excluded_count", "non_decision_feature_excluded", logging.INFO, horizon_contract.get("non_decision_eligible_excluded_features", [])),
+    )
+    for counter, event, level, feature_keys in exclusion_specs:
+        if feature_keys:
+            structured_log(
+                logger,
+                level,
+                event=event,
+                msg=f"{event}: {', '.join(feature_keys)}",
+                counter=counter,
+                horizon=horizon,
+                feature_keys=feature_keys,
+            )
+
+    contract_violation_features = horizon_contract.get("contract_violation_features", [])
+    if contract_violation_features:
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="decision_path_contract_violation",
+            msg=f"decision_path_contract_violation: {', '.join(contract_violation_features)}",
+            counter="decision_path_contract_violation_count",
+            horizon=horizon,
+            feature_keys=contract_violation_features,
+        )
+
+
+
+def _log_ood_assessment(horizon: str, assessment: OODAssessment) -> None:
+    if assessment.state == OODState.IN_DISTRIBUTION:
+        structured_log(
+            logger,
+            logging.INFO,
+            event="ood_assessed",
+            msg=f"ood_assessed: {assessment.primary_reason}",
+            counter="ood_in_distribution_count",
+            horizon=horizon,
+            ood_state=assessment.state.value,
+            primary_reason=assessment.primary_reason,
+            coverage_ratio=assessment.coverage_ratio,
+            decision_feature_count=assessment.total_decision_feature_count,
+            valid_decision_feature_count=assessment.valid_decision_feature_count,
+        )
+        return
+
+    counter = "ood_unknown_count"
+    level = logging.WARNING
+    if assessment.state == OODState.DEGRADED:
+        counter = "ood_degraded_count"
+        level = logging.INFO
+    elif assessment.state == OODState.OUT_OF_DISTRIBUTION:
+        counter = "ood_rejection_count"
+
+    structured_log(
+        logger,
+        level,
+        event="ood_assessed",
+        msg=f"ood_assessed: {assessment.primary_reason}",
+        counter=counter,
+        horizon=horizon,
+        ood_state=assessment.state.value,
+        primary_reason=assessment.primary_reason,
+        reasons=list(assessment.reasons),
+        coverage_ratio=assessment.coverage_ratio,
+        decision_feature_count=assessment.total_decision_feature_count,
+        valid_decision_feature_count=assessment.valid_decision_feature_count,
+        degraded_feature_keys=list(assessment.degraded_feature_keys),
+        missing_feature_keys=list(assessment.missing_feature_keys),
+        session_mismatch_features=list(assessment.session_mismatch_features),
+        normalization_failure_features=list(assessment.normalization_failure_features),
+    )
+
+    if assessment.boundary_violation_features:
+        structured_log(
+            logger,
+            logging.WARNING,
+            event="ood_feature_boundary_violation",
+            msg="ood_feature_boundary_violation",
+            counter="ood_feature_boundary_violation_count",
+            horizon=horizon,
+            ood_state=assessment.state.value,
+            boundary_violation_features=assessment.boundary_violation_features,
+        )
+
+
+def _log_calibration_selection(horizon: str, selection: CalibrationSelectionResult) -> None:
+    if selection.artifact is not None:
+        structured_log(
+            logger,
+            logging.INFO,
+            event="calibration_artifact_selected",
+            msg=f"calibration_artifact_selected: {selection.artifact.artifact_version}",
+            counter="calibration_artifact_selected_count",
+            horizon=horizon,
+            reason_code=selection.reason_code,
+            reasons=list(selection.reasons),
+            registry_version=selection.registry_version,
+            registry_source=selection.registry_source,
+            request=selection.request.to_dict(),
+            calibration_scope=selection.artifact.calibration_scope,
+            artifact_name=selection.artifact.artifact_name,
+            artifact_version=selection.artifact.artifact_version,
+            artifact_hash=selection.artifact.artifact_hash,
+        )
+        return
+
+    counter = "calibration_artifact_missing_count"
+    if selection.reason_code in {"TARGET_MISMATCH", "HORIZON_MISMATCH", "SESSION_MISMATCH", "REGIME_MISMATCH", "REPLAY_MODE_MISMATCH"}:
+        counter = "calibration_scope_mismatch_count"
+
+    structured_log(
+        logger,
+        logging.WARNING,
+        event="calibration_artifact_unavailable",
+        msg=f"calibration_artifact_unavailable: {selection.reason_code}",
+        counter=counter,
+        horizon=horizon,
+        reason_code=selection.reason_code,
+        reasons=list(selection.reasons),
+        registry_version=selection.registry_version,
+        registry_source=selection.registry_source,
+        request=selection.request.to_dict(),
+        invalid_entries=list(selection.invalid_entries),
+    )
+
 def generate_predictions(
     cfg: Dict[str, Any],
     snapshot_id: int,
@@ -479,6 +980,7 @@ def generate_predictions(
     Shared identically between live ingestion and replay engine to guarantee governance parity.
     """
     feature_value_map = {f["feature_key"]: f["feature_value"] for f in valid_features}
+    feature_use_contracts_by_key = _build_feature_use_contract_index(valid_features)
     cadence_sec = int(cfg["ingestion"]["cadence_minutes"]) * 60
 
     ts_list: List[dt.datetime] = []
@@ -577,12 +1079,12 @@ def generate_predictions(
         base_reqs = cfg["validation"]["horizon_critical_features"][h_str]
 
         if cfg["validation"]["horizon_weights_source"] == "model":
-            weights = dict(cfg["model"]["weights"])
+            raw_weights = dict(cfg["model"]["weights"])
             overrides = cfg["validation"]["horizon_weights_overrides"][h_str]
             if overrides:
-                weights.update(overrides)
+                raw_weights.update(overrides)
         else:
-            weights = cfg["validation"]["horizon_weights"][h_str]
+            raw_weights = dict(cfg["validation"]["horizon_weights"][h_str])
 
         use_default_reqs = cfg["validation"]["use_default_required_features"]
 
@@ -595,31 +1097,68 @@ def generate_predictions(
                 SessionState.CLOSED: ["spot"],
             }.get(session_enum, ["spot"])
             reqs = list(set(reqs) | set(session_default_criticals))
-        else:
-            if not reqs:
-                logger.info(f"No explicit critical features for horizon {h_str} and defaults disabled. Empty critical set allowed.")
+        elif not reqs:
+            logger.info(f"No explicit critical features for horizon {h_str} and defaults disabled. Empty critical set allowed.")
 
-        target_features = set(weights.keys()) | set(reqs)
+        horizon_contract = _resolve_horizon_decision_contract(
+            raw_weights=raw_weights,
+            required_features=reqs,
+            feature_use_contracts=feature_use_contracts_by_key,
+        )
+        horizon_contract["use_default_required_features"] = use_default_reqs
+        _log_horizon_decision_path_exclusions(h_str, horizon_contract)
 
-        horizon_contract = {
-            "use_default_required_features": use_default_reqs,
-            "resolved_critical_features": sorted(list(reqs)),
-        }
+        weights = dict(horizon_contract.pop("decision_weights"))
+        reqs = list(horizon_contract["resolved_critical_features"])
+        target_features = set(horizon_contract["resolved_target_features"])
 
         if not target_features:
+            configured_targets = sorted(set(raw_weights.keys()) | set(base_reqs))
+            invalid_contract_reason = "invalid_contract_no_decision_targets" if configured_targets else "invalid_contract_no_targets"
             logger.error(
-                f"invalid_contract_horizon_{h_str}: No target features (critical or weighted) defined.",
-                extra={"counter": "invalid_horizon_contract"},
+                f"invalid_contract_horizon_{h_str}: No decision-eligible target features defined.",
+                extra={
+                    "counter": "invalid_horizon_contract",
+                    "horizon": h_str,
+                    "configured_targets": configured_targets,
+                    "decision_path_exclusions": {
+                        "zero_weight": horizon_contract.get("zero_weight_excluded_features", []),
+                        "report_only": horizon_contract.get("report_only_excluded_features", []),
+                        "context_only": horizon_contract.get("context_only_excluded_features", []),
+                        "contract_violations": horizon_contract.get("contract_violation_features", []),
+                    },
+                },
             )
-            return current_base_gate.block(f"invalid_contract_no_targets_{h_str}", invalid=True), weights, 0.0, horizon_contract, ["invalid_contract_no_targets"], {}
+            return (
+                current_base_gate.block(f"{invalid_contract_reason}_{h_str}", invalid=True),
+                weights,
+                0.0,
+                horizon_contract,
+                [invalid_contract_reason],
+                {
+                    "configured_targets": configured_targets,
+                    "decision_path_exclusions": {
+                        "zero_weight": horizon_contract.get("zero_weight_excluded_features", []),
+                        "report_only": horizon_contract.get("report_only_excluded_features", []),
+                        "context_only": horizon_contract.get("context_only_excluded_features", []),
+                        "contract_violations": horizon_contract.get("contract_violation_features", []),
+                    },
+                },
+            )
 
         logger.info(
             f"resolved_horizon_{h_str}_features",
             extra={
                 "counter": "resolved_horizon_features",
                 "horizon": h_str,
-                "critical_features": sorted(list(reqs)),
-                "target_features": sorted(list(target_features)),
+                "critical_features": reqs,
+                "weighted_features": sorted(weights.keys()),
+                "target_features": sorted(target_features),
+                "decision_path_exclusions": {
+                    "zero_weight": horizon_contract.get("zero_weight_excluded_features", []),
+                    "report_only": horizon_contract.get("report_only_excluded_features", []),
+                    "context_only": horizon_contract.get("context_only_excluded_features", []),
+                },
             },
         )
 
@@ -648,7 +1187,10 @@ def generate_predictions(
             )
 
         missing_criticals = [k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])]
-        missing_non_criticals = [k for k in weights.keys() if k not in reqs and (k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]))]
+        missing_non_criticals = [
+            k for k in weights.keys()
+            if k not in reqs and (k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k]))
+        ]
 
         valid_target_keys = {k for k in target_features if k in feat_dict and feat_dict[k] is not None and math.isfinite(feat_dict[k])}
 
@@ -656,7 +1198,7 @@ def generate_predictions(
         target_diagnostics: Dict[str, Any] = {}
 
         if len(valid_target_keys) == 0:
-            expected_keys = sorted(list(target_features))
+            expected_keys = sorted(target_features)
             filter_reasons = {
                 "missing": sorted([k for k in expected_keys if assessments_by_feature.get(k) is None]),
                 "misaligned": sorted([k for k in expected_keys if assessments_by_feature.get(k) and assessments_by_feature[k].reason == FeatureDecisionReason.JOIN_SKEW_VIOLATION]),
@@ -674,6 +1216,12 @@ def generate_predictions(
                 "future_ts_keys": filter_reasons["future_ts"],
                 "missing_ts_keys": filter_reasons["missing_ts"],
                 "stale_keys": filter_reasons["stale"],
+                "decision_path_exclusions": {
+                    "zero_weight": horizon_contract.get("zero_weight_excluded_features", []),
+                    "report_only": horizon_contract.get("report_only_excluded_features", []),
+                    "context_only": horizon_contract.get("context_only_excluded_features", []),
+                    "contract_violations": horizon_contract.get("contract_violation_features", []),
+                },
             }
 
             actual_missing_criticals = sorted([k for k in reqs if k not in feat_dict or feat_dict[k] is None or not math.isfinite(feat_dict[k])])
@@ -692,6 +1240,7 @@ def generate_predictions(
                     "missing_criticals": actual_missing_criticals,
                     "excluded_by_alignment_count": excluded_align_count,
                     "filter_reasons": filter_reasons,
+                    "decision_path_exclusions": target_diagnostics["decision_path_exclusions"],
                 },
             )
             h_gate = h_gate.block(block_reason, invalid=True, missing_features=actual_missing_criticals)
@@ -741,7 +1290,7 @@ def generate_predictions(
 
         return h_gate, weights, decision_dq, horizon_contract, sorted(set(dq_reasons)), target_diagnostics
 
-    def _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract):
+    def _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract, ood_assessment, calibration_selection):
         pred_meta = pred.meta
         pred_meta["endpoint_coverage"] = endpoint_coverage
         pred_meta["alignment_diagnostics"] = {
@@ -785,18 +1334,25 @@ def generate_predictions(
             "threshold_policy_version": label_contract.threshold_policy_version,
             "target_spec": target_spec.to_dict(),
             "label_contract": label_contract.to_dict(),
+            "calibration_selection_reason": calibration_selection.reason_code,
+            "calibration_version": calibration_selection.artifact.artifact_version if calibration_selection.artifact is not None else None,
+            "calibration_scope": calibration_selection.artifact.calibration_scope if calibration_selection.artifact is not None else None,
         }
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
         pred_meta["dq_reason_codes"] = dq_reasons
         pred_meta["suppression_reason"] = pred.suppression_reason
         pred_meta["ood_state"] = pred.ood_state.value
+        pred_meta["ood_reason"] = ood_assessment.primary_reason
+        pred_meta["ood_assessment"] = ood_assessment.to_dict()
+        pred_meta["calibration_selection"] = calibration_selection.to_dict()
         pred_meta["replay_mode"] = pred.replay_mode.value
         pred_meta["gating"] = {"target_diagnostics": target_diags} if target_diags else {}
         return pred_meta
 
     predictions = []
     model_cfg = cfg.get("model", {}) or {}
+    ood_policy = resolve_ood_policy(cfg)
 
     for h in cfg["validation"]["horizons_minutes"]:
         h_str = str(h)
@@ -813,7 +1369,26 @@ def generate_predictions(
             flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
             session_boundary_rule="TRUNCATE_TO_SESSION_CLOSE",
         )
-        calibration_artifact_ref = build_calibration_artifact_ref(model_cfg, target_spec=target_spec)
+        calibration_regime = resolve_calibration_regime(model_cfg)
+        calibration_selection = select_calibration_artifact(
+            model_cfg,
+            target_spec=target_spec,
+            horizon_kind="FIXED",
+            horizon_minutes=int(h),
+            session_state=session_enum,
+            regime=calibration_regime,
+            replay_mode=ReplayMode.UNKNOWN,
+        )
+        _log_calibration_selection(h_str, calibration_selection)
+        ood_assessment = assess_operational_ood(
+            feature_rows=valid_features,
+            decision_feature_keys=horizon_contract["resolved_target_features"],
+            session_state=session_enum,
+            assessments_by_feature=assessments_by_feature,
+            gate=h_gate,
+            policy=ood_policy,
+        )
+        _log_ood_assessment(h_str, ood_assessment)
         pred = bounded_additive_score(
             feat_dict,
             decision_dq,
@@ -829,14 +1404,16 @@ def generate_predictions(
             model_name=str(model_cfg.get("model_name", "bounded_additive_score")),
             model_version=str(model_cfg.get("model_version", "UNSPECIFIED")),
             target_spec=target_spec,
-            calibration_artifact_ref=calibration_artifact_ref,
-            ood_state=OODState.UNKNOWN,
+            calibration_artifact_ref=calibration_selection.artifact,
+            ood_state=ood_assessment.state,
+            ood_reason=ood_assessment.primary_reason,
+            ood_policy=model_cfg.get("ood_probability_policy") or model_cfg.get("ood_runtime_policy") or {},
             replay_mode=ReplayMode.UNKNOWN,
         )
 
         window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
 
-        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract)
+        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract, ood_assessment, calibration_selection)
 
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": int(h), "horizon_kind": "FIXED",
@@ -870,7 +1447,26 @@ def generate_predictions(
             flat_threshold_pct=cfg.get("validation", {}).get("flat_threshold_pct"),
             session_boundary_rule="TRUNCATE_TO_SESSION_CLOSE",
         )
-        calibration_artifact_ref = build_calibration_artifact_ref(model_cfg, target_spec=target_spec)
+        calibration_regime = resolve_calibration_regime(model_cfg)
+        calibration_selection = select_calibration_artifact(
+            model_cfg,
+            target_spec=target_spec,
+            horizon_kind="TO_CLOSE",
+            horizon_minutes=0,
+            session_state=session_enum,
+            regime=calibration_regime,
+            replay_mode=ReplayMode.UNKNOWN,
+        )
+        _log_calibration_selection("to_close", calibration_selection)
+        ood_assessment = assess_operational_ood(
+            feature_rows=valid_features,
+            decision_feature_keys=horizon_contract["resolved_target_features"],
+            session_state=session_enum,
+            assessments_by_feature=assessments_by_feature,
+            gate=h_gate,
+            policy=ood_policy,
+        )
+        _log_ood_assessment("to_close", ood_assessment)
         pred = bounded_additive_score(
             feat_dict,
             decision_dq,
@@ -886,14 +1482,16 @@ def generate_predictions(
             model_name=str(model_cfg.get("model_name", "bounded_additive_score")),
             model_version=str(model_cfg.get("model_version", "UNSPECIFIED")),
             target_spec=target_spec,
-            calibration_artifact_ref=calibration_artifact_ref,
-            ood_state=OODState.UNKNOWN,
+            calibration_artifact_ref=calibration_selection.artifact,
+            ood_state=ood_assessment.state,
+            ood_reason=ood_assessment.primary_reason,
+            ood_policy=model_cfg.get("ood_probability_policy") or model_cfg.get("ood_runtime_policy") or {},
             replay_mode=ReplayMode.UNKNOWN,
         )
 
         window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
 
-        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract)
+        pred_meta = _build_pred_meta(pred, horizon_contract, decision_dq, dq_reasons, target_diags, target_spec, label_contract, ood_assessment, calibration_selection)
 
         predictions.append({
             "snapshot_id": snapshot_id, "horizon_minutes": 0, "horizon_kind": "TO_CLOSE",
@@ -1040,10 +1638,21 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     prev_hash = prev_state.last_payload_hash if prev_state else None
                     
+                    source_time_hints = infer_source_time_hints(
+                        payload_json=getattr(res, "payload_json", None),
+                        response_headers=getattr(res, "response_headers", None),
+                        explicit_event_time_raw=getattr(res, "event_time_utc", None),
+                        explicit_publish_time_raw=getattr(res, "source_publish_time_utc", None),
+                        explicit_effective_time_raw=getattr(res, "effective_time_utc", None),
+                        explicit_revision=getattr(res, "source_revision", None),
+                    )
+
                     event_id = db.insert_raw_event(
                         con, run_id, tkr, endpoint_id, res.requested_at_utc, res.received_at_utc,
                         res.status_code, res.latency_ms, res.payload_hash, res.payload_json,
                         res.retry_count > 0, res.error_type, res.error_message, cb,
+                        source_publish_time_utc=source_time_hints.source_publish_time_utc,
+                        source_revision=source_time_hints.source_revision,
                     )
 
                     attempt_ts_utc = to_utc_dt(
@@ -1068,9 +1677,13 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         str(event_id), asof_utc, assessment, prev_state,
                         fallback_max_age_seconds=fallback_max_age_seconds,
                         invalid_after_seconds=invalid_after_seconds,
+                        source_event_time_raw=source_time_hints.event_time_utc,
+                        source_publish_time_raw=source_time_hints.source_publish_time_utc,
+                        effective_time_raw=source_time_hints.effective_time_utc,
                         received_at_raw=getattr(res, "received_at_utc", None),
                         processed_at_raw=attempt_ts_utc,
                         as_of_time_raw=asof_utc,
+                        source_revision=source_time_hints.source_revision,
                     )
                     
                     enforced_freshness = resolved.freshness_state
@@ -1163,6 +1776,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             timestamp_quality=res.timestamp_quality,
                             lagged=res.lagged,
                             time_provenance_degraded=res.time_provenance_degraded,
+                            endpoint_name=call.name,
+                            endpoint_purpose=call.purpose,
+                            decision_path=call.decision_path,
+                            missing_affects_confidence=call.missing_affects_confidence,
+                            stale_affects_confidence=call.stale_affects_confidence,
+                            purpose_contract_version=call.purpose_contract_version,
                         )
                         contexts[endpoint_id] = ctx
                             
@@ -1173,7 +1792,12 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             "endpoint_id": endpoint_id,
                             "signature": sig,
                             "used_event_id": res.used_event_id,
-                            "missing_keys": asmnt.missing_keys
+                            "missing_keys": asmnt.missing_keys,
+                            "purpose": call.purpose,
+                            "decision_path": call.decision_path,
+                            "missing_affects_confidence": call.missing_affects_confidence,
+                            "stale_affects_confidence": call.stale_affects_confidence,
+                            "purpose_contract_version": call.purpose_contract_version,
                         }
 
                         # Ticket 3: Persist strict validation keys for Replay Parity constraint

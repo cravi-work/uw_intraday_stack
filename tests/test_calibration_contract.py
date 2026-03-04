@@ -4,6 +4,7 @@ from src.models import (
     CalibrationArtifactRef,
     DataQualityState,
     DecisionGate,
+    OODState,
     PredictionTargetSpec,
     RiskGateStatus,
     SignalState,
@@ -96,6 +97,7 @@ def test_duplicate_bins_are_suppressed_before_calibrated_probability_emission():
         gate=_gate(),
         target_spec=target_spec,
         calibration_artifact_ref=bad_ref,
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert bad_ref.is_valid() is False

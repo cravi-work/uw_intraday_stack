@@ -48,6 +48,7 @@ def test_calibrated_probability_vector_is_coherent():
         model_version="3.0.0",
         target_spec=_target_spec(),
         calibration_artifact_ref=_cal_ref(),
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is not None
@@ -68,6 +69,7 @@ def test_calibration_target_mismatch_suppresses_probability_output():
         gate=_gate(),
         target_spec=_target_spec(),
         calibration_artifact_ref=_cal_ref(target_version="other_target_v2"),
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is None
@@ -103,6 +105,7 @@ def test_extreme_positive_bias_calibration_remains_coherent():
         gate=_gate(),
         target_spec=_target_spec(),
         calibration_artifact_ref=_cal_ref(),
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is not None
@@ -122,6 +125,7 @@ def test_extreme_negative_bias_calibration_remains_coherent():
         gate=_gate(),
         target_spec=_target_spec(),
         calibration_artifact_ref=_cal_ref(),
+        ood_state=OODState.IN_DISTRIBUTION,
     )
 
     assert pred.prob_up is not None

@@ -123,6 +123,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     threshold_policy_version TEXT,
     replay_mode TEXT,
     ood_state TEXT,
+    ood_reason TEXT,
+    calibration_scope JSON,
+    calibration_artifact_hash TEXT,
+    decision_path_contract_version TEXT,
     suppression_reason TEXT,
     probability_contract_json JSON,
     model_hash TEXT,
@@ -229,12 +233,16 @@ CREATE TABLE IF NOT EXISTS decision_traces (
     confidence_state TEXT,
     suppression_reason TEXT,
     ood_state TEXT,
+    ood_reason TEXT,
     replay_mode TEXT,
     model_name TEXT,
     model_version TEXT,
     target_name TEXT,
     target_version TEXT,
     calibration_version TEXT,
+    calibration_scope JSON,
+    calibration_artifact_hash TEXT,
+    decision_path_contract_version TEXT,
     threshold_policy_version TEXT,
     blocked_reasons_json JSON,
     degraded_reasons_json JSON,
@@ -438,27 +446,65 @@ def _derive_feature_version(meta_json: Dict[str, Any]) -> Optional[str]:
     return f"derived_feature_contract_{digest}"
 
 
+def _as_mapping(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str):
+        return _safe_json_loads(raw)
+    return {}
+
+
+def _normalize_jsonish_mapping(raw: Any) -> Optional[Dict[str, Any]]:
+    mapping = _as_mapping(raw)
+    return mapping or None
+
+
+def _infer_decision_path_contract_version(meta_json: Dict[str, Any], prediction_contract: Dict[str, Any]) -> Optional[str]:
+    explicit = meta_json.get("decision_path_contract_version") or prediction_contract.get("decision_path_contract_version")
+    if explicit not in (None, ""):
+        return str(explicit)
+
+    horizon_contract = _as_mapping(meta_json.get("horizon_contract"))
+    explicit = horizon_contract.get("decision_path_contract_version")
+    if explicit not in (None, ""):
+        return str(explicit)
+
+    feature_contracts = horizon_contract.get("feature_contracts")
+    if isinstance(feature_contracts, Mapping):
+        versions = sorted({
+            str(
+                contract.get("contract_version")
+                or contract.get("feature_use_contract_version")
+                or contract.get("purpose_contract_version")
+            ).strip()
+            for contract in feature_contracts.values()
+            if isinstance(contract, Mapping)
+            and (
+                contract.get("contract_version")
+                or contract.get("feature_use_contract_version")
+                or contract.get("purpose_contract_version")
+            ) not in (None, "")
+        })
+        if len(versions) == 1:
+            return versions[0]
+        if len(versions) > 1:
+            return f"MIXED:{','.join(versions)}"
+    return None
+
+
 def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[str, Any]:
     meta_json = _safe_json_loads(prediction.get("meta_json"))
-    probability_contract = meta_json.get("probability_contract")
-    if not isinstance(probability_contract, dict):
-        probability_contract = {}
+    probability_contract = _as_mapping(meta_json.get("probability_contract"))
+    prediction_contract = _as_mapping(meta_json.get("prediction_contract"))
 
-    prediction_contract = meta_json.get("prediction_contract")
-    if not isinstance(prediction_contract, dict):
-        prediction_contract = {}
+    target_spec = _as_mapping(prediction_contract.get("target_spec"))
+    if not target_spec:
+        target_spec = _as_mapping(probability_contract.get("target_spec"))
 
-    target_spec = prediction_contract.get("target_spec")
-    if not isinstance(target_spec, dict):
-        target_spec = probability_contract.get("target_spec") if isinstance(probability_contract.get("target_spec"), dict) else {}
-
-    label_contract = prediction_contract.get("label_contract")
-    if not isinstance(label_contract, dict):
-        label_contract = {}
-
-    calibration_ref = probability_contract.get("calibration_artifact_ref")
-    if not isinstance(calibration_ref, dict):
-        calibration_ref = {}
+    label_contract = _as_mapping(prediction_contract.get("label_contract"))
+    calibration_ref = _as_mapping(probability_contract.get("calibration_artifact_ref"))
+    calibration_selection = _as_mapping(meta_json.get("calibration_selection"))
+    ood_assessment = _as_mapping(meta_json.get("ood_assessment"))
 
     target_name = prediction.get("target_name") or prediction_contract.get("target_name") or target_spec.get("target_name")
     target_version = prediction.get("target_version") or prediction_contract.get("target_version") or target_spec.get("target_version")
@@ -472,6 +518,27 @@ def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[s
     feature_version = prediction.get("feature_version") or _derive_feature_version(meta_json)
     replay_mode = prediction.get("replay_mode") or meta_json.get("replay_mode")
     ood_state = prediction.get("ood_state") or meta_json.get("ood_state") or probability_contract.get("ood_state")
+    ood_reason = (
+        prediction.get("ood_reason")
+        or meta_json.get("ood_reason")
+        or ood_assessment.get("primary_reason")
+        or probability_contract.get("ood_reason")
+    )
+    calibration_scope = (
+        _normalize_jsonish_mapping(prediction.get("calibration_scope"))
+        or _normalize_jsonish_mapping(prediction_contract.get("calibration_scope"))
+        or _normalize_jsonish_mapping(calibration_selection.get("calibration_scope"))
+        or _normalize_jsonish_mapping(calibration_ref.get("calibration_scope"))
+    )
+    calibration_artifact_hash = (
+        prediction.get("calibration_artifact_hash")
+        or calibration_selection.get("artifact_hash")
+        or calibration_ref.get("artifact_hash")
+    )
+    decision_path_contract_version = (
+        prediction.get("decision_path_contract_version")
+        or _infer_decision_path_contract_version(meta_json, prediction_contract)
+    )
     suppression_reason = (
         prediction.get("suppression_reason")
         or meta_json.get("suppression_reason")
@@ -487,6 +554,10 @@ def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[s
         "threshold_policy_version": str(threshold_policy_version) if threshold_policy_version not in (None, "") else None,
         "replay_mode": str(replay_mode) if replay_mode not in (None, "") else None,
         "ood_state": str(ood_state) if ood_state not in (None, "") else None,
+        "ood_reason": str(ood_reason) if ood_reason not in (None, "") else None,
+        "calibration_scope": calibration_scope if calibration_scope else None,
+        "calibration_artifact_hash": str(calibration_artifact_hash) if calibration_artifact_hash not in (None, "") else None,
+        "decision_path_contract_version": str(decision_path_contract_version) if decision_path_contract_version not in (None, "") else None,
         "suppression_reason": str(suppression_reason) if suppression_reason not in (None, "") else None,
         "probability_contract_json": probability_contract if probability_contract else None,
     }
@@ -538,6 +609,10 @@ class DbWriter:
         _add("predictions", "threshold_policy_version", "TEXT")
         _add("predictions", "replay_mode", "TEXT")
         _add("predictions", "ood_state", "TEXT")
+        _add("predictions", "ood_reason", "TEXT")
+        _add("predictions", "calibration_scope", "JSON")
+        _add("predictions", "calibration_artifact_hash", "TEXT")
+        _add("predictions", "decision_path_contract_version", "TEXT")
         _add("predictions", "suppression_reason", "TEXT")
         _add("predictions", "probability_contract_json", "JSON")
         _add("predictions", "is_mock", "BOOLEAN DEFAULT FALSE")
@@ -588,12 +663,16 @@ class DbWriter:
                 confidence_state TEXT,
                 suppression_reason TEXT,
                 ood_state TEXT,
+                ood_reason TEXT,
                 replay_mode TEXT,
                 model_name TEXT,
                 model_version TEXT,
                 target_name TEXT,
                 target_version TEXT,
                 calibration_version TEXT,
+                calibration_scope JSON,
+                calibration_artifact_hash TEXT,
+                decision_path_contract_version TEXT,
                 threshold_policy_version TEXT,
                 blocked_reasons_json JSON,
                 degraded_reasons_json JSON,
@@ -602,6 +681,10 @@ class DbWriter:
             """
         )
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_trace_dedupe ON decision_traces (prediction_business_key, event_type)")
+        _add("decision_traces", "ood_reason", "TEXT")
+        _add("decision_traces", "calibration_scope", "JSON")
+        _add("decision_traces", "calibration_artifact_hash", "TEXT")
+        _add("decision_traces", "decision_path_contract_version", "TEXT")
 
         pred_cols = {r[1]: r[2] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
         if pred_cols.get("bias") in ["VARCHAR", "TEXT"]:
@@ -617,6 +700,7 @@ class DbWriter:
 
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_business_key ON predictions(prediction_business_key)")
         self._backfill_prediction_contract_columns(con)
+        self._backfill_decision_trace_governance_columns(con)
         self._backfill_raw_http_event_lineage(con)
 
     def _backfill_prediction_contract_columns(self, con: duckdb.DuckDBPyConnection) -> None:
@@ -625,7 +709,8 @@ class DbWriter:
             SELECT prediction_id, snapshot_id, horizon_kind, horizon_minutes, horizon_seconds,
                    prediction_business_key, meta_json, target_name, target_version, label_version,
                    feature_version, calibration_version, threshold_policy_version, replay_mode,
-                   ood_state, suppression_reason, probability_contract_json
+                   ood_state, ood_reason, calibration_scope, calibration_artifact_hash,
+                   decision_path_contract_version, suppression_reason, probability_contract_json
             FROM predictions
             """
         ).fetchall()
@@ -648,6 +733,10 @@ class DbWriter:
                 threshold_policy_version,
                 replay_mode,
                 ood_state,
+                ood_reason,
+                calibration_scope,
+                calibration_artifact_hash,
+                decision_path_contract_version,
                 suppression_reason,
                 probability_contract_json,
             ) = row
@@ -670,6 +759,10 @@ class DbWriter:
                 or (threshold_policy_version in (None, "") and extracted["threshold_policy_version"] is not None)
                 or (replay_mode in (None, "") and extracted["replay_mode"] is not None)
                 or (ood_state in (None, "") and extracted["ood_state"] is not None)
+                or (ood_reason in (None, "") and extracted["ood_reason"] is not None)
+                or (_normalize_jsonish_mapping(calibration_scope) is None and extracted["calibration_scope"] is not None)
+                or (calibration_artifact_hash in (None, "") and extracted["calibration_artifact_hash"] is not None)
+                or (decision_path_contract_version in (None, "") and extracted["decision_path_contract_version"] is not None)
                 or (suppression_reason in (None, "") and extracted["suppression_reason"] is not None)
                 or (probability_contract_json is None and extracted["probability_contract_json"] is not None)
             )
@@ -688,6 +781,10 @@ class DbWriter:
                     threshold_policy_version = COALESCE(threshold_policy_version, ?),
                     replay_mode = COALESCE(replay_mode, ?),
                     ood_state = COALESCE(ood_state, ?),
+                    ood_reason = COALESCE(ood_reason, ?),
+                    calibration_scope = COALESCE(calibration_scope, ?),
+                    calibration_artifact_hash = COALESCE(calibration_artifact_hash, ?),
+                    decision_path_contract_version = COALESCE(decision_path_contract_version, ?),
                     suppression_reason = COALESCE(suppression_reason, ?),
                     probability_contract_json = COALESCE(probability_contract_json, ?)
                 WHERE prediction_id = ?
@@ -702,6 +799,10 @@ class DbWriter:
                     extracted["threshold_policy_version"],
                     extracted["replay_mode"],
                     extracted["ood_state"],
+                    extracted["ood_reason"],
+                    _safe_json_dumps(extracted["calibration_scope"]),
+                    extracted["calibration_artifact_hash"],
+                    extracted["decision_path_contract_version"],
                     extracted["suppression_reason"],
                     _safe_json_dumps(extracted["probability_contract_json"]),
                     prediction_id,
@@ -711,6 +812,77 @@ class DbWriter:
 
         if updated:
             logger.info("Backfilled prediction contract columns", extra={"json": {"rows": updated}})
+
+    def _backfill_decision_trace_governance_columns(self, con: duckdb.DuckDBPyConnection) -> None:
+        pred_lookup = {
+            str(row[0]): {
+                "ood_reason": row[1],
+                "calibration_scope": _normalize_jsonish_mapping(row[2]),
+                "calibration_artifact_hash": row[3],
+                "decision_path_contract_version": row[4],
+            }
+            for row in con.execute(
+                """
+                SELECT prediction_business_key, ood_reason, calibration_scope,
+                       calibration_artifact_hash, decision_path_contract_version
+                FROM predictions
+                WHERE prediction_business_key IS NOT NULL
+                """
+            ).fetchall()
+        }
+
+        rows = con.execute(
+            """
+            SELECT trace_id, prediction_business_key, trace_json, ood_reason, calibration_scope,
+                   calibration_artifact_hash, decision_path_contract_version
+            FROM decision_traces
+            """
+        ).fetchall()
+
+        updated = 0
+        for trace_id, business_key, trace_json_raw, current_ood_reason, current_scope_raw, current_artifact_hash, current_dp_version in rows:
+            trace_json = _safe_json_loads(trace_json_raw)
+            prediction_values = pred_lookup.get(str(business_key), {})
+
+            extracted_ood_reason = current_ood_reason or trace_json.get("ood_reason") or prediction_values.get("ood_reason")
+            extracted_scope = (
+                _normalize_jsonish_mapping(current_scope_raw)
+                or _normalize_jsonish_mapping(trace_json.get("calibration_scope"))
+                or prediction_values.get("calibration_scope")
+            )
+            extracted_artifact_hash = current_artifact_hash or trace_json.get("calibration_artifact_hash") or prediction_values.get("calibration_artifact_hash")
+            extracted_dp_version = current_dp_version or trace_json.get("decision_path_contract_version") or prediction_values.get("decision_path_contract_version")
+
+            changed = (
+                (current_ood_reason in (None, "") and extracted_ood_reason is not None)
+                or (_normalize_jsonish_mapping(current_scope_raw) is None and extracted_scope is not None)
+                or (current_artifact_hash in (None, "") and extracted_artifact_hash is not None)
+                or (current_dp_version in (None, "") and extracted_dp_version is not None)
+            )
+            if not changed:
+                continue
+
+            con.execute(
+                """
+                UPDATE decision_traces
+                SET ood_reason = COALESCE(ood_reason, ?),
+                    calibration_scope = COALESCE(calibration_scope, ?),
+                    calibration_artifact_hash = COALESCE(calibration_artifact_hash, ?),
+                    decision_path_contract_version = COALESCE(decision_path_contract_version, ?)
+                WHERE trace_id = ?
+                """,
+                [
+                    extracted_ood_reason,
+                    _safe_json_dumps(extracted_scope),
+                    extracted_artifact_hash,
+                    extracted_dp_version,
+                    trace_id,
+                ],
+            )
+            updated += 1
+
+        if updated:
+            logger.info("Backfilled decision trace governance columns", extra={"json": {"rows": updated}})
 
     def _backfill_raw_http_event_lineage(self, con: duckdb.DuckDBPyConnection) -> None:
         rows = con.execute(
@@ -968,6 +1140,10 @@ class DbWriter:
             "threshold_policy_version": extracted["threshold_policy_version"],
             "replay_mode": extracted["replay_mode"],
             "ood_state": extracted["ood_state"],
+            "ood_reason": extracted["ood_reason"],
+            "calibration_scope": _safe_json_dumps(extracted["calibration_scope"]),
+            "calibration_artifact_hash": extracted["calibration_artifact_hash"],
+            "decision_path_contract_version": extracted["decision_path_contract_version"],
             "suppression_reason": extracted["suppression_reason"],
             "probability_contract_json": _safe_json_dumps(extracted["probability_contract_json"]),
             "model_hash": p.get("model_hash"),
@@ -1017,6 +1193,10 @@ class DbWriter:
             p.setdefault("threshold_policy_version", extracted["threshold_policy_version"])
             p.setdefault("replay_mode", extracted["replay_mode"])
             p.setdefault("ood_state", extracted["ood_state"])
+            p.setdefault("ood_reason", extracted["ood_reason"])
+            p.setdefault("calibration_scope", extracted["calibration_scope"])
+            p.setdefault("calibration_artifact_hash", extracted["calibration_artifact_hash"])
+            p.setdefault("decision_path_contract_version", extracted["decision_path_contract_version"])
             p.setdefault("suppression_reason", extracted["suppression_reason"])
 
         self.insert_decision_trace(
@@ -1046,6 +1226,7 @@ class DbWriter:
             prediction.get("horizon_seconds"),
         ))
         trace_id = _decision_trace_id(business_key, normalized_event)
+        extracted = _extract_prediction_contract_fields(prediction)
         row = {
             "trace_id": trace_id,
             "created_at_utc": datetime.now(UTC),
@@ -1059,12 +1240,16 @@ class DbWriter:
             "confidence_state": trace.get("confidence_state"),
             "suppression_reason": trace.get("suppression_reason"),
             "ood_state": trace.get("ood_state"),
+            "ood_reason": extracted.get("ood_reason"),
             "replay_mode": trace.get("replay_mode"),
             "model_name": trace.get("model_name"),
             "model_version": trace.get("model_version"),
             "target_name": trace.get("target_name"),
             "target_version": trace.get("target_version"),
             "calibration_version": trace.get("calibration_version"),
+            "calibration_scope": _safe_json_dumps(extracted.get("calibration_scope")),
+            "calibration_artifact_hash": extracted.get("calibration_artifact_hash"),
+            "decision_path_contract_version": extracted.get("decision_path_contract_version"),
             "threshold_policy_version": trace.get("threshold_policy_version"),
             "blocked_reasons_json": _safe_json_dumps(trace.get("blocked_reasons"), default=[]),
             "degraded_reasons_json": _safe_json_dumps(trace.get("degraded_reasons"), default=[]),

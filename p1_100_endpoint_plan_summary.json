@@ -1,0 +1,306 @@
+{
+  "disabled_default": [
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "stock_volume_price_levels",
+      "path": "/api/stock/{ticker}/stock-volume-price-levels",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "net_prem_ticks",
+      "path": "/api/stock/{ticker}/net-prem-ticks",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "volume_oi_expiry",
+      "path": "/api/stock/{ticker}/option/volume-oi-expiry",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "interpolated_iv",
+      "path": "/api/stock/{ticker}/interpolated-iv",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "realized_vol",
+      "path": "/api/stock/{ticker}/volatility/realized",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "option_stock_price_levels",
+      "path": "/api/stock/{ticker}/option/stock-price-levels",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "max_pain",
+      "path": "/api/stock/{ticker}/max-pain",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "flow-alerts",
+      "path": "/api/stock/{ticker}/flow-alerts",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "option-chains",
+      "path": "/api/stock/{ticker}/option-chains",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "option-contracts",
+      "path": "/api/stock/{ticker}/option-contracts",
+      "purpose": "disabled",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    }
+  ],
+  "disabled_market_context": [],
+  "fetched_default": [
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "ohlc_1m",
+      "path": "/api/stock/{ticker}/ohlc/{candle_size}",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "spot_exposures",
+      "path": "/api/stock/{ticker}/spot-exposures",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "spot_exposures_strike",
+      "path": "/api/stock/{ticker}/spot-exposures/strike",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "greek_exposure",
+      "path": "/api/stock/{ticker}/greek-exposure",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "flow_per_strike_intraday",
+      "path": "/api/stock/{ticker}/flow-per-strike-intraday",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "flow_recent",
+      "path": "/api/stock/{ticker}/flow-recent",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "oi_per_strike",
+      "path": "/api/stock/{ticker}/oi-per-strike",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "oi_change",
+      "path": "/api/stock/{ticker}/oi-change",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "term_structure",
+      "path": "/api/stock/{ticker}/volatility/term-structure",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "iv_rank",
+      "path": "/api/stock/{ticker}/iv-rank",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": false,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": false,
+      "name": "darkpool_ticker",
+      "path": "/api/darkpool/{ticker}",
+      "purpose": "report-only",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": false
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "litflow_ticker",
+      "path": "/api/lit-flow/{ticker}",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "greek-exposure-strike",
+      "path": "/api/stock/{ticker}/greek-exposure/strike",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "greek-exposure-expiry",
+      "path": "/api/stock/{ticker}/greek-exposure/expiry",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "spot-exposures-expiry-strike",
+      "path": "/api/stock/{ticker}/spot-exposures/expiry-strike",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "flow-per-strike",
+      "path": "/api/stock/{ticker}/flow-per-strike",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    },
+    {
+      "decision_path": true,
+      "is_market": false,
+      "method": "GET",
+      "missing_affects_confidence": true,
+      "name": "historical-risk-reversal-skew",
+      "path": "/api/stock/{ticker}/historical-risk-reversal-skew",
+      "purpose": "signal-critical",
+      "purpose_contract_version": "v1",
+      "stale_affects_confidence": true
+    }
+  ],
+  "fetched_market_context": [],
+  "market_context_enabled": false
+}

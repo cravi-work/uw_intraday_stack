@@ -193,6 +193,12 @@ class CalibrationArtifactRef:
     bins: Tuple[float, ...]
     mapped: Tuple[float, ...]
     artifact_source: str = "runtime_config"
+    scope_horizon_kind: str = "ANY"
+    scope_horizon_minutes: Optional[int] = None
+    scope_session: str = "ANY"
+    scope_regime: str = "ANY"
+    scope_replay_mode: str = "ANY"
+    scope_contract_version: str = "calibration_scope/v1"
 
     def is_valid(self) -> bool:
         if not self.artifact_name or not str(self.artifact_name).strip():
@@ -223,7 +229,43 @@ class CalibrationArtifactRef:
             m = float(m)
             if m < 0.0 or m > 1.0:
                 return False
+
+        scope_horizon_kind = str(self.scope_horizon_kind or "ANY").upper()
+        if scope_horizon_kind not in {"ANY", HorizonKind.FIXED.value, HorizonKind.TO_CLOSE.value}:
+            return False
+        if scope_horizon_kind == HorizonKind.FIXED.value and self.scope_horizon_minutes is not None:
+            try:
+                if int(self.scope_horizon_minutes) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if scope_horizon_kind == HorizonKind.TO_CLOSE.value and self.scope_horizon_minutes not in (None, 0):
+            return False
+
+        scope_session = str(self.scope_session or "ANY").upper()
+        if scope_session not in {"ANY", SessionState.PREMARKET.value, SessionState.RTH.value, SessionState.AFTERHOURS.value, SessionState.CLOSED.value}:
+            return False
+
+        scope_replay_mode = str(self.scope_replay_mode or "ANY").upper()
+        if scope_replay_mode not in {"ANY", ReplayMode.UNKNOWN.value, ReplayMode.LIVE_LIKE_OBSERVED.value, ReplayMode.RESEARCH_RESTATED.value}:
+            return False
+
+        if not str(self.scope_regime or "ANY").strip():
+            return False
+        if not str(self.scope_contract_version or "").strip():
+            return False
         return True
+
+    @property
+    def calibration_scope(self) -> Dict[str, Any]:
+        return {
+            "horizon_kind": str(self.scope_horizon_kind or "ANY").upper(),
+            "horizon_minutes": None if self.scope_horizon_minutes is None else int(self.scope_horizon_minutes),
+            "session": str(self.scope_session or "ANY").upper(),
+            "regime": str(self.scope_regime or "ANY").upper(),
+            "replay_mode": str(self.scope_replay_mode or "ANY").upper(),
+            "scope_contract_version": self.scope_contract_version,
+        }
 
     @property
     def artifact_hash(self) -> str:
@@ -232,6 +274,7 @@ class CalibrationArtifactRef:
             "artifact_version": self.artifact_version,
             "target_name": self.target_name,
             "target_version": self.target_version,
+            "calibration_scope": self.calibration_scope,
             "bins": list(self.bins),
             "mapped": list(self.mapped),
         }
@@ -245,6 +288,7 @@ class CalibrationArtifactRef:
             "target_version": self.target_version,
             "artifact_source": self.artifact_source,
             "artifact_hash": self.artifact_hash,
+            "calibration_scope": self.calibration_scope,
             "bins": list(self.bins),
             "mapped": list(self.mapped),
         }
@@ -261,6 +305,8 @@ class ProbabilityOutput:
     target_spec: Optional[PredictionTargetSpec]
     calibration_artifact_ref: Optional[CalibrationArtifactRef]
     ood_state: OODState
+    ood_reason: Optional[str] = None
+    ood_policy_action: str = "emit"
 
     def is_coherent(self) -> bool:
         if self.calibrated_probability_vector is None:
@@ -287,6 +333,8 @@ class ProbabilityOutput:
             "target_spec": self.target_spec.to_dict() if self.target_spec is not None else None,
             "calibration_artifact_ref": self.calibration_artifact_ref.to_dict() if self.calibration_artifact_ref is not None else None,
             "ood_state": self.ood_state.value,
+            "ood_reason": self.ood_reason,
+            "ood_policy_action": self.ood_policy_action,
             "is_coherent": self.is_coherent(),
         }
 
@@ -422,6 +470,14 @@ def build_calibration_artifact_ref(
         version_payload = {"bins": list(bins), "mapped": list(mapped)}
         version = hashlib.sha256(json.dumps(version_payload, sort_keys=True).encode()).hexdigest()[:12]
 
+    scope_cfg = cal_cfg.get("scope") if isinstance(cal_cfg.get("scope"), Mapping) else {}
+    scope_horizon_minutes = scope_cfg.get("horizon_minutes")
+    if scope_horizon_minutes not in (None, ""):
+        try:
+            scope_horizon_minutes = int(scope_horizon_minutes)
+        except (TypeError, ValueError):
+            return None
+
     return CalibrationArtifactRef(
         artifact_name=str(cal_cfg.get("artifact_name") or f"{cfg.get('model_name', 'model')}_calibration"),
         artifact_version=str(version),
@@ -430,6 +486,12 @@ def build_calibration_artifact_ref(
         bins=bins,
         mapped=mapped,
         artifact_source=str(cal_cfg.get("artifact_source") or "runtime_config"),
+        scope_horizon_kind=str(scope_cfg.get("horizon_kind") or "ANY").upper(),
+        scope_horizon_minutes=scope_horizon_minutes,
+        scope_session=str(scope_cfg.get("session") or "ANY").upper(),
+        scope_regime=str(scope_cfg.get("regime") or "ANY").upper(),
+        scope_replay_mode=str(scope_cfg.get("replay_mode") or "ANY").upper(),
+        scope_contract_version=str(scope_cfg.get("scope_contract_version") or "calibration_scope/v1"),
     )
 
 
@@ -479,10 +541,83 @@ def _cohere_probability_vector(
     return _round_probability_vector((probs[0], probs[1], probs[2]))
 
 
-def _confidence_state_from_value(confidence: float, gate: DecisionGate, *, suppressed: bool = False) -> ConfidenceState:
+_DEFAULT_OOD_EMISSION_POLICY: Dict[str, Any] = {
+    "degraded_confidence_scale": 0.5,
+    "unknown_confidence_scale": 0.0,
+    "out_confidence_scale": 0.0,
+    "degraded_emit_calibrated": True,
+    "unknown_emit_calibrated": False,
+    "out_emit_calibrated": False,
+}
+
+
+def _resolve_ood_emission_policy(policy: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    resolved = dict(_DEFAULT_OOD_EMISSION_POLICY)
+    if not isinstance(policy, Mapping):
+        return resolved
+    for key, fallback in _DEFAULT_OOD_EMISSION_POLICY.items():
+        value = policy.get(key, fallback)
+        if isinstance(fallback, bool):
+            resolved[key] = bool(value)
+        else:
+            try:
+                resolved[key] = float(value)
+            except (TypeError, ValueError):
+                resolved[key] = fallback
+    return resolved
+
+
+def _resolve_ood_probability_effect(
+    ood_state: OODState,
+    *,
+    policy: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    resolved_policy = _resolve_ood_emission_policy(policy)
+
+    if ood_state == OODState.OUT_OF_DISTRIBUTION:
+        return {
+            "confidence_scale": float(resolved_policy["out_confidence_scale"]),
+            "suppress_calibrated_probability": not bool(resolved_policy["out_emit_calibrated"]),
+            "suppression_reason": "OOD_REJECTION",
+            "policy_action": "suppress",
+        }
+
+    if ood_state == OODState.UNKNOWN:
+        return {
+            "confidence_scale": float(resolved_policy["unknown_confidence_scale"]),
+            "suppress_calibrated_probability": not bool(resolved_policy["unknown_emit_calibrated"]),
+            "suppression_reason": "OOD_UNKNOWN",
+            "policy_action": "suppress",
+        }
+
+    if ood_state == OODState.DEGRADED:
+        return {
+            "confidence_scale": float(resolved_policy["degraded_confidence_scale"]),
+            "suppress_calibrated_probability": not bool(resolved_policy["degraded_emit_calibrated"]),
+            "suppression_reason": "OOD_DEGRADED" if not bool(resolved_policy["degraded_emit_calibrated"]) else None,
+            "policy_action": "degrade_confidence",
+        }
+
+    return {
+        "confidence_scale": 1.0,
+        "suppress_calibrated_probability": False,
+        "suppression_reason": None,
+        "policy_action": "emit",
+    }
+
+
+def _confidence_state_from_value(
+    confidence: float,
+    gate: DecisionGate,
+    *,
+    suppressed: bool = False,
+    ood_state: OODState = OODState.IN_DISTRIBUTION,
+) -> ConfidenceState:
     if gate.risk_gate_status == RiskGateStatus.BLOCKED:
         return ConfidenceState.UNKNOWN
-    if suppressed or gate.risk_gate_status == RiskGateStatus.DEGRADED:
+    if ood_state == OODState.UNKNOWN:
+        return ConfidenceState.UNKNOWN
+    if suppressed or gate.risk_gate_status == RiskGateStatus.DEGRADED or ood_state in (OODState.DEGRADED, OODState.OUT_OF_DISTRIBUTION):
         return ConfidenceState.DEGRADED
     if confidence >= 0.7:
         return ConfidenceState.HIGH
@@ -605,6 +740,8 @@ def bounded_additive_score(
     target_spec: Optional[PredictionTargetSpec] = None,
     calibration_artifact_ref: Optional[CalibrationArtifactRef] = None,
     ood_state: OODState = OODState.UNKNOWN,
+    ood_reason: Optional[str] = None,
+    ood_policy: Optional[Mapping[str, Any]] = None,
     replay_mode: ReplayMode = ReplayMode.UNKNOWN,
 ) -> Prediction:
 
@@ -625,12 +762,15 @@ def bounded_additive_score(
             target_spec=target_spec,
             calibration_artifact_ref=calibration_artifact_ref,
             ood_state=ood_state,
+            ood_reason=ood_reason,
+            ood_policy_action="blocked",
         )
         config_state = {
             "weights": weights,
             "version": "phase0_probability_contract",
             "model_name": safe_model_name,
             "model_version": safe_model_version,
+            "ood_policy": dict(ood_policy or {}),
             "blocked": True,
         }
         model_hash = hashlib.sha256(json.dumps(_json_safe_config_state(config_state), sort_keys=True).encode()).hexdigest()[:16]
@@ -682,6 +822,9 @@ def bounded_additive_score(
     confidence = 0.0 if coverage < 0.4 else abs(raw_bias) * dq_eff
     confidence = max(float(min_confidence), min(float(confidence), float(confidence_cap)))
 
+    ood_effect = _resolve_ood_probability_effect(ood_state, policy=ood_policy)
+    confidence = max(0.0, min(1.0, float(confidence) * float(ood_effect["confidence_scale"])))
+
     raw_vector, new_signal = _shape_raw_probability_vector(
         raw_bias,
         dq_eff,
@@ -696,8 +839,8 @@ def bounded_additive_score(
     suppression_reason: Optional[str] = None
     calibrated_vector: Optional[Tuple[float, float, float]] = None
 
-    if ood_state == OODState.OUT_OF_DISTRIBUTION:
-        suppression_reason = "OOD_REJECTION"
+    if ood_effect["suppress_calibrated_probability"]:
+        suppression_reason = str(ood_effect["suppression_reason"])
     elif target_spec is None:
         suppression_reason = "MISSING_TARGET_SPEC"
     elif not target_spec.is_valid():
@@ -718,7 +861,12 @@ def bounded_additive_score(
             direction_margin=direction_margin,
         )
 
-    conf_state = _confidence_state_from_value(confidence, gate, suppressed=suppression_reason is not None)
+    conf_state = _confidence_state_from_value(
+        confidence,
+        gate,
+        suppressed=suppression_reason is not None,
+        ood_state=ood_state,
+    )
     probability_output = ProbabilityOutput(
         raw_score=raw_bias,
         raw_probability_vector=raw_vector,
@@ -729,6 +877,8 @@ def bounded_additive_score(
         target_spec=target_spec,
         calibration_artifact_ref=calibration_artifact_ref,
         ood_state=ood_state,
+        ood_reason=ood_reason,
+        ood_policy_action=str(ood_effect["policy_action"]),
     )
 
     config_state = {
@@ -742,6 +892,7 @@ def bounded_additive_score(
         "target_spec": target_spec,
         "calibration_artifact_ref": calibration_artifact_ref,
         "ood_state": ood_state,
+        "ood_policy": dict(ood_policy or {}),
         "replay_mode": replay_mode,
         "version": "phase0_probability_contract",
     }

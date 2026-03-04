@@ -1,7 +1,9 @@
 from __future__ import annotations
 from enum import Enum
 from dataclasses import dataclass, replace
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Mapping, Sequence
+from collections import deque
+from email.utils import parsedate_to_datetime
 import datetime
 import math
 
@@ -70,6 +72,12 @@ class EndpointContext:
     timestamp_quality: Optional[str] = None
     lagged: bool = False
     time_provenance_degraded: bool = False
+    endpoint_name: Optional[str] = None
+    endpoint_purpose: Optional[str] = None
+    decision_path: Optional[bool] = None
+    missing_affects_confidence: Optional[bool] = None
+    stale_affects_confidence: Optional[bool] = None
+    purpose_contract_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +120,36 @@ class ResolvedLineage:
     time_provenance_degraded: bool = False
 
 
+@dataclass(frozen=True)
+class SourceTimeHints:
+    event_time_utc: Optional[datetime.datetime] = None
+    source_publish_time_utc: Optional[datetime.datetime] = None
+    effective_time_utc: Optional[datetime.datetime] = None
+    source_revision: Optional[str] = None
+
+
+PAYLOAD_EVENT_TIME_KEYS: Tuple[str, ...] = (
+    "event_time", "event_at", "executed_at", "trade_time", "occurred_at",
+    "timestamp", "time", "t", "date", "updated_at", "last_updated"
+)
+PAYLOAD_PUBLISH_TIME_KEYS: Tuple[str, ...] = (
+    "source_publish_time", "source_publish_time_utc", "published_at",
+    "publish_time", "report_time", "report_date"
+)
+PAYLOAD_EFFECTIVE_TIME_KEYS: Tuple[str, ...] = (
+    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of"
+)
+PAYLOAD_SOURCE_REVISION_KEYS: Tuple[str, ...] = (
+    "source_revision", "revision", "rev", "version", "sequence_id", "update_id"
+)
+RESPONSE_HEADER_PUBLISH_KEYS: Tuple[str, ...] = (
+    "x-source-publish-time", "x-published-at", "last-modified"
+)
+RESPONSE_HEADER_REVISION_KEYS: Tuple[str, ...] = (
+    "x-source-revision", "x-revision", "etag"
+)
+
+
 def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
     if x is None:
         return None
@@ -131,10 +169,121 @@ def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
             return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
         except ValueError:
             try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed is not None:
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+                    return parsed.astimezone(datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError, IndexError):
+                pass
+            try:
                 return datetime.datetime.fromtimestamp(float(raw), datetime.timezone.utc)
             except (TypeError, ValueError, OverflowError):
                 return None
     return None
+
+
+def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, max_nodes: int = 256) -> Optional[datetime.datetime]:
+    if payload is None:
+        return None
+    keyset = {str(k).lower() for k in candidate_keys}
+    queue = deque([payload])
+    seen = 0
+    best_dt: Optional[datetime.datetime] = None
+
+    while queue and seen < max_nodes:
+        current = queue.popleft()
+        seen += 1
+        if isinstance(current, Mapping):
+            for key, value in current.items():
+                if str(key).lower() in keyset:
+                    dt_val = _coerce_optional_utc_dt(value)
+                    if dt_val is not None and (best_dt is None or dt_val > best_dt):
+                        best_dt = dt_val
+            for value in current.values():
+                if isinstance(value, (Mapping, list, tuple)):
+                    queue.append(value)
+        elif isinstance(current, (list, tuple)):
+            for value in current[:32]:
+                if isinstance(value, (Mapping, list, tuple)):
+                    queue.append(value)
+    return best_dt
+
+
+def _find_first_nested_value(payload: Any, candidate_keys: Sequence[str], *, max_nodes: int = 256) -> Any:
+    if payload is None:
+        return None
+    keyset = {str(k).lower() for k in candidate_keys}
+    queue = deque([payload])
+    seen = 0
+
+    while queue and seen < max_nodes:
+        current = queue.popleft()
+        seen += 1
+        if isinstance(current, Mapping):
+            for key, value in current.items():
+                if str(key).lower() in keyset and value not in (None, ""):
+                    return value
+            for value in current.values():
+                if isinstance(value, (Mapping, list, tuple)):
+                    queue.append(value)
+        elif isinstance(current, (list, tuple)):
+            for value in current[:32]:
+                if isinstance(value, (Mapping, list, tuple)):
+                    queue.append(value)
+    return None
+
+
+def _normalize_response_headers(headers: Any) -> Dict[str, str]:
+    if not isinstance(headers, Mapping):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in headers.items():
+        if value in (None, ""):
+            continue
+        out[str(key).strip().lower()] = str(value).strip()
+    return out
+
+
+def infer_source_time_hints(
+    *,
+    payload_json: Any = None,
+    response_headers: Any = None,
+    explicit_event_time_raw: Any = None,
+    explicit_publish_time_raw: Any = None,
+    explicit_effective_time_raw: Any = None,
+    explicit_revision: Optional[str] = None,
+) -> SourceTimeHints:
+    headers = _normalize_response_headers(response_headers)
+
+    explicit_event = _coerce_optional_utc_dt(explicit_event_time_raw)
+    explicit_publish = _coerce_optional_utc_dt(explicit_publish_time_raw)
+    explicit_effective = _coerce_optional_utc_dt(explicit_effective_time_raw)
+
+    payload_event = _find_best_nested_timestamp(payload_json, PAYLOAD_EVENT_TIME_KEYS)
+    payload_publish = _find_best_nested_timestamp(payload_json, PAYLOAD_PUBLISH_TIME_KEYS)
+    payload_effective = _find_best_nested_timestamp(payload_json, PAYLOAD_EFFECTIVE_TIME_KEYS)
+    payload_revision = _find_first_nested_value(payload_json, PAYLOAD_SOURCE_REVISION_KEYS)
+
+    header_publish = None
+    for key in RESPONSE_HEADER_PUBLISH_KEYS:
+        if key in headers:
+            header_publish = _coerce_optional_utc_dt(headers.get(key))
+            if header_publish is not None:
+                break
+
+    header_revision = None
+    for key in RESPONSE_HEADER_REVISION_KEYS:
+        if key in headers and headers.get(key) not in (None, ""):
+            header_revision = headers.get(key)
+            break
+
+    return SourceTimeHints(
+        event_time_utc=explicit_event or payload_event,
+        source_publish_time_utc=explicit_publish or payload_publish or header_publish,
+        effective_time_utc=explicit_effective or payload_effective,
+        source_revision=str(explicit_revision) if explicit_revision not in (None, "") else (str(payload_revision) if payload_revision not in (None, "") else header_revision),
+    )
 
 
 def to_utc_dt(x: Any, *, fallback: datetime.datetime) -> datetime.datetime:
