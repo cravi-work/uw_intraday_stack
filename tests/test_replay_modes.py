@@ -68,6 +68,50 @@ def _base_cfg(db_path: str) -> dict:
     }
 
 
+def _registry_artifact(*, version: str, replay_mode: str) -> dict:
+    return {
+        "artifact_name": "bounded_additive_score_calibration",
+        "artifact_version": version,
+        "target_name": "intraday_direction_3class",
+        "target_version": "target_v4",
+        "scope": {
+            "horizon_kind": "FIXED",
+            "horizon_minutes": 15,
+            "session": "RTH",
+            "regime": "DEFAULT",
+            "replay_mode": replay_mode,
+        },
+        "bins": [0.0, 0.5, 1.0],
+        "mapped": [0.1, 0.5, 0.9],
+    }
+
+
+def _registry_cfg(db_path: str, artifacts: list[dict]) -> dict:
+    cfg = _base_cfg(db_path)
+    model_cfg = dict(cfg["model"])
+    model_cfg.pop("calibration", None)
+    model_cfg["calibration_registry"] = {
+        "contract_version": "calibration_registry/v1",
+        "registry_version": "registry.replay.v1",
+        "default_regime": "DEFAULT",
+        "selection_policy": {
+            "require_scope_match": True,
+            "allow_legacy_fallback": False,
+        },
+        "compatibility_rules": {
+            "require_target_match": True,
+            "require_horizon_match": True,
+            "require_session_match": True,
+            "require_regime_match": True,
+            "require_replay_mode_match": True,
+            "require_artifact_hash": True,
+        },
+        "artifacts": artifacts,
+    }
+    cfg["model"] = model_cfg
+    return cfg
+
+
 def _insert_snapshot(db: DbWriter, con: duckdb.DuckDBPyConnection, *, asof: datetime, ticker: str = "AAPL") -> str:
     cfg_version = db.insert_config(con, "model: {}\n")
     run_id = db.begin_run(
@@ -316,6 +360,63 @@ def test_research_replay_persists_mode_and_frozen_versions(tmp_path):
     assert row[8] == 1
     assert row[9] == "PASSED"
 
+
+
+def test_replay_uses_requested_mode_for_calibration_selection(tmp_path):
+    db_path = str(tmp_path / "replay_scope.duckdb")
+    db = DbWriter(db_path)
+    asof = _bootstrap_observed_snapshot(db_path)
+    cfg = _registry_cfg(
+        db_path,
+        [
+            _registry_artifact(version="cal.live_like", replay_mode="LIVE_LIKE_OBSERVED"),
+            _registry_artifact(version="cal.research", replay_mode="RESEARCH_RESTATED"),
+        ],
+    )
+
+    with db.writer() as con:
+        snapshot_id = con.execute("SELECT snapshot_id FROM snapshots ORDER BY asof_ts_utc LIMIT 1").fetchone()[0]
+        _insert_prediction(db, con, snapshot_id=snapshot_id, replay_mode="UNKNOWN", calibration_version="cal.research")
+
+    report = run_replay(db_path, "AAPL", cfg=cfg, replay_mode="RESEARCH_RESTATED")
+
+    assert report["status"] == "PASSED"
+    pred = report["recomputed_predictions"][0]
+    selection = pred["meta_json"]["calibration_selection"]
+    governance = pred["meta_json"]["replay_governance"]
+
+    assert pred["replay_mode"] == "RESEARCH_RESTATED"
+    assert selection["request"]["replay_mode"] == "RESEARCH_RESTATED"
+    assert selection["artifact"]["artifact_version"] == "cal.research"
+    assert selection["artifact"]["calibration_scope"]["replay_mode"] == "RESEARCH_RESTATED"
+    assert governance["requested_replay_mode"] == "RESEARCH_RESTATED"
+    assert governance["prediction_replay_mode"] == "RESEARCH_RESTATED"
+    assert governance["calibration_request_replay_mode"] == "RESEARCH_RESTATED"
+    assert governance["calibration_artifact_scope_replay_mode"] == "RESEARCH_RESTATED"
+    assert governance["stored_prediction_replay_mode"] == "UNKNOWN"
+
+
+def test_replay_fails_when_requested_mode_has_no_compatible_calibration_artifact(tmp_path):
+    db_path = str(tmp_path / "replay_scope_missing.duckdb")
+    _bootstrap_observed_snapshot(db_path)
+    cfg = _registry_cfg(
+        db_path,
+        [
+            _registry_artifact(version="cal.research", replay_mode="RESEARCH_RESTATED"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="requested replay mode LIVE_LIKE_OBSERVED has no compatible calibration artifact"):
+        run_replay(db_path, "AAPL", cfg=cfg, replay_mode="LIVE_LIKE_OBSERVED")
+
+    con = duckdb.connect(db_path)
+    row = con.execute("SELECT replay_mode, status, failure_reason FROM replay_runs ORDER BY started_at_utc DESC LIMIT 1").fetchone()
+    con.close()
+
+    assert row[0] == "LIVE_LIKE_OBSERVED"
+    assert row[1] == "FAILED"
+    assert "REPLAY_MODE_MISMATCH" in row[2]
+    assert "no compatible calibration artifact" in row[2]
 
 
 def test_replay_rejects_mixed_replay_modes(tmp_path):

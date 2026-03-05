@@ -5,6 +5,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .models import (
     CalibrationArtifactRef,
+    DEFAULT_CALIBRATION_PROVENANCE_FIELDS,
     HorizonKind,
     PredictionTargetSpec,
     ReplayMode,
@@ -77,6 +78,8 @@ class CalibrationSelectionResult:
     invalid_entries: Tuple[str, ...] = field(default_factory=tuple)
     selection_policy: Dict[str, Any] = field(default_factory=dict)
     compatibility_rules: Dict[str, Any] = field(default_factory=dict)
+    provenance_required_fields: Tuple[str, ...] = field(default_factory=tuple)
+    provenance_exclusions: Tuple[str, ...] = field(default_factory=tuple)
     contract_version: str = "calibration_selection/v1"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -91,6 +94,8 @@ class CalibrationSelectionResult:
             "invalid_entries": list(self.invalid_entries),
             "selection_policy": dict(self.selection_policy),
             "compatibility_rules": dict(self.compatibility_rules),
+            "provenance_required_fields": list(self.provenance_required_fields),
+            "provenance_exclusions": list(self.provenance_exclusions),
             "artifact": self.artifact.to_dict() if self.artifact is not None else None,
             "artifact_hash": self.artifact.artifact_hash if self.artifact is not None else None,
             "calibration_scope": self.artifact.calibration_scope if self.artifact is not None else None,
@@ -110,6 +115,21 @@ def _normalize_text(value: Any, *, default: str = "") -> str:
 def _normalize_scope_token(value: Any, *, default: str = ANY_SCOPE) -> str:
     raw = _normalize_text(value, default=default)
     return raw.upper() if raw else default
+
+
+def _normalize_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _normalize_session_state(value: Any) -> str:
@@ -145,7 +165,46 @@ def _coerce_optional_int(value: Any) -> Optional[int]:
     return int(value)
 
 
-def _scope_specificity(artifact: CalibrationArtifactRef) -> tuple[int, str, str]:
+def _normalize_required_provenance_fields(selection_policy: Mapping[str, Any], compatibility_rules: Mapping[str, Any]) -> Tuple[str, ...]:
+    def _from_value(value: Any) -> Tuple[str, ...]:
+        if value is True:
+            return tuple(DEFAULT_CALIBRATION_PROVENANCE_FIELDS)
+        if value in (False, None, ""):
+            return tuple()
+        if isinstance(value, Sequence) and not isinstance(value, str):
+            normalized: list[str] = []
+            for field_name in value:
+                raw = str(field_name or "").strip()
+                if raw:
+                    normalized.append(raw)
+            return tuple(normalized)
+        raw = str(value or "").strip()
+        return (raw,) if raw else tuple()
+
+    explicit = _from_value(compatibility_rules.get("required_provenance_fields"))
+    if explicit:
+        return explicit
+    explicit = _from_value(selection_policy.get("required_provenance_fields"))
+    if explicit:
+        return explicit
+    if _normalize_bool(compatibility_rules.get("require_provenance_fields"), default=False):
+        return tuple(DEFAULT_CALIBRATION_PROVENANCE_FIELDS)
+    if _normalize_bool(selection_policy.get("require_provenance"), default=False):
+        return tuple(DEFAULT_CALIBRATION_PROVENANCE_FIELDS)
+    if _normalize_bool(selection_policy.get("institutional_grade"), default=False):
+        return tuple(DEFAULT_CALIBRATION_PROVENANCE_FIELDS)
+    return tuple()
+
+
+def _allow_generic_scope_fallback(selection_policy: Mapping[str, Any], compatibility_rules: Mapping[str, Any]) -> bool:
+    if "allow_generic_scope_fallback" in compatibility_rules:
+        return _normalize_bool(compatibility_rules.get("allow_generic_scope_fallback"), default=True)
+    if "allow_generic_scope_fallback" in selection_policy:
+        return _normalize_bool(selection_policy.get("allow_generic_scope_fallback"), default=True)
+    return True
+
+
+def _scope_specificity(artifact: CalibrationArtifactRef) -> tuple[int, int, str, str]:
     score = 0
     if str(artifact.scope_horizon_kind).upper() != ANY_SCOPE:
         score += 10
@@ -157,7 +216,8 @@ def _scope_specificity(artifact: CalibrationArtifactRef) -> tuple[int, str, str]
         score += 3
     if str(artifact.scope_replay_mode).upper() != ANY_SCOPE:
         score += 1
-    return (-score, str(artifact.artifact_name), str(artifact.artifact_version))
+    provenance_score = len(tuple(field for field in DEFAULT_CALIBRATION_PROVENANCE_FIELDS if field not in artifact.missing_provenance_fields(DEFAULT_CALIBRATION_PROVENANCE_FIELDS)))
+    return (-score, -provenance_score, str(artifact.artifact_name), str(artifact.artifact_version))
 
 
 def _artifact_matches_target(artifact: CalibrationArtifactRef, request: CalibrationSelectionRequest) -> bool:
@@ -195,6 +255,25 @@ def _artifact_matches_replay_mode(artifact: CalibrationArtifactRef, request: Cal
     return scope_replay == ANY_SCOPE or scope_replay == request.replay_mode
 
 
+def _artifact_uses_generic_scope(artifact: CalibrationArtifactRef, request: CalibrationSelectionRequest) -> bool:
+    if request.horizon_kind != ANY_SCOPE and _normalize_horizon_kind(artifact.scope_horizon_kind) == ANY_SCOPE:
+        return True
+    if request.horizon_kind == HorizonKind.FIXED.value and request.horizon_minutes is not None:
+        if artifact.scope_horizon_minutes is None:
+            return True
+    if request.session_state and _normalize_scope_token(artifact.scope_session) == ANY_SCOPE:
+        return True
+    if request.regime and _normalize_scope_token(artifact.scope_regime) == ANY_SCOPE:
+        return True
+    if request.replay_mode and _normalize_replay_mode(artifact.scope_replay_mode) == ANY_SCOPE:
+        return True
+    return False
+
+
+def _artifact_missing_required_provenance(artifact: CalibrationArtifactRef, required_fields: Sequence[str]) -> Tuple[str, ...]:
+    return artifact.missing_provenance_fields(tuple(required_fields)) if required_fields else tuple()
+
+
 def _build_registry_artifact(
     entry: Mapping[str, Any],
     *,
@@ -204,6 +283,7 @@ def _build_registry_artifact(
 ) -> CalibrationArtifactRef:
     cfg = dict(entry)
     scope_cfg = _as_mapping(cfg.get("scope"))
+    provenance_cfg = _as_mapping(cfg.get("provenance"))
 
     bins_raw = cfg.get("bins")
     mapped_raw = cfg.get("mapped")
@@ -235,6 +315,16 @@ def _build_registry_artifact(
         scope_regime=_normalize_scope_token(scope_cfg.get("regime"), default=ANY_SCOPE),
         scope_replay_mode=_normalize_replay_mode(scope_cfg.get("replay_mode")),
         scope_contract_version=_normalize_text(scope_cfg.get("scope_contract_version"), default="calibration_scope/v1"),
+        provenance_contract_version=_normalize_text(
+            provenance_cfg.get("provenance_contract_version") or cfg.get("provenance_contract_version"),
+            default="calibration_provenance/v1",
+        ),
+        trained_from_utc=provenance_cfg.get("trained_from_utc", cfg.get("trained_from_utc")),
+        trained_to_utc=provenance_cfg.get("trained_to_utc", cfg.get("trained_to_utc")),
+        valid_from_utc=provenance_cfg.get("valid_from_utc", cfg.get("valid_from_utc")),
+        valid_to_utc=provenance_cfg.get("valid_to_utc", cfg.get("valid_to_utc")),
+        evidence_ref=_normalize_text(provenance_cfg.get("evidence_ref", cfg.get("evidence_ref")), default="") or None,
+        fit_sample_count=_coerce_optional_int(provenance_cfg.get("fit_sample_count", cfg.get("fit_sample_count"))),
     )
     if not artifact.is_valid():
         raise ValueError("invalid calibration artifact")
@@ -270,7 +360,7 @@ def build_calibration_registry(
                         source_name="calibration_registry",
                     )
                 )
-            except Exception as exc:  # explicit parse rejection surfaced in selection diagnostics
+            except Exception as exc:
                 invalid_entries.append(f"artifacts[{idx}]: {exc}")
         return CalibrationRegistry(
             artifacts=tuple(artifacts),
@@ -337,6 +427,8 @@ def select_calibration_artifact(
 
     registry = build_calibration_registry(model_cfg, target_spec=target_spec)
     all_artifacts = tuple(artifact for artifact in registry.artifacts if artifact.is_valid())
+    required_provenance_fields = _normalize_required_provenance_fields(registry.selection_policy, registry.compatibility_rules)
+    allow_generic_scope_fallback = _allow_generic_scope_fallback(registry.selection_policy, registry.compatibility_rules)
 
     if target_spec is None:
         return CalibrationSelectionResult(
@@ -351,6 +443,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     if not all_artifacts:
@@ -366,6 +459,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     target_candidates = tuple(a for a in all_artifacts if _artifact_matches_target(a, request))
@@ -382,6 +476,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     horizon_candidates = tuple(a for a in target_candidates if _artifact_matches_horizon(a, request))
@@ -398,6 +493,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     session_candidates = tuple(a for a in horizon_candidates if _artifact_matches_session(a, request))
@@ -414,6 +510,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     regime_candidates = tuple(a for a in session_candidates if _artifact_matches_regime(a, request))
@@ -430,6 +527,7 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
     replay_candidates = tuple(a for a in regime_candidates if _artifact_matches_replay_mode(a, request))
@@ -446,13 +544,83 @@ def select_calibration_artifact(
             invalid_entries=registry.invalid_entries,
             selection_policy=registry.selection_policy,
             compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
         )
 
-    ordered = sorted(replay_candidates, key=_scope_specificity)
+    compatible_candidates: list[CalibrationArtifactRef] = []
+    provenance_exclusions: list[str] = []
+    generic_scope_exclusions: list[str] = []
+    for artifact in replay_candidates:
+        missing_provenance = _artifact_missing_required_provenance(artifact, required_provenance_fields)
+        if missing_provenance:
+            provenance_exclusions.append(f"{artifact.artifact_version}:{','.join(missing_provenance)}")
+            continue
+        if not allow_generic_scope_fallback and _artifact_uses_generic_scope(artifact, request):
+            generic_scope_exclusions.append(f"{artifact.artifact_version}:generic_scope_forbidden")
+            continue
+        compatible_candidates.append(artifact)
+
+    if not compatible_candidates:
+        if provenance_exclusions:
+            return CalibrationSelectionResult(
+                artifact=None,
+                request=request,
+                reason_code="MISSING_REQUIRED_PROVENANCE",
+                reasons=tuple(f"missing_provenance:{item}" for item in provenance_exclusions),
+                registry_version=registry.registry_version,
+                registry_source=registry.registry_source,
+                candidate_count=len(replay_candidates),
+                compatible_candidate_count=0,
+                invalid_entries=registry.invalid_entries,
+                selection_policy=registry.selection_policy,
+                compatibility_rules=registry.compatibility_rules,
+                provenance_required_fields=required_provenance_fields,
+                provenance_exclusions=tuple(provenance_exclusions),
+            )
+        if generic_scope_exclusions:
+            return CalibrationSelectionResult(
+                artifact=None,
+                request=request,
+                reason_code="GENERIC_SCOPE_FALLBACK_FORBIDDEN",
+                reasons=tuple(generic_scope_exclusions),
+                registry_version=registry.registry_version,
+                registry_source=registry.registry_source,
+                candidate_count=len(replay_candidates),
+                compatible_candidate_count=0,
+                invalid_entries=registry.invalid_entries,
+                selection_policy=registry.selection_policy,
+                compatibility_rules=registry.compatibility_rules,
+                provenance_required_fields=required_provenance_fields,
+                provenance_exclusions=tuple(generic_scope_exclusions),
+            )
+        return CalibrationSelectionResult(
+            artifact=None,
+            request=request,
+            reason_code="NO_COMPATIBLE_ARTIFACT",
+            reasons=("no_compatible_artifact",),
+            registry_version=registry.registry_version,
+            registry_source=registry.registry_source,
+            candidate_count=len(replay_candidates),
+            compatible_candidate_count=0,
+            invalid_entries=registry.invalid_entries,
+            selection_policy=registry.selection_policy,
+            compatibility_rules=registry.compatibility_rules,
+            provenance_required_fields=required_provenance_fields,
+        )
+
+    ordered = sorted(compatible_candidates, key=_scope_specificity)
     selected = ordered[0]
     reasons = ["selected_scope_compatible_artifact"]
+    if _artifact_uses_generic_scope(selected, request):
+        reasons.append("selected_generic_scope_artifact")
+    if required_provenance_fields:
+        reasons.append("provenance_contract_satisfied")
     if len(ordered) > 1:
         reasons.append(f"multiple_compatible_candidates:{len(ordered)}")
+    if provenance_exclusions:
+        reasons.append(f"excluded_missing_provenance:{len(provenance_exclusions)}")
+    if generic_scope_exclusions:
+        reasons.append(f"excluded_generic_scope:{len(generic_scope_exclusions)}")
 
     return CalibrationSelectionResult(
         artifact=selected,
@@ -462,8 +630,10 @@ def select_calibration_artifact(
         registry_version=registry.registry_version,
         registry_source=registry.registry_source,
         candidate_count=len(all_artifacts),
-        compatible_candidate_count=len(replay_candidates),
+        compatible_candidate_count=len(compatible_candidates),
         invalid_entries=registry.invalid_entries,
         selection_policy=registry.selection_policy,
         compatibility_rules=registry.compatibility_rules,
+        provenance_required_fields=required_provenance_fields,
+        provenance_exclusions=tuple(provenance_exclusions + generic_scope_exclusions),
     )

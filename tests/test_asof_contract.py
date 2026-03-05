@@ -1,3 +1,4 @@
+from unittest.mock import Mock
 import datetime as dt
 
 from src.endpoint_rules import EmptyPayloadPolicy
@@ -270,3 +271,131 @@ def test_explicit_provider_fields_override_inferred_payload_and_header_values():
     assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 20, tzinfo=dt.timezone.utc)
     assert hints.effective_time_utc == dt.datetime(2026, 1, 1, 11, 59, 25, tzinfo=dt.timezone.utc)
     assert hints.source_revision == "rev-explicit"
+
+
+def test_camel_case_payload_provider_time_fields_are_inferred_before_degraded_fallback():
+    asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    payload = {
+        "meta": {
+            "effectiveTime": "2026-01-01T11:59:50+00:00",
+            "publishedAt": "2026-01-01T11:59:45+00:00",
+            "sourceRevision": "rev-camel-1",
+        },
+        "data": [{"close": 150.0, "eventTime": "2026-01-01T11:59:40+00:00"}],
+    }
+
+    hints = infer_source_time_hints(payload_json=payload)
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
+        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
+        is_empty=False,
+        changed=True,
+        error_reason=None,
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="evt-camel",
+        current_ts_raw=asof_utc,
+        assessment=assessment,
+        prev_state=None,
+        as_of_time_raw=asof_utc,
+        source_event_time_raw=hints.event_time_utc,
+        source_publish_time_raw=hints.source_publish_time_utc,
+        effective_time_raw=hints.effective_time_utc,
+        source_revision=hints.source_revision,
+    )
+
+    assert hints.event_time_utc == dt.datetime(2026, 1, 1, 11, 59, 40, tzinfo=dt.timezone.utc)
+    assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 45, tzinfo=dt.timezone.utc)
+    assert hints.effective_time_utc == dt.datetime(2026, 1, 1, 11, 59, 50, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-camel-1"
+    assert resolved.effective_ts_utc == hints.effective_time_utc
+    assert resolved.effective_time_source == "payload_effective_time"
+    assert resolved.timestamp_quality == "VALID"
+    assert resolved.time_provenance_degraded is False
+
+
+
+def test_response_header_event_and_effective_times_reduce_degraded_fallback():
+    asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    headers = {
+        "X-Source-Event-Time": "2026-01-01T11:59:20+00:00",
+        "X-Effective-Time": "2026-01-01T11:59:30+00:00",
+        "X-Source-Revision": "rev-effective-header",
+    }
+
+    hints = infer_source_time_hints(payload_json={"data": [{"close": 151.0}]}, response_headers=headers)
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
+        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
+        is_empty=False,
+        changed=True,
+        error_reason=None,
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="evt-effective-header",
+        current_ts_raw=asof_utc,
+        assessment=assessment,
+        prev_state=None,
+        as_of_time_raw=asof_utc,
+        source_event_time_raw=hints.event_time_utc,
+        source_publish_time_raw=hints.source_publish_time_utc,
+        effective_time_raw=hints.effective_time_utc,
+        source_revision=hints.source_revision,
+    )
+
+    assert hints.event_time_utc == dt.datetime(2026, 1, 1, 11, 59, 20, tzinfo=dt.timezone.utc)
+    assert hints.effective_time_utc == dt.datetime(2026, 1, 1, 11, 59, 30, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-effective-header"
+    assert resolved.effective_ts_utc == hints.effective_time_utc
+    assert resolved.effective_time_source == "payload_effective_time"
+    assert resolved.timestamp_quality == "VALID"
+    assert resolved.time_provenance_degraded is False
+
+
+
+def test_response_header_generated_at_is_used_when_payload_is_timestamp_poor():
+    headers = {
+        "X-Generated-At": "2026-01-01T11:59:30+00:00",
+        "X-Data-Revision": "rev-generated-header",
+    }
+
+    hints = infer_source_time_hints(payload_json={"meta": {}, "data": [{"close": 151.0}]}, response_headers=headers)
+
+    assert hints.event_time_utc is None
+    assert hints.source_publish_time_utc == dt.datetime(2026, 1, 1, 11, 59, 30, tzinfo=dt.timezone.utc)
+    assert hints.source_revision == "rev-generated-header"
+
+
+
+def test_uw_client_preserves_provider_time_headers_for_downstream_inference():
+    from src.uw_client import UwClient
+
+    client = UwClient(
+        registry=Mock(),
+        base_url="https://example.com",
+        api_key_env="UW_API_KEY",
+        timeout_seconds=5,
+        max_retries=0,
+        backoff_seconds=1,
+        max_concurrent_requests=1,
+        rate_limit_per_second=1,
+        circuit_failure_threshold=1,
+        circuit_cool_down_seconds=1,
+        circuit_half_open_max_calls=1,
+    )
+
+    headers = client._extract_response_headers({
+        "X-Source-Event-Time": "2026-01-01T11:59:20+00:00",
+        "X-Effective-Time": "2026-01-01T11:59:30+00:00",
+        "X-Generated-At": "2026-01-01T11:59:40+00:00",
+        "X-Data-Revision": "rev-provider-meta",
+        "Ignored": "value",
+    })
+
+    assert headers["x-source-event-time"] == "2026-01-01T11:59:20+00:00"
+    assert headers["x-effective-time"] == "2026-01-01T11:59:30+00:00"
+    assert headers["x-generated-at"] == "2026-01-01T11:59:40+00:00"
+    assert headers["x-data-revision"] == "rev-provider-meta"
+    assert "ignored" not in headers

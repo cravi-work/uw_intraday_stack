@@ -113,6 +113,59 @@ FEATURE_USE_ROLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
 LEGACY_PATH_USE_ROLE_OVERRIDES: Dict[str, str] = {
     "/api/darkpool/{ticker}": "report-only",
 }
+OUTPUT_DOMAIN_CONTRACT_VERSION = "output_domain/v1"
+
+
+def _normalize_expected_bounds(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+
+    lower: Optional[float] = None
+    upper: Optional[float] = None
+    inclusive = True
+    if isinstance(value, Mapping):
+        lower = safe_float(value.get("lower", value.get("min")))
+        upper = safe_float(value.get("upper", value.get("max")))
+        inclusive = bool(value.get("inclusive", True))
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        lower = safe_float(value[0])
+        upper = safe_float(value[1])
+    else:
+        return None
+
+    if lower is None or upper is None:
+        return None
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        return None
+
+    lo = float(min(lower, upper))
+    hi = float(max(lower, upper))
+    return {"lower": lo, "upper": hi, "inclusive": inclusive}
+
+
+def _with_output_domain(
+    lineage: Dict[str, Any],
+    *,
+    emitted_units: Optional[str],
+    raw_input_units: Optional[str],
+    bounded_output: bool,
+    expected_bounds: Any = None,
+    output_domain: str = "unbounded_scalar",
+    allowed_values: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    enriched = dict(lineage)
+    enriched["emitted_units"] = emitted_units
+    enriched["raw_input_units"] = raw_input_units
+    enriched["bounded_output"] = bool(bounded_output)
+    enriched["expected_bounds"] = _normalize_expected_bounds(expected_bounds) if expected_bounds is not None else None
+    enriched["output_domain"] = output_domain
+    enriched["output_domain_contract_version"] = OUTPUT_DOMAIN_CONTRACT_VERSION
+    if allowed_values is not None:
+        enriched["allowed_values"] = [
+            float(v) if isinstance(v, (int, float)) and math.isfinite(float(v)) else v
+            for v in allowed_values
+        ]
+    return enriched
 
 
 def _resolve_feature_use_contract(ctx: EndpointContext) -> Dict[str, Any]:
@@ -447,11 +500,22 @@ def _build_meta(
     )
 
     feature_use_contract = _resolve_feature_use_contract(ctx)
+    structured_expected_bounds = _normalize_expected_bounds(lineage.get("expected_bounds"))
+    allowed_values = lineage.get("allowed_values")
+    if isinstance(allowed_values, tuple):
+        allowed_values = list(allowed_values)
     full_lineage = {
         "metric_name": lineage.get("metric_name", "unknown"),
         "source_path": ctx.path,
         "fields_used": lineage.get("fields_used", []),
         "units_expected": lineage.get("units_expected", "unknown"),
+        "emitted_units": lineage.get("emitted_units"),
+        "raw_input_units": lineage.get("raw_input_units"),
+        "expected_bounds": copy.deepcopy(structured_expected_bounds) if structured_expected_bounds is not None else None,
+        "bounded_output": bool(lineage.get("bounded_output", False)),
+        "output_domain": lineage.get("output_domain"),
+        "output_domain_contract_version": lineage.get("output_domain_contract_version"),
+        "allowed_values": copy.deepcopy(allowed_values) if allowed_values is not None else None,
         "normalization": lineage.get("normalization", "none"),
         "session_applicability": lineage.get("session_applicability", "PREMARKET/RTH/AFTERHOURS"),
         "quality_policy": lineage.get("quality_policy", "None on missing"),
@@ -527,7 +591,7 @@ def _annotate_level_usage_contract(meta: Dict[str, Any], level_type: str) -> Dic
     return meta
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "spot",
         "fields_used": ["close", "t"],
         "units_expected": "USD",
@@ -535,7 +599,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None if missing required explicit keys",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="USD", raw_input_units="USD", bounded_output=False, output_domain="unbounded_scalar")
     
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, ctx.na_reason or "missing_dependency")})
@@ -562,15 +626,15 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, prov)})
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "smart_whale_pressure",
         "fields_used": ["premium", "dte", "side", "put_call", "option_symbol", "expiration", "multiplier", "deliverable"],
-        "units_expected": "Net Premium Flow (USD)",
+        "units_expected": "Normalized Directional Pressure [-1, 1]",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
         "quality_policy": "None on filtered zeros to avoid false baseline certainty; suppress on contract normalization failure",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="normalized_directional_pressure", raw_input_units="Net Premium Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
 
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency")})
@@ -666,15 +730,15 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
 
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "dealer_greeks",
         "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date", "option_symbol", "expiration", "multiplier", "deliverable"],
-        "units_expected": "Notional Exposure (USD)",
+        "units_expected": "Normalized Signed Exposure [-1, 1]",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "PREMARKET/RTH",
         "quality_policy": "None on missing; suppress on contract normalization failure",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="normalized_signed_exposure", raw_input_units="Notional Exposure (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
 
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency")})
@@ -715,15 +779,15 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     }, {"greeks": meta})
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "net_gex_sign",
         "fields_used": ["gamma_exposure"],
-        "units_expected": "Sign (+1.0, 0.0, -1.0)",
+        "units_expected": "Directional Sign [-1, 1]",
         "normalization": "Directional sign clamping",
         "session_applicability": "PREMARKET/RTH",
         "quality_policy": "None on missing exposure fields",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="directional_sign", raw_input_units="Gamma Exposure (provider aggregate units)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="discrete_sign", allowed_values=(-1.0, 0.0, 1.0))
     
     if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency")})
@@ -752,7 +816,7 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "oi_pressure",
         "fields_used": ["open_interest", "strike", "put_call", "expiration", "option_symbol", "multiplier", "deliverable"],
         "units_expected": "Directional Imbalance Ratio [-1, 1]",
@@ -760,7 +824,7 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "session_applicability": "RTH",
         "quality_policy": "Suppress on missing put/call semantics, invalid directional rows, or contract normalization failure",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="directional_imbalance_ratio", raw_input_units="Open Interest (contracts)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
 
@@ -853,15 +917,15 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
 
 def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "iv_rank",
         "fields_used": ["iv_rank", "iv_percentile"],
-        "units_expected": "Percentile [0,1]",
+        "units_expected": "Percentile [0, 1]",
         "normalization": "none",
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
-    }
+    }, emitted_units="percentile_rank", raw_input_units="Percentile Rank", bounded_output=True, expected_bounds=(0.0, 1.0), output_domain="closed_interval")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, ctx.na_reason or "missing_dependency")})
     
@@ -876,7 +940,7 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
     return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, _extract_payload_provenance(payload))})
 
 def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "vol_term_slope",
         "fields_used": ["dte", "days", "iv", "implied_volatility"],
         "units_expected": "IV Spread",
@@ -884,7 +948,7 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
-    }
+    }, emitted_units="implied_volatility_spread", raw_input_units="Implied Volatility", bounded_output=False, output_domain="unbounded_scalar")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, ctx.na_reason or "missing_dependency")})
     
@@ -908,7 +972,7 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
     return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)})})
 
 def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "vol_skew",
         "fields_used": ["skew", "risk_reversal", "value"],
         "units_expected": "Skew Ratio",
@@ -916,7 +980,7 @@ def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
-    }
+    }, emitted_units="skew_ratio", raw_input_units="Skew Ratio", bounded_output=False, output_domain="unbounded_scalar")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, ctx.na_reason or "missing_dependency")})
     
@@ -936,7 +1000,7 @@ def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, _extract_payload_provenance(payload))})
 
 def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "darkpool_pressure",
         "fields_used": ["volume", "price", "size", "side"],
         "units_expected": "Directional Imbalance Ratio [-1, 1]",
@@ -944,7 +1008,7 @@ def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBund
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "Suppress on directionless totals",
         "criticality": "NON_CRITICAL"
-    }
+    }, emitted_units="directional_imbalance_ratio", raw_input_units="Notional Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, ctx.na_reason or "missing_dependency")})
     
@@ -990,7 +1054,7 @@ def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBund
     return FeatureBundle({"darkpool_pressure": pressure}, {"darkpool": _build_meta(ctx, "extract_darkpool", lineage, {**_extract_payload_provenance(payload), "n_rows": len(rows), "explicit_side_rows": explicit_side_rows, "buy_notional": buy_notional, "sell_notional": sell_notional})})
 
 def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "litflow_pressure",
         "fields_used": ["volume", "price", "side", "size"],
         "units_expected": "Directional Imbalance Ratio [-1, 1]",
@@ -998,7 +1062,7 @@ def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundl
         "session_applicability": "RTH",
         "quality_policy": "None on missing",
         "criticality": "NON_CRITICAL"
-    }
+    }, emitted_units="directional_imbalance_ratio", raw_input_units="Notional Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, ctx.na_reason or "missing_dependency")})
     

@@ -1,3 +1,4 @@
+
 import datetime as dt
 import logging
 
@@ -61,6 +62,13 @@ def _feature(
     na_reason: str | None = None,
     use_role: str = "signal-critical",
     decision_eligible: bool = True,
+    bounded_output: bool = False,
+    expected_bounds: tuple[float, float] | dict | None = None,
+    emitted_units: str | None = None,
+    raw_input_units: str | None = None,
+    output_domain: str | None = None,
+    output_domain_contract_version: str | None = None,
+    allowed_values: list[float] | None = None,
 ) -> dict:
     contract = {
         "contract_version": "feature_use/v1",
@@ -70,6 +78,31 @@ def _feature(
         "missing_affects_confidence": bool(decision_eligible),
         "stale_affects_confidence": bool(decision_eligible),
     }
+    lineage = {
+        "effective_ts_utc": (ASOF_UTC - dt.timedelta(minutes=1)).isoformat(),
+        "source_path": path,
+        "units_expected": units_expected,
+        "session_applicability": session_applicability,
+        "decision_path_role": use_role,
+        "feature_use_contract_version": "feature_use/v1",
+        "time_provenance_degraded": bool(time_provenance_degraded),
+    }
+    if bounded_output:
+        lineage.update(
+            {
+                "bounded_output": True,
+                "expected_bounds": (
+                    {"lower": float(expected_bounds[0]), "upper": float(expected_bounds[1]), "inclusive": True}
+                    if isinstance(expected_bounds, tuple)
+                    else expected_bounds
+                ),
+                "emitted_units": emitted_units,
+                "raw_input_units": raw_input_units,
+                "output_domain": output_domain,
+                "output_domain_contract_version": output_domain_contract_version,
+                "allowed_values": list(allowed_values) if allowed_values is not None else None,
+            }
+        )
     return {
         "feature_key": feature_key,
         "feature_value": value,
@@ -93,15 +126,7 @@ def _feature(
             "decision_eligible": bool(decision_eligible),
             "missing_affects_confidence": bool(decision_eligible),
             "stale_affects_confidence": bool(decision_eligible),
-            "metric_lineage": {
-                "effective_ts_utc": (ASOF_UTC - dt.timedelta(minutes=1)).isoformat(),
-                "source_path": path,
-                "units_expected": units_expected,
-                "session_applicability": session_applicability,
-                "decision_path_role": use_role,
-                "feature_use_contract_version": "feature_use/v1",
-                "time_provenance_degraded": bool(time_provenance_degraded),
-            },
+            "metric_lineage": lineage,
             "details": {},
         },
     }
@@ -121,7 +146,6 @@ def _run(features: list[dict], cfg: dict, *, session: SessionState = SessionStat
     return predictions[0]
 
 
-
 def test_assess_operational_ood_marks_healthy_bundle_in_distribution():
     features = [
         _feature(
@@ -137,6 +161,12 @@ def test_assess_operational_ood_marks_healthy_bundle_in_distribution():
             path="/api/stock/{ticker}/oi-per-strike",
             units_expected="Directional Imbalance Ratio [-1, 1]",
             session_applicability="RTH",
+            bounded_output=True,
+            expected_bounds=(-1.0, 1.0),
+            emitted_units="directional_imbalance_ratio",
+            raw_input_units="Open Interest (contracts)",
+            output_domain="closed_interval",
+            output_domain_contract_version="output_domain/v1",
         ),
     ]
 
@@ -150,7 +180,6 @@ def test_assess_operational_ood_marks_healthy_bundle_in_distribution():
     assert assessment.primary_reason == "decision_feature_bundle_in_distribution"
     assert assessment.coverage_ratio == 1.0
     assert assessment.boundary_violation_features == {}
-
 
 
 def test_assess_operational_ood_marks_time_provenance_degradation():
@@ -169,6 +198,12 @@ def test_assess_operational_ood_marks_time_provenance_degradation():
             units_expected="Directional Imbalance Ratio [-1, 1]",
             session_applicability="RTH",
             time_provenance_degraded=True,
+            bounded_output=True,
+            expected_bounds=(-1.0, 1.0),
+            emitted_units="directional_imbalance_ratio",
+            raw_input_units="Open Interest (contracts)",
+            output_domain="closed_interval",
+            output_domain_contract_version="output_domain/v1",
         ),
     ]
 
@@ -181,7 +216,6 @@ def test_assess_operational_ood_marks_time_provenance_degradation():
     assert assessment.state == OODState.DEGRADED
     assert assessment.primary_reason.startswith("time_provenance_degraded:")
     assert assessment.degraded_feature_keys == ("oi_pressure",)
-
 
 
 def test_assess_operational_ood_marks_boundary_violation_out_of_distribution():
@@ -199,6 +233,12 @@ def test_assess_operational_ood_marks_boundary_violation_out_of_distribution():
             path="/api/stock/{ticker}/oi-per-strike",
             units_expected="Directional Imbalance Ratio [-1, 1]",
             session_applicability="RTH",
+            bounded_output=True,
+            expected_bounds=(-1.0, 1.0),
+            emitted_units="directional_imbalance_ratio",
+            raw_input_units="Open Interest (contracts)",
+            output_domain="closed_interval",
+            output_domain_contract_version="output_domain/v1",
         ),
     ]
 
@@ -213,7 +253,6 @@ def test_assess_operational_ood_marks_boundary_violation_out_of_distribution():
     assert "oi_pressure" in assessment.boundary_violation_features
 
 
-
 def test_assess_operational_ood_returns_unknown_when_assessment_cannot_run():
     assessment = assess_operational_ood(
         feature_rows=[],
@@ -224,7 +263,6 @@ def test_assess_operational_ood_returns_unknown_when_assessment_cannot_run():
     assert assessment.state == OODState.UNKNOWN
     assert assessment.primary_reason == "no_decision_features_configured"
     assert assessment.assessment_ran is False
-
 
 
 def test_generate_predictions_emits_real_ood_state_and_logs_boundary_violation(caplog):
@@ -243,6 +281,12 @@ def test_generate_predictions_emits_real_ood_state_and_logs_boundary_violation(c
             path="/api/stock/{ticker}/oi-per-strike",
             units_expected="Directional Imbalance Ratio [-1, 1]",
             session_applicability="RTH",
+            bounded_output=True,
+            expected_bounds=(-1.0, 1.0),
+            emitted_units="directional_imbalance_ratio",
+            raw_input_units="Open Interest (contracts)",
+            output_domain="closed_interval",
+            output_domain_contract_version="output_domain/v1",
         ),
     ]
 
@@ -256,7 +300,6 @@ def test_generate_predictions_emits_real_ood_state_and_logs_boundary_violation(c
     counters = [getattr(record, "counter", None) for record in caplog.records]
     assert "ood_rejection_count" in counters
     assert "ood_feature_boundary_violation_count" in counters
-
 
 
 def test_generate_predictions_marks_degraded_for_time_provenance_degraded_bundle(caplog):
@@ -276,6 +319,12 @@ def test_generate_predictions_marks_degraded_for_time_provenance_degraded_bundle
             units_expected="Directional Imbalance Ratio [-1, 1]",
             session_applicability="RTH",
             time_provenance_degraded=True,
+            bounded_output=True,
+            expected_bounds=(-1.0, 1.0),
+            emitted_units="directional_imbalance_ratio",
+            raw_input_units="Open Interest (contracts)",
+            output_domain="closed_interval",
+            output_domain_contract_version="output_domain/v1",
         ),
     ]
 

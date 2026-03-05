@@ -14,6 +14,41 @@ from src.storage import DbWriter
 UTC = timezone.utc
 
 
+def _insert_feature_lineage(con: duckdb.DuckDBPyConnection, snapshot_id) -> None:
+    con.execute(
+        """
+        INSERT INTO features (snapshot_id, feature_key, feature_value, meta_json)
+        VALUES
+          (?, 'spot', 412.10, ?),
+          (?, 'oi_pressure', 0.24, ?)
+        """,
+        [
+            snapshot_id,
+            json.dumps(
+                {
+                    "metric_lineage": {
+                        "metric_name": "spot",
+                        "timestamp_quality": "VALID",
+                        "time_provenance_degraded": False,
+                    }
+                }
+            ),
+            snapshot_id,
+            json.dumps(
+                {
+                    "metric_lineage": {
+                        "metric_name": "oi_pressure",
+                        "timestamp_quality": "DEGRADED",
+                        "time_provenance_degraded": True,
+                        "bounded_output": True,
+                        "output_domain_contract_version": "output_domain/v1",
+                    }
+                }
+            ),
+        ],
+    )
+
+
 def _insert_prediction(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -25,9 +60,13 @@ def _insert_prediction(
     calibration_version: str | None,
     calibration_scope: dict | None,
     calibration_artifact_hash: str | None,
+    calibration_evidence_ref: str | None,
+    replay_governance_reason: str | None,
     suppression_reason: str | None,
     data_quality_state: str,
     confidence_state: str,
+    output_domain_contract_version: str | None,
+    ood_contract_version: str | None,
     meta_json: dict | None = None,
 ) -> None:
     con.execute(
@@ -39,14 +78,17 @@ def _insert_prediction(
             target_name, target_version, label_version,
             model_name, model_version, calibration_version, threshold_policy_version,
             replay_mode, ood_state, ood_reason, calibration_scope, calibration_artifact_hash,
-            decision_path_contract_version, suppression_reason, probability_contract_json, meta_json,
+            calibration_evidence_ref, output_domain_contract_version, replay_governance_reason,
+            ood_contract_version, decision_path_contract_version, suppression_reason,
+            probability_contract_json, meta_json,
             outcome_realized, is_mock, realized_at_utc, brier_score,
             decision_state, risk_gate_status, data_quality_state, confidence_state
         ) VALUES (?, ?, ?, ?, 'FIXED', ?, 0.10, 0.66, 0.58, 0.21, 0.21,
                   'intraday_direction_3class', 'target_v2', 'label_v2',
                   'phase0_additive', '2.0', ?, 'thresh_v3',
                   'LIVE_LIKE_OBSERVED', ?, ?, ?, ?,
-                  'decision_path/v2', ?, ?, ?,
+                  ?, ?, ?, ?, 'decision_path/v2', ?,
+                  ?, ?,
                   FALSE, FALSE, NULL, NULL,
                   'LONG', 'PASS', ?, ?)
         """,
@@ -61,6 +103,10 @@ def _insert_prediction(
             ood_reason,
             json.dumps(calibration_scope) if calibration_scope is not None else None,
             calibration_artifact_hash,
+            calibration_evidence_ref,
+            output_domain_contract_version,
+            replay_governance_reason,
+            ood_contract_version,
             suppression_reason,
             json.dumps(probability_contract),
             json.dumps(meta_json or {}),
@@ -94,6 +140,7 @@ def _seed_governance_dashboard_db(tmp_path):
             datetime(2026, 3, 5, 1, 0, tzinfo=UTC),
         ],
     )
+    _insert_feature_lineage(con, snapshot_id)
 
     shared_scope = {
         "horizon_kind": "FIXED",
@@ -117,16 +164,25 @@ def _seed_governance_dashboard_db(tmp_path):
                 "artifact_version": "cal_v8",
                 "artifact_hash": "hash_v8",
                 "calibration_scope": {**shared_scope, "horizon_minutes": 5},
+                "artifact_provenance": {
+                    "evidence_ref": "evidence://calibration/report-v8",
+                },
             },
+            "ood_contract_version": "ood/v2",
+            "output_domain_contract_version": "output_domain/v1",
         },
         ood_state="DEGRADED",
         ood_reason="FEATURE_COVERAGE_BELOW_TARGET",
         calibration_version="cal_v8",
         calibration_scope={**shared_scope, "horizon_minutes": 5},
         calibration_artifact_hash="hash_v8",
+        calibration_evidence_ref="evidence://calibration/report-v8",
+        replay_governance_reason="REPLAY_MODE_COMPATIBLE",
         suppression_reason=None,
         data_quality_state="PARTIAL",
         confidence_state="DEGRADED",
+        output_domain_contract_version="output_domain/v1",
+        ood_contract_version="ood/v2",
         meta_json={
             "prediction_contract": {"decision_path_contract_version": "decision_path/v2"},
             "horizon_contract": {
@@ -134,6 +190,11 @@ def _seed_governance_dashboard_db(tmp_path):
                 "report_only_excluded_features": ["darkpool_pressure"],
                 "context_only_excluded_features": ["iv_rank"],
             },
+            "replay_governance": {
+                "calibration_selection_reason": "REPLAY_MODE_COMPATIBLE",
+            },
+            "ood_assessment": {"contract_version": "ood/v2"},
+            "output_domain_contract_version": "output_domain/v1",
         },
     )
 
@@ -147,27 +208,40 @@ def _seed_governance_dashboard_db(tmp_path):
             "ood_state": "UNKNOWN",
             "ood_reason": "ASSESSMENT_SKIPPED",
             "is_coherent": True,
+            "ood_contract_version": "ood/v2",
+            "output_domain_contract_version": "output_domain/v1",
         },
         ood_state="UNKNOWN",
         ood_reason="ASSESSMENT_SKIPPED",
         calibration_version="cal_v8",
         calibration_scope=None,
         calibration_artifact_hash=None,
+        calibration_evidence_ref=None,
+        replay_governance_reason=None,
         suppression_reason=None,
         data_quality_state="OK",
         confidence_state="HIGH",
+        output_domain_contract_version="output_domain/v1",
+        ood_contract_version="ood/v2",
         meta_json={
             "prediction_contract": {"decision_path_contract_version": "decision_path/v2"},
             "horizon_contract": {"decision_path_contract_version": "decision_path/v2"},
+            "ood_assessment": {"contract_version": "ood/v2"},
+            "output_domain_contract_version": "output_domain/v1",
         },
     )
 
     trace_json = {
         "ood_reason": "FEATURE_COVERAGE_BELOW_TARGET",
+        "calibration_evidence_ref": "evidence://calibration/report-v8",
+        "output_domain_contract_version": "output_domain/v1",
+        "ood_contract_version": "ood/v2",
+        "replay_governance_reason": "REPLAY_MODE_COMPATIBLE",
         "probability_contract": {
             "calibration_artifact_ref": {
                 "artifact_hash": "hash_v8",
                 "calibration_scope": {**shared_scope, "horizon_minutes": 5},
+                "artifact_provenance": {"evidence_ref": "evidence://calibration/report-v8"},
             }
         },
         "horizon_contract": {
@@ -183,13 +257,16 @@ def _seed_governance_dashboard_db(tmp_path):
             event_type, decision_state, risk_gate_status, data_quality_state,
             confidence_state, suppression_reason, ood_state, ood_reason, replay_mode,
             model_version, target_version, calibration_version,
-            calibration_scope, calibration_artifact_hash, decision_path_contract_version,
-            trace_json
+            calibration_scope, calibration_artifact_hash, calibration_evidence_ref,
+            output_domain_contract_version, replay_governance_reason, ood_contract_version,
+            decision_path_contract_version, trace_json
         ) VALUES (?, ?, NULL, ?, ?,
                   'SIGNAL_DEGRADED', 'LONG', 'DEGRADED', 'PARTIAL',
                   'DEGRADED', NULL, 'DEGRADED', 'FEATURE_COVERAGE_BELOW_TARGET', 'LIVE_LIKE_OBSERVED',
                   '2.0', 'target_v2', 'cal_v8',
-                  ?, 'hash_v8', 'decision_path/v2', ?)
+                  ?, 'hash_v8', 'evidence://calibration/report-v8',
+                  'output_domain/v1', 'REPLAY_MODE_COMPATIBLE', 'ood/v2',
+                  'decision_path/v2', ?)
         """,
         [
             uuid.uuid4(),
@@ -215,15 +292,22 @@ def test_prediction_frame_distinguishes_degraded_and_unknown_governance_states(t
     assert degraded["governance_state"] == "DEGRADED"
     assert degraded["governance_reason"] == "FEATURE_COVERAGE_BELOW_TARGET, QUALITY_PARTIAL, CONFIDENCE_DEGRADED"
     assert degraded["calibrated_prob_up"] == pytest.approx(0.58)
+    assert degraded["calibration_evidence_ref"] == "evidence://calibration/report-v8"
+    assert degraded["replay_governance_reason"] == "REPLAY_MODE_COMPATIBLE"
+    assert degraded["ood_contract_version"] == "ood/v2"
+    assert degraded["output_domain_contract_version"] == "output_domain/v1"
     assert "session=RTH" in str(degraded["calibration_scope_label"])
     assert "report_only=darkpool_pressure" in str(degraded["decision_path_exclusions_text"])
     assert "context_only=iv_rank" in str(degraded["decision_path_exclusions_text"])
+    assert int(degraded["time_provenance_degraded_count"]) == 1
+    assert "oi_pressure" in str(degraded["time_provenance_degraded_features_text"])
 
     unknown = df.loc[df["horizon_minutes"] == 10].iloc[0]
     assert unknown["governance_state"] == "UNKNOWN_GOVERNANCE"
     assert "OOD_UNKNOWN" in str(unknown["governance_reason"])
     assert "CALIBRATION_SCOPE_MISSING" in str(unknown["governance_reason"])
     assert "CALIBRATION_ARTIFACT_HASH_MISSING" in str(unknown["governance_reason"])
+    assert "CALIBRATION_EVIDENCE_REF_MISSING" in str(unknown["governance_reason"])
     assert pd.isna(unknown["calibrated_prob_up"])
     assert pd.isna(unknown["calibrated_prob_down"])
     assert pd.isna(unknown["calibrated_prob_flat"])
@@ -239,7 +323,13 @@ def test_decision_trace_frame_surfaces_governance_details_truthfully(tmp_path):
     row = df.iloc[0]
     assert row["governance_state"] == "DEGRADED"
     assert row["ood_reason"] == "FEATURE_COVERAGE_BELOW_TARGET"
+    assert row["calibration_evidence_ref"] == "evidence://calibration/report-v8"
+    assert row["replay_governance_reason"] == "REPLAY_MODE_COMPATIBLE"
+    assert row["ood_contract_version"] == "ood/v2"
+    assert row["output_domain_contract_version"] == "output_domain/v1"
     assert "session=RTH" in str(row["calibration_scope_label"])
     assert row["decision_path_contract_version"] == "decision_path/v2"
     assert "report_only=darkpool_pressure" in str(row["decision_path_exclusions_text"])
     assert "context_only=iv_rank" in str(row["decision_path_exclusions_text"])
+    assert int(row["time_provenance_degraded_count"]) == 1
+    assert "oi_pressure" in str(row["time_provenance_degraded_features_text"])

@@ -38,6 +38,15 @@ def test_repo_guard_fails_on_root_type_expression_artifact(tmp_path: Path):
     assert "Root type-expression temp file" in result.stdout
     assert "Optional[str]" in result.stdout
 
+def test_repo_guard_fails_on_nested_root_type_expression_artifact(tmp_path: Path):
+    (tmp_path / "Optional[Dict[str").write_text("", encoding="utf-8")
+
+    result = _run_guard(tmp_path)
+
+    assert result.returncode == 2
+    assert "Root type-expression temp file" in result.stdout
+    assert "Optional[Dict[str" in result.stdout
+
 
 def test_repo_guard_fails_on_root_generated_output_placeholder(tmp_path: Path):
     (tmp_path / "derived_levels").write_text("", encoding="utf-8")

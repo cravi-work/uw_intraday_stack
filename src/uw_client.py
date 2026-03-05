@@ -152,8 +152,20 @@ class UwClient:
             "etag",
             "x-source-publish-time",
             "x-published-at",
+            "x-generated-at",
+            "x-response-generated-at",
+            "x-provider-publish-time",
+            "x-source-event-time",
+            "x-event-time",
+            "x-provider-event-time",
+            "x-effective-time",
+            "x-as-of-time",
+            "x-data-as-of",
+            "x-snapshot-time",
             "x-source-revision",
             "x-revision",
+            "x-version",
+            "x-data-revision",
         }
         out: Dict[str, str] = {}
         for key, value in headers.items():

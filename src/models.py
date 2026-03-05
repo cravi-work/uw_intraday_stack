@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, Any, List, Optional, Tuple, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
@@ -184,6 +185,46 @@ class LabelContractSpec:
         }
 
 
+UTC = timezone.utc
+DEFAULT_CALIBRATION_PROVENANCE_FIELDS: Tuple[str, ...] = (
+    "trained_from_utc",
+    "trained_to_utc",
+    "valid_from_utc",
+    "valid_to_utc",
+    "evidence_ref",
+    "fit_sample_count",
+)
+
+
+def _normalize_optional_utc_iso(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt_val = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+            return dt_val.astimezone(UTC).isoformat()
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return datetime.fromtimestamp(float(value), UTC).isoformat()
+        raw = str(value).strip()
+        if not raw:
+            return None
+        dt_val = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=UTC)
+        else:
+            dt_val = dt_val.astimezone(UTC)
+        return dt_val.isoformat()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_positive_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    coerced = int(value)
+    return coerced
+
+
 @dataclass(frozen=True)
 class CalibrationArtifactRef:
     artifact_name: str
@@ -199,6 +240,13 @@ class CalibrationArtifactRef:
     scope_regime: str = "ANY"
     scope_replay_mode: str = "ANY"
     scope_contract_version: str = "calibration_scope/v1"
+    provenance_contract_version: str = "calibration_provenance/v1"
+    trained_from_utc: Optional[str] = None
+    trained_to_utc: Optional[str] = None
+    valid_from_utc: Optional[str] = None
+    valid_to_utc: Optional[str] = None
+    evidence_ref: Optional[str] = None
+    fit_sample_count: Optional[int] = None
 
     def is_valid(self) -> bool:
         if not self.artifact_name or not str(self.artifact_name).strip():
@@ -254,6 +302,36 @@ class CalibrationArtifactRef:
             return False
         if not str(self.scope_contract_version or "").strip():
             return False
+        if not str(self.provenance_contract_version or "").strip():
+            return False
+
+        trained_from = _normalize_optional_utc_iso(self.trained_from_utc)
+        trained_to = _normalize_optional_utc_iso(self.trained_to_utc)
+        valid_from = _normalize_optional_utc_iso(self.valid_from_utc)
+        valid_to = _normalize_optional_utc_iso(self.valid_to_utc)
+
+        if self.trained_from_utc not in (None, "") and trained_from is None:
+            return False
+        if self.trained_to_utc not in (None, "") and trained_to is None:
+            return False
+        if self.valid_from_utc not in (None, "") and valid_from is None:
+            return False
+        if self.valid_to_utc not in (None, "") and valid_to is None:
+            return False
+        if trained_from is not None and trained_to is not None and trained_from > trained_to:
+            return False
+        if valid_from is not None and valid_to is not None and valid_from > valid_to:
+            return False
+
+        if self.evidence_ref not in (None, "") and not str(self.evidence_ref).strip():
+            return False
+
+        if self.fit_sample_count is not None:
+            try:
+                if int(self.fit_sample_count) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
         return True
 
     @property
@@ -268,6 +346,29 @@ class CalibrationArtifactRef:
         }
 
     @property
+    def artifact_provenance(self) -> Dict[str, Any]:
+        return {
+            "trained_from_utc": _normalize_optional_utc_iso(self.trained_from_utc),
+            "trained_to_utc": _normalize_optional_utc_iso(self.trained_to_utc),
+            "valid_from_utc": _normalize_optional_utc_iso(self.valid_from_utc),
+            "valid_to_utc": _normalize_optional_utc_iso(self.valid_to_utc),
+            "evidence_ref": str(self.evidence_ref).strip() if self.evidence_ref not in (None, "") else None,
+            "fit_sample_count": None if self.fit_sample_count is None else int(self.fit_sample_count),
+            "provenance_contract_version": self.provenance_contract_version,
+        }
+
+    def missing_provenance_fields(self, required_fields: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+        required = tuple(required_fields or DEFAULT_CALIBRATION_PROVENANCE_FIELDS)
+        provenance = self.artifact_provenance
+        missing: list[str] = []
+        for field_name in required:
+            if field_name == "artifact_hash":
+                continue
+            if provenance.get(field_name) in (None, ""):
+                missing.append(str(field_name))
+        return tuple(missing)
+
+    @property
     def artifact_hash(self) -> str:
         payload = {
             "artifact_name": self.artifact_name,
@@ -275,6 +376,7 @@ class CalibrationArtifactRef:
             "target_name": self.target_name,
             "target_version": self.target_version,
             "calibration_scope": self.calibration_scope,
+            "artifact_provenance": self.artifact_provenance,
             "bins": list(self.bins),
             "mapped": list(self.mapped),
         }
@@ -289,6 +391,7 @@ class CalibrationArtifactRef:
             "artifact_source": self.artifact_source,
             "artifact_hash": self.artifact_hash,
             "calibration_scope": self.calibration_scope,
+            "artifact_provenance": self.artifact_provenance,
             "bins": list(self.bins),
             "mapped": list(self.mapped),
         }
@@ -471,10 +574,18 @@ def build_calibration_artifact_ref(
         version = hashlib.sha256(json.dumps(version_payload, sort_keys=True).encode()).hexdigest()[:12]
 
     scope_cfg = cal_cfg.get("scope") if isinstance(cal_cfg.get("scope"), Mapping) else {}
+    provenance_cfg = cal_cfg.get("provenance") if isinstance(cal_cfg.get("provenance"), Mapping) else {}
     scope_horizon_minutes = scope_cfg.get("horizon_minutes")
     if scope_horizon_minutes not in (None, ""):
         try:
             scope_horizon_minutes = int(scope_horizon_minutes)
+        except (TypeError, ValueError):
+            return None
+
+    fit_sample_count = provenance_cfg.get("fit_sample_count", cal_cfg.get("fit_sample_count"))
+    if fit_sample_count not in (None, ""):
+        try:
+            fit_sample_count = int(fit_sample_count)
         except (TypeError, ValueError):
             return None
 
@@ -492,6 +603,13 @@ def build_calibration_artifact_ref(
         scope_regime=str(scope_cfg.get("regime") or "ANY").upper(),
         scope_replay_mode=str(scope_cfg.get("replay_mode") or "ANY").upper(),
         scope_contract_version=str(scope_cfg.get("scope_contract_version") or "calibration_scope/v1"),
+        provenance_contract_version=str(provenance_cfg.get("provenance_contract_version") or cal_cfg.get("provenance_contract_version") or "calibration_provenance/v1"),
+        trained_from_utc=_normalize_optional_utc_iso(provenance_cfg.get("trained_from_utc", cal_cfg.get("trained_from_utc"))),
+        trained_to_utc=_normalize_optional_utc_iso(provenance_cfg.get("trained_to_utc", cal_cfg.get("trained_to_utc"))),
+        valid_from_utc=_normalize_optional_utc_iso(provenance_cfg.get("valid_from_utc", cal_cfg.get("valid_from_utc"))),
+        valid_to_utc=_normalize_optional_utc_iso(provenance_cfg.get("valid_to_utc", cal_cfg.get("valid_to_utc"))),
+        evidence_ref=str(provenance_cfg.get("evidence_ref", cal_cfg.get("evidence_ref")) or "").strip() or None,
+        fit_sample_count=fit_sample_count,
     )
 
 

@@ -43,6 +43,17 @@ def _governed_model_section() -> dict:
             "selection_policy": {
                 "require_scope_match": True,
                 "allow_legacy_fallback": False,
+                "allow_generic_scope_fallback": True,
+                "require_provenance": True,
+                "required_provenance_fields": [
+                    "trained_from_utc",
+                    "trained_to_utc",
+                    "valid_from_utc",
+                    "valid_to_utc",
+                    "evidence_ref",
+                    "fit_sample_count",
+                ],
+                "institutional_grade": False,
             },
             "compatibility_rules": {
                 "require_target_match": True,
@@ -51,6 +62,15 @@ def _governed_model_section() -> dict:
                 "require_regime_match": True,
                 "require_replay_mode_match": True,
                 "require_artifact_hash": True,
+                "require_provenance_fields": True,
+                "required_provenance_fields": [
+                    "trained_from_utc",
+                    "trained_to_utc",
+                    "valid_from_utc",
+                    "valid_to_utc",
+                    "evidence_ref",
+                    "fit_sample_count",
+                ],
             },
             "artifacts": [
                 {
@@ -67,6 +87,14 @@ def _governed_model_section() -> dict:
                     },
                     "bins": [0.0, 0.5, 1.0],
                     "mapped": [0.05, 0.5, 0.95],
+                    "provenance": {
+                        "trained_from_utc": "2025-01-02T14:30:00+00:00",
+                        "trained_to_utc": "2025-12-31T21:00:00+00:00",
+                        "valid_from_utc": "2026-01-02T14:30:00+00:00",
+                        "valid_to_utc": "2026-12-31T21:00:00+00:00",
+                        "evidence_ref": "replay://tests/calibration/fixed15",
+                        "fit_sample_count": 25000,
+                    },
                 },
                 {
                     "artifact_name": "bounded_additive_score_calibration",
@@ -82,6 +110,14 @@ def _governed_model_section() -> dict:
                     },
                     "bins": [0.0, 0.5, 1.0],
                     "mapped": [0.05, 0.5, 0.95],
+                    "provenance": {
+                        "trained_from_utc": "2025-01-02T14:30:00+00:00",
+                        "trained_to_utc": "2025-12-31T21:00:00+00:00",
+                        "valid_from_utc": "2026-01-02T14:30:00+00:00",
+                        "valid_to_utc": "2026-12-31T21:00:00+00:00",
+                        "evidence_ref": "replay://tests/calibration/fixed60",
+                        "fit_sample_count": 20000,
+                    },
                 },
                 {
                     "artifact_name": "bounded_additive_score_calibration",
@@ -96,6 +132,14 @@ def _governed_model_section() -> dict:
                     },
                     "bins": [0.0, 0.5, 1.0],
                     "mapped": [0.05, 0.5, 0.95],
+                    "provenance": {
+                        "trained_from_utc": "2025-01-02T14:30:00+00:00",
+                        "trained_to_utc": "2025-12-31T21:00:00+00:00",
+                        "valid_from_utc": "2026-01-02T14:30:00+00:00",
+                        "valid_to_utc": "2026-12-31T21:00:00+00:00",
+                        "evidence_ref": "replay://tests/calibration/toclose",
+                        "fit_sample_count": 18000,
+                    },
                 },
             ],
         },
@@ -146,6 +190,19 @@ def valid_cfg():
                     "60": [],
                     "to_close": [],
                 },
+            },
+            "governance_mode": "FORWARD_OBSERVATION",
+            "output_domain_policy": {
+                "contract_version": "output_domain_policy/v1",
+                "required_contract_version": "output_domain/v1",
+                "require_bounded_output_contract": True,
+                "require_expected_bounds": True,
+                "require_emitted_units": True,
+                "require_raw_input_units": True,
+                "require_output_domain": True,
+                "require_bounded_output_flag": True,
+                "degrade_on_missing_contract": True,
+                "enforce_on_decision_eligible_only": True,
             },
             "label_contract": {
                 "label_version": "2026.02.0",
@@ -364,6 +421,67 @@ def test_missing_calibration_compatibility_rule_rejected(valid_cfg):
 
 
 
+
+
+
+def test_missing_governance_mode_defaults_for_backward_compatibility(valid_cfg):
+    del valid_cfg["validation"]["governance_mode"]
+    _validate_config(valid_cfg)
+    summary = summarize_effective_runtime_config(valid_cfg)
+    assert summary["governance_mode"] == "FORWARD_OBSERVATION"
+
+
+
+def test_invalid_governance_mode_rejected(valid_cfg):
+    valid_cfg["validation"]["governance_mode"] = "PAPER"
+    with pytest.raises(ValueError, match="validation.governance_mode must be one of"):
+        _validate_config(valid_cfg)
+
+
+
+def test_missing_output_domain_policy_field_rejected(valid_cfg):
+    del valid_cfg["validation"]["output_domain_policy"]["require_expected_bounds"]
+    with pytest.raises(KeyError, match="Missing validation.output_domain_policy.require_expected_bounds"):
+        _validate_config(valid_cfg)
+
+
+
+def test_output_domain_contract_version_must_match_runtime(valid_cfg):
+    valid_cfg["validation"]["output_domain_policy"]["required_contract_version"] = "output_domain/v2"
+    with pytest.raises(ValueError, match="required_contract_version must match runtime feature contract"):
+        _validate_config(valid_cfg)
+
+
+
+def test_missing_calibration_generic_scope_policy_rejected(valid_cfg):
+    del valid_cfg["model"]["calibration_registry"]["selection_policy"]["allow_generic_scope_fallback"]
+    with pytest.raises(KeyError, match="Missing model.calibration_registry.selection_policy.allow_generic_scope_fallback"):
+        _validate_config(valid_cfg)
+
+
+
+def test_mismatched_required_provenance_fields_rejected(valid_cfg):
+    valid_cfg["model"]["calibration_registry"]["compatibility_rules"]["required_provenance_fields"] = ["trained_from_utc"]
+    with pytest.raises(ValueError, match="selection_policy.required_provenance_fields must match"):
+        _validate_config(valid_cfg)
+
+
+
+def test_missing_artifact_provenance_field_rejected(valid_cfg):
+    del valid_cfg["model"]["calibration_registry"]["artifacts"][0]["provenance"]["evidence_ref"]
+    with pytest.raises(KeyError, match=r"Missing model.calibration_registry.artifacts\[0\]\.evidence_ref"):
+        _validate_config(valid_cfg)
+
+
+
+def test_institutional_grade_requires_no_generic_scope_fallback(valid_cfg):
+    valid_cfg["validation"]["governance_mode"] = "INSTITUTIONAL_GRADE"
+    valid_cfg["model"]["calibration_registry"]["selection_policy"]["institutional_grade"] = True
+    valid_cfg["model"]["calibration_registry"]["selection_policy"]["allow_generic_scope_fallback"] = True
+    with pytest.raises(ValueError, match="allow_generic_scope_fallback must be false in institutional-grade mode"):
+        _validate_config(valid_cfg)
+
+
 def test_effective_runtime_summary_exposes_governance_contract_fields(valid_cfg):
     _validate_config(valid_cfg)
     summary = summarize_effective_runtime_config(valid_cfg)
@@ -372,6 +490,7 @@ def test_effective_runtime_summary_exposes_governance_contract_fields(valid_cfg)
     assert summary["base_url"] == "https://api.unusualwhales.com"
     assert summary["model_name"] == "bounded_additive_score"
     assert summary["target_name"] == "intraday_direction_3class"
+    assert summary["governance_mode"] == "FORWARD_OBSERVATION"
     assert summary["decision_path_policy_version"] == "decision_path/v1"
     assert summary["zero_weight_is_non_decision"] is True
     assert summary["ood_assessment_policy_version"] == "ood_assessment/v1"
@@ -379,8 +498,23 @@ def test_effective_runtime_summary_exposes_governance_contract_fields(valid_cfg)
     assert summary["calibration_registry_version"] == "2026.03.0"
     assert summary["calibration_scope_required"] is True
     assert summary["calibration_allow_legacy_fallback"] is False
+    assert summary["calibration_allow_generic_scope_fallback"] is True
+    assert summary["calibration_require_provenance"] is True
+    assert summary["calibration_required_provenance_fields"] == [
+        "trained_from_utc",
+        "trained_to_utc",
+        "valid_from_utc",
+        "valid_to_utc",
+        "evidence_ref",
+        "fit_sample_count",
+    ]
+    assert summary["calibration_institutional_grade"] is False
     assert summary["calibration_compatibility_rules"]["require_artifact_hash"] is True
+    assert summary["calibration_compatibility_rules"]["require_provenance_fields"] is True
     assert summary["legacy_calibration_declared"] is False
+    assert summary["output_domain_policy_version"] == "output_domain_policy/v1"
+    assert summary["output_domain_required_contract_version"] == "output_domain/v1"
+    assert summary["output_domain_requirements"]["require_expected_bounds"] is True
     assert summary["threshold_policy_version"] == "2026.02.0"
     assert summary["label_version"] == "2026.02.0"
     assert summary["adapt_enabled"] is False

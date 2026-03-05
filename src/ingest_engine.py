@@ -23,6 +23,7 @@ from .config_loader import (
     resolve_ood_assessment_policy,
     resolve_ood_probability_policy,
     summarize_effective_runtime_config,
+    validate_governance_policy_config,
 )
 from .file_lock import FileLock, FileLockError
 from .logging_config import log_prediction_decision, structured_log
@@ -115,6 +116,25 @@ def _require_float(mapping: Dict[str, Any], key: str, path: str, *, minimum: Opt
     if maximum is not None and value_f > maximum:
         raise ValueError(f"{path} must be <= {maximum}")
     return value_f
+
+
+def _normalize_prediction_replay_mode(value: Any) -> ReplayMode:
+    """
+    Resolve the runtime replay/data-observation mode that should govern calibration
+    selection and probability emission.
+
+    Forward/non-replay prediction paths default to LIVE_LIKE_OBSERVED semantics so
+    artifact selection does not silently collapse into UNKNOWN.
+    """
+    if value in (None, "", ReplayMode.UNKNOWN, ReplayMode.UNKNOWN.value):
+        return ReplayMode.LIVE_LIKE_OBSERVED
+    if isinstance(value, ReplayMode):
+        return value
+    try:
+        mode = ReplayMode(str(value).upper())
+    except Exception as exc:
+        raise ValueError(f"Unsupported replay_mode for prediction generation: {value}") from exc
+    return ReplayMode.LIVE_LIKE_OBSERVED if mode == ReplayMode.UNKNOWN else mode
 
 
 def _effective_weights_for_horizon(cfg: Dict[str, Any], horizon: str) -> Dict[str, float]:
@@ -382,6 +402,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
                     raise KeyError(f"Missing model.target_spec.{key}")
 
     _validate_governance_contract(cfg, horizons)
+    validate_governance_policy_config(cfg)
     validate_adapt_config(cfg)
 
     unknown_keys = set()
@@ -911,6 +932,7 @@ def _log_ood_assessment(horizon: str, assessment: OODAssessment) -> None:
         missing_feature_keys=list(assessment.missing_feature_keys),
         session_mismatch_features=list(assessment.session_mismatch_features),
         normalization_failure_features=list(assessment.normalization_failure_features),
+        output_domain_missing_features=list(assessment.output_domain_missing_features),
     )
 
     if assessment.boundary_violation_features:
@@ -923,6 +945,19 @@ def _log_ood_assessment(horizon: str, assessment: OODAssessment) -> None:
             horizon=horizon,
             ood_state=assessment.state.value,
             boundary_violation_features=assessment.boundary_violation_features,
+        )
+
+    if assessment.output_domain_missing_features:
+        structured_log(
+            logger,
+            logging.INFO,
+            event="ood_output_domain_contract_missing",
+            msg="ood_output_domain_contract_missing",
+            counter="ood_output_domain_missing_count",
+            horizon=horizon,
+            ood_state=assessment.state.value,
+            output_domain_missing_features=list(assessment.output_domain_missing_features),
+            output_domain_contract_issues=assessment.output_domain_contract_issues,
         )
 
 
@@ -973,7 +1008,8 @@ def generate_predictions(
     asof_utc: dt.datetime,
     session_enum: SessionState,
     sec_to_close: Optional[float],
-    endpoint_coverage: float
+    endpoint_coverage: float,
+    replay_mode: Any = ReplayMode.LIVE_LIKE_OBSERVED,
 ) -> List[Dict[str, Any]]:
     """
     Centralized Decision Window and Gating pipeline.
@@ -982,6 +1018,7 @@ def generate_predictions(
     feature_value_map = {f["feature_key"]: f["feature_value"] for f in valid_features}
     feature_use_contracts_by_key = _build_feature_use_contract_index(valid_features)
     cadence_sec = int(cfg["ingestion"]["cadence_minutes"]) * 60
+    effective_replay_mode = _normalize_prediction_replay_mode(replay_mode)
 
     ts_list: List[dt.datetime] = []
     alignment_violations: List[str] = []
@@ -1337,6 +1374,8 @@ def generate_predictions(
             "calibration_selection_reason": calibration_selection.reason_code,
             "calibration_version": calibration_selection.artifact.artifact_version if calibration_selection.artifact is not None else None,
             "calibration_scope": calibration_selection.artifact.calibration_scope if calibration_selection.artifact is not None else None,
+            "calibration_request_replay_mode": calibration_selection.request.replay_mode,
+            "prediction_replay_mode": pred.replay_mode.value,
         }
         pred_meta["horizon_contract"] = horizon_contract
         pred_meta["decision_dq"] = decision_dq
@@ -1377,7 +1416,7 @@ def generate_predictions(
             horizon_minutes=int(h),
             session_state=session_enum,
             regime=calibration_regime,
-            replay_mode=ReplayMode.UNKNOWN,
+            replay_mode=effective_replay_mode,
         )
         _log_calibration_selection(h_str, calibration_selection)
         ood_assessment = assess_operational_ood(
@@ -1408,7 +1447,7 @@ def generate_predictions(
             ood_state=ood_assessment.state,
             ood_reason=ood_assessment.primary_reason,
             ood_policy=model_cfg.get("ood_probability_policy") or model_cfg.get("ood_runtime_policy") or {},
-            replay_mode=ReplayMode.UNKNOWN,
+            replay_mode=effective_replay_mode,
         )
 
         window_id_fixed = hashlib.sha256(f"{snapshot_id}_FIXED_{h}".encode()).hexdigest()[:16]
@@ -1428,7 +1467,8 @@ def generate_predictions(
             "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
             "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
             "critical_missing_count": len(pred.gate.critical_features_missing), "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-            "decision_window_id": window_id_fixed
+            "decision_window_id": window_id_fixed,
+            "replay_mode": pred.replay_mode.value,
         })
 
     emit_to_close = cfg["validation"]["emit_to_close_horizon"]
@@ -1455,7 +1495,7 @@ def generate_predictions(
             horizon_minutes=0,
             session_state=session_enum,
             regime=calibration_regime,
-            replay_mode=ReplayMode.UNKNOWN,
+            replay_mode=effective_replay_mode,
         )
         _log_calibration_selection("to_close", calibration_selection)
         ood_assessment = assess_operational_ood(
@@ -1486,7 +1526,7 @@ def generate_predictions(
             ood_state=ood_assessment.state,
             ood_reason=ood_assessment.primary_reason,
             ood_policy=model_cfg.get("ood_probability_policy") or model_cfg.get("ood_runtime_policy") or {},
-            replay_mode=ReplayMode.UNKNOWN,
+            replay_mode=effective_replay_mode,
         )
 
         window_id_close = hashlib.sha256(f"{snapshot_id}_TOCLOSE_{sec_to_close}".encode()).hexdigest()[:16]
@@ -1506,7 +1546,8 @@ def generate_predictions(
             "degraded_reasons": list(pred.gate.degraded_reasons), "validation_eligible": pred.gate.validation_eligible,
             "gate_json": asdict(pred.gate), "source_ts_min_utc": source_ts_min, "source_ts_max_utc": source_ts_max,
             "critical_missing_count": len(pred.gate.critical_features_missing), "alignment_status": "ALIGNED" if is_aligned else "MISALIGNED",
-            "decision_window_id": window_id_close
+            "decision_window_id": window_id_close,
+            "replay_mode": pred.replay_mode.value,
         })
 
     return predictions
@@ -1930,7 +1971,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         asof_utc=asof_utc,
                         session_enum=session_enum,
                         sec_to_close=sec_to_close,
-                        endpoint_coverage=endpoint_coverage
+                        endpoint_coverage=endpoint_coverage,
+                        replay_mode=ReplayMode.LIVE_LIKE_OBSERVED,
                     )
                     
                     # Task 7: Persist the features *after* prediction gating mutations.

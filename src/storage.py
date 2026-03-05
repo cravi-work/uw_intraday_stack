@@ -126,6 +126,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     ood_reason TEXT,
     calibration_scope JSON,
     calibration_artifact_hash TEXT,
+    calibration_evidence_ref TEXT,
+    output_domain_contract_version TEXT,
+    replay_governance_reason TEXT,
+    ood_contract_version TEXT,
     decision_path_contract_version TEXT,
     suppression_reason TEXT,
     probability_contract_json JSON,
@@ -242,6 +246,10 @@ CREATE TABLE IF NOT EXISTS decision_traces (
     calibration_version TEXT,
     calibration_scope JSON,
     calibration_artifact_hash TEXT,
+    calibration_evidence_ref TEXT,
+    output_domain_contract_version TEXT,
+    replay_governance_reason TEXT,
+    ood_contract_version TEXT,
     decision_path_contract_version TEXT,
     threshold_policy_version TEXT,
     blocked_reasons_json JSON,
@@ -492,7 +500,106 @@ def _infer_decision_path_contract_version(meta_json: Dict[str, Any], prediction_
     return None
 
 
-def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[str, Any]:
+def _collect_contract_versions(*values: Any) -> Optional[str]:
+    versions = sorted({str(v).strip() for v in values if v not in (None, "") and str(v).strip()})
+    if not versions:
+        return None
+    if len(versions) == 1:
+        return versions[0]
+    return f"MIXED:{','.join(versions)}"
+
+
+def _infer_output_domain_contract_version_from_meta(meta_json: Dict[str, Any], prediction_contract: Dict[str, Any], probability_contract: Dict[str, Any]) -> Optional[str]:
+    values = [
+        meta_json.get("output_domain_contract_version"),
+        prediction_contract.get("output_domain_contract_version"),
+        probability_contract.get("output_domain_contract_version"),
+    ]
+
+    horizon_contract = _as_mapping(meta_json.get("horizon_contract"))
+    values.append(horizon_contract.get("output_domain_contract_version"))
+
+    feature_contracts = horizon_contract.get("feature_contracts")
+    if isinstance(feature_contracts, Mapping):
+        for contract in feature_contracts.values():
+            if isinstance(contract, Mapping):
+                values.append(contract.get("output_domain_contract_version"))
+
+    ood_assessment = _as_mapping(meta_json.get("ood_assessment"))
+    values.append(ood_assessment.get("output_domain_contract_version"))
+
+    output_domain_contract_issues = ood_assessment.get("output_domain_contract_issues")
+    if isinstance(output_domain_contract_issues, Mapping):
+        for issue in output_domain_contract_issues.values():
+            if isinstance(issue, Mapping):
+                values.append(issue.get("output_domain_contract_version"))
+
+    boundary_violation_features = ood_assessment.get("boundary_violation_features")
+    if isinstance(boundary_violation_features, Mapping):
+        for issue in boundary_violation_features.values():
+            if isinstance(issue, Mapping):
+                values.append(issue.get("output_domain_contract_version"))
+
+    metric_lineage = _as_mapping(meta_json.get("metric_lineage"))
+    values.append(metric_lineage.get("output_domain_contract_version"))
+
+    return _collect_contract_versions(*values)
+
+
+def _infer_output_domain_contract_version_from_snapshot(
+    con: Optional[duckdb.DuckDBPyConnection],
+    snapshot_id: Any,
+    *,
+    cache: Optional[Dict[str, Optional[str]]] = None,
+) -> Optional[str]:
+    if con is None or snapshot_id in (None, ""):
+        return None
+
+    snapshot_key = str(snapshot_id)
+    if cache is not None and snapshot_key in cache:
+        return cache[snapshot_key]
+
+    try:
+        rows = con.execute(
+            "SELECT meta_json FROM features WHERE snapshot_id = ?",
+            [snapshot_key],
+        ).fetchall()
+    except Exception:
+        if cache is not None:
+            cache[snapshot_key] = None
+        return None
+
+    versions = []
+    for (meta_json_raw,) in rows:
+        feature_meta = _safe_json_loads(meta_json_raw)
+        metric_lineage = _as_mapping(feature_meta.get("metric_lineage"))
+        bounded_output = bool(metric_lineage.get("bounded_output", feature_meta.get("bounded_output", False)))
+        decision_eligible = feature_meta.get("decision_eligible")
+        if decision_eligible is None:
+            decision_eligible = metric_lineage.get("decision_eligible")
+        if decision_eligible is None:
+            use_role = feature_meta.get("use_role") or metric_lineage.get("decision_path_role")
+            decision_eligible = bool(str(use_role or "").strip() == "signal-critical")
+
+        if not bounded_output or not bool(decision_eligible):
+            continue
+
+        version = metric_lineage.get("output_domain_contract_version") or feature_meta.get("output_domain_contract_version")
+        if version not in (None, "") and str(version).strip():
+            versions.append(str(version).strip())
+
+    resolved = _collect_contract_versions(*versions)
+    if cache is not None:
+        cache[snapshot_key] = resolved
+    return resolved
+
+
+def _extract_prediction_contract_fields(
+    prediction: Mapping[str, Any],
+    *,
+    con: Optional[duckdb.DuckDBPyConnection] = None,
+    feature_contract_cache: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
     meta_json = _safe_json_loads(prediction.get("meta_json"))
     probability_contract = _as_mapping(meta_json.get("probability_contract"))
     prediction_contract = _as_mapping(meta_json.get("prediction_contract"))
@@ -505,6 +612,10 @@ def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[s
     calibration_ref = _as_mapping(probability_contract.get("calibration_artifact_ref"))
     calibration_selection = _as_mapping(meta_json.get("calibration_selection"))
     ood_assessment = _as_mapping(meta_json.get("ood_assessment"))
+    replay_governance = _as_mapping(meta_json.get("replay_governance"))
+    calibration_selection_artifact = _as_mapping(calibration_selection.get("artifact"))
+    calibration_provenance = _as_mapping(calibration_ref.get("artifact_provenance"))
+    selection_provenance = _as_mapping(calibration_selection_artifact.get("artifact_provenance"))
 
     target_name = prediction.get("target_name") or prediction_contract.get("target_name") or target_spec.get("target_name")
     target_version = prediction.get("target_version") or prediction_contract.get("target_version") or target_spec.get("target_version")
@@ -535,6 +646,35 @@ def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[s
         or calibration_selection.get("artifact_hash")
         or calibration_ref.get("artifact_hash")
     )
+    calibration_evidence_ref = (
+        prediction.get("calibration_evidence_ref")
+        or meta_json.get("calibration_evidence_ref")
+        or selection_provenance.get("evidence_ref")
+        or calibration_provenance.get("evidence_ref")
+        or calibration_selection_artifact.get("evidence_ref")
+        or calibration_ref.get("evidence_ref")
+    )
+    output_domain_contract_version = (
+        prediction.get("output_domain_contract_version")
+        or _infer_output_domain_contract_version_from_meta(meta_json, prediction_contract, probability_contract)
+        or _infer_output_domain_contract_version_from_snapshot(
+            con,
+            prediction.get("snapshot_id"),
+            cache=feature_contract_cache,
+        )
+    )
+    replay_governance_reason = (
+        prediction.get("replay_governance_reason")
+        or meta_json.get("replay_governance_reason")
+        or replay_governance.get("reason")
+        or replay_governance.get("calibration_selection_reason")
+        or calibration_selection.get("reason_code")
+    )
+    ood_contract_version = (
+        prediction.get("ood_contract_version")
+        or meta_json.get("ood_contract_version")
+        or ood_assessment.get("contract_version")
+    )
     decision_path_contract_version = (
         prediction.get("decision_path_contract_version")
         or _infer_decision_path_contract_version(meta_json, prediction_contract)
@@ -557,14 +697,23 @@ def _extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[s
         "ood_reason": str(ood_reason) if ood_reason not in (None, "") else None,
         "calibration_scope": calibration_scope if calibration_scope else None,
         "calibration_artifact_hash": str(calibration_artifact_hash) if calibration_artifact_hash not in (None, "") else None,
+        "calibration_evidence_ref": str(calibration_evidence_ref) if calibration_evidence_ref not in (None, "") else None,
+        "output_domain_contract_version": str(output_domain_contract_version) if output_domain_contract_version not in (None, "") else None,
+        "replay_governance_reason": str(replay_governance_reason) if replay_governance_reason not in (None, "") else None,
+        "ood_contract_version": str(ood_contract_version) if ood_contract_version not in (None, "") else None,
         "decision_path_contract_version": str(decision_path_contract_version) if decision_path_contract_version not in (None, "") else None,
         "suppression_reason": str(suppression_reason) if suppression_reason not in (None, "") else None,
         "probability_contract_json": probability_contract if probability_contract else None,
     }
 
 
-def extract_prediction_contract_fields(prediction: Mapping[str, Any]) -> Dict[str, Any]:
-    return _extract_prediction_contract_fields(prediction)
+def extract_prediction_contract_fields(
+    prediction: Mapping[str, Any],
+    *,
+    con: Optional[duckdb.DuckDBPyConnection] = None,
+    feature_contract_cache: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
+    return _extract_prediction_contract_fields(prediction, con=con, feature_contract_cache=feature_contract_cache)
 
 
 
@@ -612,6 +761,10 @@ class DbWriter:
         _add("predictions", "ood_reason", "TEXT")
         _add("predictions", "calibration_scope", "JSON")
         _add("predictions", "calibration_artifact_hash", "TEXT")
+        _add("predictions", "calibration_evidence_ref", "TEXT")
+        _add("predictions", "output_domain_contract_version", "TEXT")
+        _add("predictions", "replay_governance_reason", "TEXT")
+        _add("predictions", "ood_contract_version", "TEXT")
         _add("predictions", "decision_path_contract_version", "TEXT")
         _add("predictions", "suppression_reason", "TEXT")
         _add("predictions", "probability_contract_json", "JSON")
@@ -672,6 +825,10 @@ class DbWriter:
                 calibration_version TEXT,
                 calibration_scope JSON,
                 calibration_artifact_hash TEXT,
+                calibration_evidence_ref TEXT,
+                output_domain_contract_version TEXT,
+                replay_governance_reason TEXT,
+                ood_contract_version TEXT,
                 decision_path_contract_version TEXT,
                 threshold_policy_version TEXT,
                 blocked_reasons_json JSON,
@@ -684,6 +841,10 @@ class DbWriter:
         _add("decision_traces", "ood_reason", "TEXT")
         _add("decision_traces", "calibration_scope", "JSON")
         _add("decision_traces", "calibration_artifact_hash", "TEXT")
+        _add("decision_traces", "calibration_evidence_ref", "TEXT")
+        _add("decision_traces", "output_domain_contract_version", "TEXT")
+        _add("decision_traces", "replay_governance_reason", "TEXT")
+        _add("decision_traces", "ood_contract_version", "TEXT")
         _add("decision_traces", "decision_path_contract_version", "TEXT")
 
         pred_cols = {r[1]: r[2] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
@@ -710,7 +871,8 @@ class DbWriter:
                    prediction_business_key, meta_json, target_name, target_version, label_version,
                    feature_version, calibration_version, threshold_policy_version, replay_mode,
                    ood_state, ood_reason, calibration_scope, calibration_artifact_hash,
-                   decision_path_contract_version, suppression_reason, probability_contract_json
+                   calibration_evidence_ref, output_domain_contract_version, replay_governance_reason,
+                   ood_contract_version, decision_path_contract_version, suppression_reason, probability_contract_json
             FROM predictions
             """
         ).fetchall()
@@ -736,6 +898,10 @@ class DbWriter:
                 ood_reason,
                 calibration_scope,
                 calibration_artifact_hash,
+                calibration_evidence_ref,
+                output_domain_contract_version,
+                replay_governance_reason,
+                ood_contract_version,
                 decision_path_contract_version,
                 suppression_reason,
                 probability_contract_json,
@@ -747,7 +913,10 @@ class DbWriter:
                 horizon_seconds=horizon_seconds,
             )
             stable_key = business_key or _prediction_business_key(str(snapshot_id), kind, minutes, seconds)
-            extracted = _extract_prediction_contract_fields({"meta_json": meta_json_raw})
+            extracted = _extract_prediction_contract_fields(
+                {"meta_json": meta_json_raw, "snapshot_id": snapshot_id},
+                con=con,
+            )
 
             changed = (
                 business_key != stable_key
@@ -762,6 +931,10 @@ class DbWriter:
                 or (ood_reason in (None, "") and extracted["ood_reason"] is not None)
                 or (_normalize_jsonish_mapping(calibration_scope) is None and extracted["calibration_scope"] is not None)
                 or (calibration_artifact_hash in (None, "") and extracted["calibration_artifact_hash"] is not None)
+                or (calibration_evidence_ref in (None, "") and extracted["calibration_evidence_ref"] is not None)
+                or (output_domain_contract_version in (None, "") and extracted["output_domain_contract_version"] is not None)
+                or (replay_governance_reason in (None, "") and extracted["replay_governance_reason"] is not None)
+                or (ood_contract_version in (None, "") and extracted["ood_contract_version"] is not None)
                 or (decision_path_contract_version in (None, "") and extracted["decision_path_contract_version"] is not None)
                 or (suppression_reason in (None, "") and extracted["suppression_reason"] is not None)
                 or (probability_contract_json is None and extracted["probability_contract_json"] is not None)
@@ -784,6 +957,10 @@ class DbWriter:
                     ood_reason = COALESCE(ood_reason, ?),
                     calibration_scope = COALESCE(calibration_scope, ?),
                     calibration_artifact_hash = COALESCE(calibration_artifact_hash, ?),
+                    calibration_evidence_ref = COALESCE(calibration_evidence_ref, ?),
+                    output_domain_contract_version = COALESCE(output_domain_contract_version, ?),
+                    replay_governance_reason = COALESCE(replay_governance_reason, ?),
+                    ood_contract_version = COALESCE(ood_contract_version, ?),
                     decision_path_contract_version = COALESCE(decision_path_contract_version, ?),
                     suppression_reason = COALESCE(suppression_reason, ?),
                     probability_contract_json = COALESCE(probability_contract_json, ?)
@@ -802,6 +979,10 @@ class DbWriter:
                     extracted["ood_reason"],
                     _safe_json_dumps(extracted["calibration_scope"]),
                     extracted["calibration_artifact_hash"],
+                    extracted["calibration_evidence_ref"],
+                    extracted["output_domain_contract_version"],
+                    extracted["replay_governance_reason"],
+                    extracted["ood_contract_version"],
                     extracted["decision_path_contract_version"],
                     extracted["suppression_reason"],
                     _safe_json_dumps(extracted["probability_contract_json"]),
@@ -819,12 +1000,18 @@ class DbWriter:
                 "ood_reason": row[1],
                 "calibration_scope": _normalize_jsonish_mapping(row[2]),
                 "calibration_artifact_hash": row[3],
-                "decision_path_contract_version": row[4],
+                "calibration_evidence_ref": row[4],
+                "output_domain_contract_version": row[5],
+                "replay_governance_reason": row[6],
+                "ood_contract_version": row[7],
+                "decision_path_contract_version": row[8],
             }
             for row in con.execute(
                 """
                 SELECT prediction_business_key, ood_reason, calibration_scope,
-                       calibration_artifact_hash, decision_path_contract_version
+                       calibration_artifact_hash, calibration_evidence_ref,
+                       output_domain_contract_version, replay_governance_reason,
+                       ood_contract_version, decision_path_contract_version
                 FROM predictions
                 WHERE prediction_business_key IS NOT NULL
                 """
@@ -834,13 +1021,14 @@ class DbWriter:
         rows = con.execute(
             """
             SELECT trace_id, prediction_business_key, trace_json, ood_reason, calibration_scope,
-                   calibration_artifact_hash, decision_path_contract_version
+                   calibration_artifact_hash, calibration_evidence_ref, output_domain_contract_version,
+                   replay_governance_reason, ood_contract_version, decision_path_contract_version
             FROM decision_traces
             """
         ).fetchall()
 
         updated = 0
-        for trace_id, business_key, trace_json_raw, current_ood_reason, current_scope_raw, current_artifact_hash, current_dp_version in rows:
+        for trace_id, business_key, trace_json_raw, current_ood_reason, current_scope_raw, current_artifact_hash, current_evidence_ref, current_output_domain_version, current_replay_reason, current_ood_contract_version, current_dp_version in rows:
             trace_json = _safe_json_loads(trace_json_raw)
             prediction_values = pred_lookup.get(str(business_key), {})
 
@@ -851,12 +1039,20 @@ class DbWriter:
                 or prediction_values.get("calibration_scope")
             )
             extracted_artifact_hash = current_artifact_hash or trace_json.get("calibration_artifact_hash") or prediction_values.get("calibration_artifact_hash")
+            extracted_evidence_ref = current_evidence_ref or trace_json.get("calibration_evidence_ref") or prediction_values.get("calibration_evidence_ref")
+            extracted_output_domain_version = current_output_domain_version or trace_json.get("output_domain_contract_version") or prediction_values.get("output_domain_contract_version")
+            extracted_replay_reason = current_replay_reason or trace_json.get("replay_governance_reason") or prediction_values.get("replay_governance_reason")
+            extracted_ood_contract_version = current_ood_contract_version or trace_json.get("ood_contract_version") or prediction_values.get("ood_contract_version")
             extracted_dp_version = current_dp_version or trace_json.get("decision_path_contract_version") or prediction_values.get("decision_path_contract_version")
 
             changed = (
                 (current_ood_reason in (None, "") and extracted_ood_reason is not None)
                 or (_normalize_jsonish_mapping(current_scope_raw) is None and extracted_scope is not None)
                 or (current_artifact_hash in (None, "") and extracted_artifact_hash is not None)
+                or (current_evidence_ref in (None, "") and extracted_evidence_ref is not None)
+                or (current_output_domain_version in (None, "") and extracted_output_domain_version is not None)
+                or (current_replay_reason in (None, "") and extracted_replay_reason is not None)
+                or (current_ood_contract_version in (None, "") and extracted_ood_contract_version is not None)
                 or (current_dp_version in (None, "") and extracted_dp_version is not None)
             )
             if not changed:
@@ -868,6 +1064,10 @@ class DbWriter:
                 SET ood_reason = COALESCE(ood_reason, ?),
                     calibration_scope = COALESCE(calibration_scope, ?),
                     calibration_artifact_hash = COALESCE(calibration_artifact_hash, ?),
+                    calibration_evidence_ref = COALESCE(calibration_evidence_ref, ?),
+                    output_domain_contract_version = COALESCE(output_domain_contract_version, ?),
+                    replay_governance_reason = COALESCE(replay_governance_reason, ?),
+                    ood_contract_version = COALESCE(ood_contract_version, ?),
                     decision_path_contract_version = COALESCE(decision_path_contract_version, ?)
                 WHERE trace_id = ?
                 """,
@@ -875,6 +1075,10 @@ class DbWriter:
                     extracted_ood_reason,
                     _safe_json_dumps(extracted_scope),
                     extracted_artifact_hash,
+                    extracted_evidence_ref,
+                    extracted_output_domain_version,
+                    extracted_replay_reason,
+                    extracted_ood_contract_version,
                     extracted_dp_version,
                     trace_id,
                 ],
@@ -1110,7 +1314,10 @@ class DbWriter:
         )
 
         meta_json = _safe_json_loads(p.get("meta_json"))
-        extracted = _extract_prediction_contract_fields({**dict(p), "meta_json": meta_json})
+        extracted = _extract_prediction_contract_fields(
+            {**dict(p), "meta_json": meta_json},
+            con=con,
+        )
         business_key = str(
             p.get("prediction_business_key")
             or _prediction_business_key(snapshot_id, horizon_kind, horizon_minutes, horizon_seconds)
@@ -1143,6 +1350,10 @@ class DbWriter:
             "ood_reason": extracted["ood_reason"],
             "calibration_scope": _safe_json_dumps(extracted["calibration_scope"]),
             "calibration_artifact_hash": extracted["calibration_artifact_hash"],
+            "calibration_evidence_ref": extracted["calibration_evidence_ref"],
+            "output_domain_contract_version": extracted["output_domain_contract_version"],
+            "replay_governance_reason": extracted["replay_governance_reason"],
+            "ood_contract_version": extracted["ood_contract_version"],
             "decision_path_contract_version": extracted["decision_path_contract_version"],
             "suppression_reason": extracted["suppression_reason"],
             "probability_contract_json": _safe_json_dumps(extracted["probability_contract_json"]),
@@ -1196,6 +1407,10 @@ class DbWriter:
             p.setdefault("ood_reason", extracted["ood_reason"])
             p.setdefault("calibration_scope", extracted["calibration_scope"])
             p.setdefault("calibration_artifact_hash", extracted["calibration_artifact_hash"])
+            p.setdefault("calibration_evidence_ref", extracted["calibration_evidence_ref"])
+            p.setdefault("output_domain_contract_version", extracted["output_domain_contract_version"])
+            p.setdefault("replay_governance_reason", extracted["replay_governance_reason"])
+            p.setdefault("ood_contract_version", extracted["ood_contract_version"])
             p.setdefault("decision_path_contract_version", extracted["decision_path_contract_version"])
             p.setdefault("suppression_reason", extracted["suppression_reason"])
 
@@ -1226,7 +1441,18 @@ class DbWriter:
             prediction.get("horizon_seconds"),
         ))
         trace_id = _decision_trace_id(business_key, normalized_event)
-        extracted = _extract_prediction_contract_fields(prediction)
+        extracted = _extract_prediction_contract_fields(prediction, con=con)
+        trace_payload = dict(trace)
+        trace_payload.update({
+            "ood_reason": extracted.get("ood_reason"),
+            "calibration_scope": extracted.get("calibration_scope"),
+            "calibration_artifact_hash": extracted.get("calibration_artifact_hash"),
+            "calibration_evidence_ref": extracted.get("calibration_evidence_ref"),
+            "output_domain_contract_version": extracted.get("output_domain_contract_version"),
+            "replay_governance_reason": extracted.get("replay_governance_reason"),
+            "ood_contract_version": extracted.get("ood_contract_version"),
+            "decision_path_contract_version": extracted.get("decision_path_contract_version"),
+        })
         row = {
             "trace_id": trace_id,
             "created_at_utc": datetime.now(UTC),
@@ -1249,11 +1475,15 @@ class DbWriter:
             "calibration_version": trace.get("calibration_version"),
             "calibration_scope": _safe_json_dumps(extracted.get("calibration_scope")),
             "calibration_artifact_hash": extracted.get("calibration_artifact_hash"),
+            "calibration_evidence_ref": extracted.get("calibration_evidence_ref"),
+            "output_domain_contract_version": extracted.get("output_domain_contract_version"),
+            "replay_governance_reason": extracted.get("replay_governance_reason"),
+            "ood_contract_version": extracted.get("ood_contract_version"),
             "decision_path_contract_version": extracted.get("decision_path_contract_version"),
             "threshold_policy_version": trace.get("threshold_policy_version"),
             "blocked_reasons_json": _safe_json_dumps(trace.get("blocked_reasons"), default=[]),
             "degraded_reasons_json": _safe_json_dumps(trace.get("degraded_reasons"), default=[]),
-            "trace_json": _safe_json_dumps(trace, default={}),
+            "trace_json": _safe_json_dumps(trace_payload, default={}),
         }
         columns = list(row.keys())
         placeholders = ", ".join(["?"] * len(columns))

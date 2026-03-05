@@ -400,6 +400,121 @@ def _stamp_replay_prediction(
     return stamped
 
 
+def _extract_prediction_replay_mode(prediction: Optional[Mapping[str, Any]]) -> Optional[str]:
+    if prediction is None:
+        return None
+    direct = prediction.get("replay_mode")
+    if direct not in (None, ""):
+        return str(direct)
+
+    meta_json = _safe_json_loads(prediction.get("meta_json"))
+    meta_mode = meta_json.get("replay_mode")
+    if meta_mode not in (None, ""):
+        return str(meta_mode)
+
+    prediction_contract = meta_json.get("prediction_contract")
+    if isinstance(prediction_contract, Mapping):
+        contract_mode = prediction_contract.get("prediction_replay_mode")
+        if contract_mode not in (None, ""):
+            return str(contract_mode)
+    return None
+
+
+def _extract_prediction_calibration_selection(prediction: Mapping[str, Any]) -> Dict[str, Any]:
+    meta_json = _safe_json_loads(prediction.get("meta_json"))
+    selection = meta_json.get("calibration_selection")
+    return dict(selection) if isinstance(selection, Mapping) else {}
+
+
+def _validate_replay_prediction_governance(
+    prediction: Mapping[str, Any],
+    *,
+    requested_mode: ReplayMode,
+) -> Dict[str, Any]:
+    meta_json = _safe_json_loads(prediction.get("meta_json"))
+    selection = _extract_prediction_calibration_selection(prediction)
+    request = dict(selection.get("request")) if isinstance(selection.get("request"), Mapping) else {}
+    artifact = dict(selection.get("artifact")) if isinstance(selection.get("artifact"), Mapping) else {}
+    artifact_scope = (
+        dict(artifact.get("calibration_scope"))
+        if isinstance(artifact.get("calibration_scope"), Mapping)
+        else {}
+    )
+    prediction_contract = (
+        dict(meta_json.get("prediction_contract"))
+        if isinstance(meta_json.get("prediction_contract"), Mapping)
+        else {}
+    )
+
+    prediction_mode = _extract_prediction_replay_mode(prediction)
+    request_mode = None if request.get("replay_mode") in (None, "") else str(request.get("replay_mode"))
+    contract_prediction_mode = (
+        None
+        if prediction_contract.get("prediction_replay_mode") in (None, "")
+        else str(prediction_contract.get("prediction_replay_mode"))
+    )
+    contract_request_mode = (
+        None
+        if prediction_contract.get("calibration_request_replay_mode") in (None, "")
+        else str(prediction_contract.get("calibration_request_replay_mode"))
+    )
+    artifact_scope_mode = (
+        None
+        if artifact_scope.get("replay_mode") in (None, "")
+        else str(artifact_scope.get("replay_mode"))
+    )
+    selection_reason = None if selection.get("reason_code") in (None, "") else str(selection.get("reason_code"))
+
+    if prediction_mode != requested_mode.value:
+        raise RuntimeError(
+            f"Replay governance mismatch: prediction emitted replay_mode={prediction_mode!r} but replay requested {requested_mode.value}"
+        )
+
+    for field_name, observed in (
+        ("calibration_request_replay_mode", request_mode),
+        ("prediction_contract.calibration_request_replay_mode", contract_request_mode),
+        ("prediction_contract.prediction_replay_mode", contract_prediction_mode),
+    ):
+        if observed is not None and observed != requested_mode.value:
+            raise RuntimeError(
+                f"Replay governance mismatch: {field_name}={observed!r} but replay requested {requested_mode.value}"
+            )
+
+    if selection_reason == "REPLAY_MODE_MISMATCH":
+        raise RuntimeError(
+            f"Replay calibration scope mismatch [REPLAY_MODE_MISMATCH]: requested replay mode {requested_mode.value} has no compatible calibration artifact"
+        )
+
+    if artifact_scope_mode not in (None, "ANY", requested_mode.value):
+        raise RuntimeError(
+            f"Replay calibration artifact scope mismatch: selected artifact replay_mode={artifact_scope_mode!r} but replay requested {requested_mode.value}"
+        )
+
+    return {
+        "requested_replay_mode": requested_mode.value,
+        "prediction_replay_mode": prediction_mode,
+        "calibration_request_replay_mode": request_mode or contract_request_mode,
+        "calibration_artifact_scope_replay_mode": artifact_scope_mode,
+        "calibration_selection_reason": selection_reason,
+        "selected_calibration_scope": artifact_scope or None,
+    }
+
+
+def _attach_replay_governance(
+    prediction: Mapping[str, Any],
+    *,
+    governance: Mapping[str, Any],
+    stored_prediction: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    stamped = dict(prediction)
+    meta_json = _safe_json_loads(stamped.get("meta_json"))
+    replay_governance = dict(governance)
+    replay_governance["stored_prediction_replay_mode"] = _extract_prediction_replay_mode(stored_prediction)
+    meta_json["replay_governance"] = replay_governance
+    stamped["meta_json"] = meta_json
+    return stamped
+
+
 def run_replay(
     db_path: str,
     ticker: str,
@@ -576,6 +691,7 @@ def run_replay(
                 session_enum=session_enum,
                 sec_to_close=sec_to_close,
                 endpoint_coverage=dq,
+                replay_mode=requested_mode,
             )
 
             stored_pred_map = {
@@ -584,6 +700,8 @@ def run_replay(
             }
             replay_pred_map: Dict[Tuple[Any, Any, Any], Dict[str, Any]] = {}
             for pred in snapshot_predictions:
+                pred_key = (pred.get("horizon_kind"), pred.get("horizon_minutes"), pred.get("horizon_seconds"))
+                governance = _validate_replay_prediction_governance(pred, requested_mode=requested_mode)
                 observed_contract = _contract_from_prediction(pred)
                 frozen_contract = _merge_frozen_contract(
                     frozen_contract,
@@ -595,6 +713,12 @@ def run_replay(
                     replay_run_id=replay_run_id,
                     replay_mode=requested_mode,
                     frozen_contract=frozen_contract,
+                )
+                stored_row = stored_pred_map.get(pred_key)
+                stamped = _attach_replay_governance(
+                    stamped,
+                    governance=governance,
+                    stored_prediction=stored_row,
                 )
                 replay_pred_map[(stamped["horizon_kind"], stamped["horizon_minutes"], stamped["horizon_seconds"])] = stamped
                 recomputed_predictions.append(stamped)

@@ -57,6 +57,25 @@ def _governed_scope(session: str = "RTH"):
     }
 
 
+def _bounded_feature_rows(*, contract_version: str = "output_domain/v1"):
+    return [
+        {
+            "feature_key": "oi_pressure",
+            "feature_value": 0.31,
+            "meta_json": {
+                "decision_eligible": True,
+                "use_role": "signal-critical",
+                "metric_lineage": {
+                    "metric_name": "oi_pressure",
+                    "bounded_output": True,
+                    "output_domain_contract_version": contract_version,
+                    "decision_path_role": "signal-critical",
+                },
+            },
+        }
+    ]
+
+
 def _governed_meta(*, session: str = "RTH", ood_reason: str = "time_provenance_degraded:spot"):
     scope = _governed_scope(session=session)
     return {
@@ -87,6 +106,15 @@ def _governed_meta(*, session: str = "RTH", ood_reason: str = "time_provenance_d
                 "target_version": "target_v2",
                 "artifact_hash": "artifact_hash_v9",
                 "calibration_scope": scope,
+                "artifact_provenance": {
+                    "trained_from_utc": "2026-01-01T00:00:00+00:00",
+                    "trained_to_utc": "2026-01-31T23:59:59+00:00",
+                    "valid_from_utc": "2026-02-01T00:00:00+00:00",
+                    "valid_to_utc": "2026-03-31T23:59:59+00:00",
+                    "evidence_ref": "evidence://calibration/report-v9",
+                    "fit_sample_count": 2048,
+                    "provenance_contract_version": "calibration_provenance/v1",
+                },
             },
             "ood_state": "DEGRADED",
             "ood_reason": ood_reason,
@@ -102,6 +130,7 @@ def _governed_meta(*, session: str = "RTH", ood_reason: str = "time_provenance_d
         "ood_assessment": {
             "primary_reason": ood_reason,
             "state": "DEGRADED",
+            "contract_version": "ood/v2",
         },
         "horizon_contract": {
             "feature_contracts": {
@@ -110,6 +139,13 @@ def _governed_meta(*, session: str = "RTH", ood_reason: str = "time_provenance_d
             }
         },
         "replay_mode": "UNKNOWN",
+        "replay_governance": {
+            "requested_replay_mode": "LIVE_LIKE_OBSERVED",
+            "prediction_replay_mode": "LIVE_LIKE_OBSERVED",
+            "calibration_request_replay_mode": "LIVE_LIKE_OBSERVED",
+            "calibration_artifact_scope_replay_mode": "UNKNOWN",
+            "calibration_selection_reason": "selected",
+        },
     }
 
 
@@ -157,6 +193,10 @@ def test_storage_schema_includes_governance_columns(tmp_path):
         "ood_reason",
         "calibration_scope",
         "calibration_artifact_hash",
+        "calibration_evidence_ref",
+        "output_domain_contract_version",
+        "replay_governance_reason",
+        "ood_contract_version",
         "decision_path_contract_version",
     }
     assert expected.issubset(pred_cols)
@@ -169,19 +209,24 @@ def test_prediction_and_decision_trace_persist_governance_state_idempotently(tmp
     payload = _prediction_payload(snapshot_id)
 
     with db.writer() as con:
+        db.insert_features(con, snapshot_id, _bounded_feature_rows())
         first_id = db.insert_prediction(con, payload)
         second_id = db.insert_prediction(con, _prediction_payload(snapshot_id, confidence=0.72))
         pred_rows = con.execute(
             """
             SELECT prediction_id, confidence, ood_reason, calibration_scope,
-                   calibration_artifact_hash, decision_path_contract_version
+                   calibration_artifact_hash, calibration_evidence_ref,
+                   output_domain_contract_version, replay_governance_reason,
+                   ood_contract_version, decision_path_contract_version
             FROM predictions
             """
         ).fetchall()
         trace_rows = con.execute(
             """
             SELECT prediction_id, event_type, ood_reason, calibration_scope,
-                   calibration_artifact_hash, decision_path_contract_version
+                   calibration_artifact_hash, calibration_evidence_ref,
+                   output_domain_contract_version, replay_governance_reason,
+                   ood_contract_version, decision_path_contract_version
             FROM decision_traces
             """
         ).fetchall()
@@ -197,7 +242,11 @@ def test_prediction_and_decision_trace_persist_governance_state_idempotently(tmp
     assert pred_row[2] == "time_provenance_degraded:spot"
     assert pred_scope["session"] == "RTH"
     assert pred_row[4] == "artifact_hash_v9"
-    assert pred_row[5] == "decision_path/v1"
+    assert pred_row[5] == "evidence://calibration/report-v9"
+    assert pred_row[6] == "output_domain/v1"
+    assert pred_row[7] == "selected"
+    assert pred_row[8] == "ood/v2"
+    assert pred_row[9] == "decision_path/v1"
 
     trace_row = trace_rows[0]
     trace_scope = _parse_jsonish(trace_row[3])
@@ -206,7 +255,11 @@ def test_prediction_and_decision_trace_persist_governance_state_idempotently(tmp
     assert trace_row[2] == "time_provenance_degraded:spot"
     assert trace_scope["horizon_minutes"] == 15
     assert trace_row[4] == "artifact_hash_v9"
-    assert trace_row[5] == "decision_path/v1"
+    assert trace_row[5] == "evidence://calibration/report-v9"
+    assert trace_row[6] == "output_domain/v1"
+    assert trace_row[7] == "selected"
+    assert trace_row[8] == "ood/v2"
+    assert trace_row[9] == "decision_path/v1"
 
 
 def test_storage_migration_backfills_governance_columns(tmp_path):
@@ -257,6 +310,17 @@ def test_storage_migration_backfills_governance_columns(tmp_path):
     )
     con.execute(
         """
+        CREATE TABLE features (
+            snapshot_id VARCHAR,
+            feature_key TEXT,
+            feature_value DOUBLE,
+            meta_json JSON,
+            UNIQUE(snapshot_id, feature_key)
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE decision_traces (
             trace_id VARCHAR PRIMARY KEY,
             created_at_utc TIMESTAMP,
@@ -297,6 +361,12 @@ def test_storage_migration_backfills_governance_columns(tmp_path):
     legacy_meta = _governed_meta(session="PREMARKET", ood_reason="legacy_session_mismatch")
     con.execute(
         """
+        INSERT INTO features VALUES (?, 'oi_pressure', 0.42, ?)
+        """,
+        ['snap-legacy', json.dumps(_bounded_feature_rows()[0]["meta_json"])],
+    )
+    con.execute(
+        """
         INSERT INTO predictions VALUES (
             'pred-legacy', ?, 'snap-legacy', 15, 'FIXED', NULL,
             100.0, 0.2, 0.5, 0.6, 0.2, 0.2,
@@ -327,6 +397,8 @@ def test_storage_migration_backfills_governance_columns(tmp_path):
         pred_row = con2.execute(
             """
             SELECT ood_reason, calibration_scope, calibration_artifact_hash,
+                   calibration_evidence_ref, output_domain_contract_version,
+                   replay_governance_reason, ood_contract_version,
                    decision_path_contract_version
             FROM predictions WHERE prediction_id = 'pred-legacy'
             """
@@ -334,6 +406,8 @@ def test_storage_migration_backfills_governance_columns(tmp_path):
         trace_row = con2.execute(
             """
             SELECT ood_reason, calibration_scope, calibration_artifact_hash,
+                   calibration_evidence_ref, output_domain_contract_version,
+                   replay_governance_reason, ood_contract_version,
                    decision_path_contract_version
             FROM decision_traces WHERE trace_id = 'trace-legacy'
             """
@@ -344,9 +418,17 @@ def test_storage_migration_backfills_governance_columns(tmp_path):
     assert pred_row[0] == "legacy_session_mismatch"
     assert pred_scope["session"] == "PREMARKET"
     assert pred_row[2] == "artifact_hash_v9"
-    assert pred_row[3] == "decision_path/v1"
+    assert pred_row[3] == "evidence://calibration/report-v9"
+    assert pred_row[4] == "output_domain/v1"
+    assert pred_row[5] == "selected"
+    assert pred_row[6] == "ood/v2"
+    assert pred_row[7] == "decision_path/v1"
 
     assert trace_row[0] == "legacy_session_mismatch"
     assert trace_scope["session"] == "PREMARKET"
     assert trace_row[2] == "artifact_hash_v9"
-    assert trace_row[3] == "decision_path/v1"
+    assert trace_row[3] == "evidence://calibration/report-v9"
+    assert trace_row[4] == "output_domain/v1"
+    assert trace_row[5] == "selected"
+    assert trace_row[6] == "ood/v2"
+    assert trace_row[7] == "decision_path/v1"

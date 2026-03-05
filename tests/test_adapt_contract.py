@@ -64,6 +64,17 @@ def _valid_cfg() -> dict:
                 "selection_policy": {
                     "require_scope_match": True,
                     "allow_legacy_fallback": False,
+                    "allow_generic_scope_fallback": True,
+                    "require_provenance": True,
+                    "required_provenance_fields": [
+                        "trained_from_utc",
+                        "trained_to_utc",
+                        "valid_from_utc",
+                        "valid_to_utc",
+                        "evidence_ref",
+                        "fit_sample_count",
+                    ],
+                    "institutional_grade": False,
                 },
                 "compatibility_rules": {
                     "require_target_match": True,
@@ -72,6 +83,15 @@ def _valid_cfg() -> dict:
                     "require_regime_match": True,
                     "require_replay_mode_match": True,
                     "require_artifact_hash": True,
+                    "require_provenance_fields": True,
+                    "required_provenance_fields": [
+                        "trained_from_utc",
+                        "trained_to_utc",
+                        "valid_from_utc",
+                        "valid_to_utc",
+                        "evidence_ref",
+                        "fit_sample_count",
+                    ],
                 },
                 "artifacts": [
                     {
@@ -88,6 +108,14 @@ def _valid_cfg() -> dict:
                         },
                         "bins": [0.0, 0.5, 1.0],
                         "mapped": [0.05, 0.5, 0.95],
+                        "provenance": {
+                            "trained_from_utc": "2025-01-02T14:30:00+00:00",
+                            "trained_to_utc": "2025-12-31T21:00:00+00:00",
+                            "valid_from_utc": "2026-01-02T14:30:00+00:00",
+                            "valid_to_utc": "2026-12-31T21:00:00+00:00",
+                            "evidence_ref": "replay://tests/adapt/calibration/fixed15",
+                            "fit_sample_count": 25000,
+                        },
                     }
                 ],
             },
@@ -119,6 +147,19 @@ def _valid_cfg() -> dict:
                     "15": [],
                 },
             },
+            "governance_mode": "FORWARD_OBSERVATION",
+            "output_domain_policy": {
+                "contract_version": "output_domain_policy/v1",
+                "required_contract_version": "output_domain/v1",
+                "require_bounded_output_contract": True,
+                "require_expected_bounds": True,
+                "require_emitted_units": True,
+                "require_raw_input_units": True,
+                "require_output_domain": True,
+                "require_bounded_output_flag": True,
+                "degrade_on_missing_contract": True,
+                "enforce_on_decision_eligible_only": True,
+            },
             "label_contract": {
                 "label_version": "2026.02.0",
                 "session_boundary_rule": "TRUNCATE_TO_SESSION_CLOSE",
@@ -143,6 +184,9 @@ def test_adapt_runtime_summary_is_explicitly_disabled():
     assert summary["adapt_enabled"] is False
     assert summary["adapt_supported"] is False
     assert summary["adapt_rejection_reason"] == ADAPT_UNSUPPORTED_REASON
+    assert summary["governance_mode"] == "FORWARD_OBSERVATION"
+    assert summary["output_domain_policy_version"] == "output_domain_policy/v1"
+    assert summary["calibration_require_provenance"] is True
 
 
 

@@ -44,6 +44,10 @@ PREDICTION_REPORT_FIELDS: Sequence[PredictionField] = (
     ("ood_reason", None),
     ("calibration_scope", None),
     ("calibration_artifact_hash", None),
+    ("calibration_evidence_ref", None),
+    ("output_domain_contract_version", None),
+    ("ood_contract_version", None),
+    ("replay_governance_reason", None),
     ("decision_path_contract_version", None),
     ("suppression_reason", None),
     ("prob_up", None),
@@ -69,14 +73,23 @@ DECISION_TRACE_FIELDS: Sequence[PredictionField] = (
     ("calibration_version", None),
     ("calibration_scope", None),
     ("calibration_artifact_hash", None),
+    ("calibration_evidence_ref", None),
+    ("output_domain_contract_version", None),
+    ("ood_contract_version", None),
+    ("replay_governance_reason", None),
     ("decision_path_contract_version", None),
     ("trace_json", None),
     ("created_at_utc", None),
 )
 
 REALIZED_REPORT_FIELDS: Sequence[PredictionField] = (
+    ("horizon_minutes", None),
+    ("horizon_kind", None),
     ("realized_at_utc", None),
     ("brier_score", None),
+    ("log_loss", None),
+    ("outcome_label", None),
+    ("is_correct", None),
     ("data_quality_state", "quality_state"),
     ("confidence_state", None),
     ("target_version", None),
@@ -86,6 +99,10 @@ REALIZED_REPORT_FIELDS: Sequence[PredictionField] = (
     ("ood_reason", None),
     ("calibration_scope", None),
     ("calibration_artifact_hash", None),
+    ("calibration_evidence_ref", None),
+    ("output_domain_contract_version", None),
+    ("ood_contract_version", None),
+    ("replay_governance_reason", None),
     ("decision_path_contract_version", None),
     ("suppression_reason", None),
     ("prob_up", None),
@@ -249,6 +266,68 @@ def _resolve_calibration_artifact_hash(row: Mapping[str, Any]) -> Optional[str]:
     )
 
 
+def _resolve_calibration_evidence_ref(row: Mapping[str, Any]) -> Optional[str]:
+    probability_contract = _resolve_probability_contract(row)
+    calibration_ref = _json_dict(probability_contract.get("calibration_artifact_ref"))
+    provenance = _json_dict(calibration_ref.get("artifact_provenance"))
+    trace_json = _resolve_trace_json(row)
+    return _clean_optional_text(
+        row.get("calibration_evidence_ref")
+        or provenance.get("evidence_ref")
+        or trace_json.get("calibration_evidence_ref")
+    )
+
+
+def _resolve_output_domain_contract_version(row: Mapping[str, Any]) -> Optional[str]:
+    probability_contract = _resolve_probability_contract(row)
+    meta_json = _resolve_meta_json(row)
+    prediction_contract = _json_dict(meta_json.get("prediction_contract"))
+    horizon_contract = _json_dict(meta_json.get("horizon_contract"))
+    ood_assessment = _json_dict(meta_json.get("ood_assessment"))
+    trace_json = _resolve_trace_json(row)
+    trace_horizon_contract = _json_dict(trace_json.get("horizon_contract"))
+    return _clean_optional_text(
+        row.get("output_domain_contract_version")
+        or meta_json.get("output_domain_contract_version")
+        or prediction_contract.get("output_domain_contract_version")
+        or probability_contract.get("output_domain_contract_version")
+        or horizon_contract.get("output_domain_contract_version")
+        or ood_assessment.get("output_domain_contract_version")
+        or trace_json.get("output_domain_contract_version")
+        or trace_horizon_contract.get("output_domain_contract_version")
+    )
+
+
+def _resolve_ood_contract_version(row: Mapping[str, Any]) -> Optional[str]:
+    probability_contract = _resolve_probability_contract(row)
+    meta_json = _resolve_meta_json(row)
+    ood_assessment = _json_dict(meta_json.get("ood_assessment"))
+    trace_json = _resolve_trace_json(row)
+    return _clean_optional_text(
+        row.get("ood_contract_version")
+        or meta_json.get("ood_contract_version")
+        or ood_assessment.get("contract_version")
+        or probability_contract.get("ood_contract_version")
+        or trace_json.get("ood_contract_version")
+    )
+
+
+def _resolve_replay_governance_reason(row: Mapping[str, Any]) -> Optional[str]:
+    meta_json = _resolve_meta_json(row)
+    replay_governance = _json_dict(meta_json.get("replay_governance"))
+    trace_json = _resolve_trace_json(row)
+    probability_contract = _resolve_probability_contract(row)
+    return _clean_optional_text(
+        row.get("replay_governance_reason")
+        or meta_json.get("replay_governance_reason")
+        or replay_governance.get("reason")
+        or replay_governance.get("calibration_selection_reason")
+        or trace_json.get("replay_governance_reason")
+        or trace_json.get("calibration_selection_reason")
+        or probability_contract.get("replay_governance_reason")
+    )
+
+
 def _resolve_decision_path_contract_version(row: Mapping[str, Any]) -> Optional[str]:
     meta_json = _resolve_meta_json(row)
     trace_json = _resolve_trace_json(row)
@@ -324,6 +403,60 @@ def _summarize_calibration_scope(scope: Mapping[str, Any]) -> Optional[str]:
     return " | ".join(pieces) if pieces else None
 
 
+def _snapshot_timestamp_provenance_summary(
+    con: duckdb.DuckDBPyConnection,
+    snapshot_id: str,
+) -> Dict[str, Any]:
+    if not _has_table(con, "features"):
+        return {}
+
+    rows = con.execute(
+        "SELECT feature_key, meta_json FROM features WHERE snapshot_id = ? ORDER BY feature_key",
+        [snapshot_id],
+    ).fetchall()
+    if not rows:
+        return {}
+
+    degraded_features: List[str] = []
+    invalid_features: List[str] = []
+    for feature_key, meta_raw in rows:
+        meta_json = _json_dict(meta_raw)
+        metric_lineage = _json_dict(meta_json.get("metric_lineage"))
+        details = _json_dict(meta_json.get("details"))
+        if bool(metric_lineage.get("time_provenance_degraded") or details.get("time_provenance_degraded")):
+            degraded_features.append(str(feature_key))
+        timestamp_quality = _clean_optional_text(
+            metric_lineage.get("timestamp_quality")
+            or details.get("timestamp_quality")
+            or meta_json.get("timestamp_quality")
+        )
+        if timestamp_quality == "INVALID":
+            invalid_features.append(str(feature_key))
+
+    summary: Dict[str, Any] = {
+        "time_provenance_degraded_count": len(degraded_features),
+        "time_provenance_degraded_features": degraded_features,
+        "timestamp_quality_invalid_count": len(invalid_features),
+        "timestamp_quality_invalid_features": invalid_features,
+    }
+    return summary
+
+
+def _attach_snapshot_provenance_summary(df: pd.DataFrame, summary: Mapping[str, Any]) -> pd.DataFrame:
+    if df.empty or not summary:
+        return df
+    normalized = df.copy()
+    degraded_features = [str(v) for v in summary.get("time_provenance_degraded_features", [])]
+    invalid_features = [str(v) for v in summary.get("timestamp_quality_invalid_features", [])]
+    normalized["time_provenance_degraded_count"] = int(summary.get("time_provenance_degraded_count", 0))
+    normalized["time_provenance_degraded_features"] = [degraded_features] * len(normalized)
+    normalized["time_provenance_degraded_features_text"] = ", ".join(degraded_features) if degraded_features else None
+    normalized["timestamp_quality_invalid_count"] = int(summary.get("timestamp_quality_invalid_count", 0))
+    normalized["timestamp_quality_invalid_features"] = [invalid_features] * len(normalized)
+    normalized["timestamp_quality_invalid_features_text"] = ", ".join(invalid_features) if invalid_features else None
+    return normalized
+
+
 def _display_probs_for_state(state: str) -> bool:
     return state in {"CALIBRATED", "DEGRADED"}
 
@@ -345,6 +478,10 @@ def _derive_prediction_governance(
     calibrated_vector = probability_contract.get("calibrated_probability_vector")
     calibration_scope = _resolve_calibration_scope(row)
     calibration_artifact_hash = _resolve_calibration_artifact_hash(row)
+    calibration_evidence_ref = _resolve_calibration_evidence_ref(row)
+    output_domain_contract_version = _resolve_output_domain_contract_version(row)
+    ood_contract_version = _resolve_ood_contract_version(row)
+    replay_governance_reason = _resolve_replay_governance_reason(row)
     exclusions = _resolve_decision_path_exclusions(row)
 
     if suppression_reason is not None or ood_state == "OUT_OF_DISTRIBUTION":
@@ -370,6 +507,12 @@ def _derive_prediction_governance(
             governance_gaps.append("CALIBRATION_SCOPE_MISSING")
         if calibration_artifact_hash is None:
             governance_gaps.append("CALIBRATION_ARTIFACT_HASH_MISSING")
+        if calibration_evidence_ref is None:
+            governance_gaps.append("CALIBRATION_EVIDENCE_REF_MISSING")
+        if output_domain_contract_version is None:
+            governance_gaps.append("OUTPUT_DOMAIN_CONTRACT_VERSION_MISSING")
+        if ood_contract_version is None:
+            governance_gaps.append("OOD_CONTRACT_VERSION_MISSING")
 
         if governance_gaps:
             state = "UNKNOWN_GOVERNANCE"
@@ -415,6 +558,10 @@ def _derive_trace_governance(row: Mapping[str, Any]) -> Tuple[str, Optional[str]
     confidence_state = _clean_optional_text(row.get("confidence_state"))
     calibration_scope = _resolve_calibration_scope(row)
     calibration_artifact_hash = _resolve_calibration_artifact_hash(row)
+    calibration_evidence_ref = _resolve_calibration_evidence_ref(row)
+    output_domain_contract_version = _resolve_output_domain_contract_version(row)
+    ood_contract_version = _resolve_ood_contract_version(row)
+    replay_governance_reason = _resolve_replay_governance_reason(row)
     exclusions = _resolve_decision_path_exclusions(row)
 
     if suppression_reason is not None or ood_state == "OUT_OF_DISTRIBUTION":
@@ -431,6 +578,12 @@ def _derive_trace_governance(row: Mapping[str, Any]) -> Tuple[str, Optional[str]
         governance_gaps.append("CALIBRATION_SCOPE_MISSING")
     if calibration_artifact_hash is None:
         governance_gaps.append("CALIBRATION_ARTIFACT_HASH_MISSING")
+    if calibration_evidence_ref is None:
+        governance_gaps.append("CALIBRATION_EVIDENCE_REF_MISSING")
+    if output_domain_contract_version is None:
+        governance_gaps.append("OUTPUT_DOMAIN_CONTRACT_VERSION_MISSING")
+    if ood_contract_version is None:
+        governance_gaps.append("OOD_CONTRACT_VERSION_MISSING")
     if governance_gaps:
         return "UNKNOWN_GOVERNANCE", ", ".join(governance_gaps), calibration_scope, exclusions
 
@@ -465,6 +618,10 @@ def _normalize_prediction_contract_frame(df: pd.DataFrame) -> pd.DataFrame:
     scope_dicts: List[Optional[Dict[str, Any]]] = []
     scope_labels: List[Optional[str]] = []
     artifact_hashes: List[Optional[str]] = []
+    evidence_refs: List[Optional[str]] = []
+    output_domain_versions: List[Optional[str]] = []
+    ood_contract_versions: List[Optional[str]] = []
+    replay_governance_reasons: List[Optional[str]] = []
     dp_versions: List[Optional[str]] = []
     exclusion_dicts: List[Optional[Dict[str, List[str]]]] = []
     exclusion_labels: List[Optional[str]] = []
@@ -479,6 +636,10 @@ def _normalize_prediction_contract_frame(df: pd.DataFrame) -> pd.DataFrame:
         scope_dicts.append(scope if scope else None)
         scope_labels.append(_summarize_calibration_scope(scope))
         artifact_hashes.append(_resolve_calibration_artifact_hash(row))
+        evidence_refs.append(_resolve_calibration_evidence_ref(row))
+        output_domain_versions.append(_resolve_output_domain_contract_version(row))
+        ood_contract_versions.append(_resolve_ood_contract_version(row))
+        replay_governance_reasons.append(_resolve_replay_governance_reason(row))
         dp_versions.append(_resolve_decision_path_contract_version(row))
         exclusion_dicts.append(exclusions if exclusions else None)
         exclusion_labels.append(_summarize_decision_path_exclusions(exclusions))
@@ -492,6 +653,10 @@ def _normalize_prediction_contract_frame(df: pd.DataFrame) -> pd.DataFrame:
     normalized["calibration_scope"] = scope_dicts
     normalized["calibration_scope_label"] = scope_labels
     normalized["calibration_artifact_hash"] = artifact_hashes
+    normalized["calibration_evidence_ref"] = evidence_refs
+    normalized["output_domain_contract_version"] = output_domain_versions
+    normalized["ood_contract_version"] = ood_contract_versions
+    normalized["replay_governance_reason"] = replay_governance_reasons
     normalized["decision_path_contract_version"] = dp_versions
     normalized["decision_path_exclusions"] = exclusion_dicts
     normalized["decision_path_exclusions_text"] = exclusion_labels
@@ -513,6 +678,10 @@ def _normalize_decision_trace_frame(df: pd.DataFrame) -> pd.DataFrame:
     scope_dicts: List[Optional[Dict[str, Any]]] = []
     scope_labels: List[Optional[str]] = []
     artifact_hashes: List[Optional[str]] = []
+    evidence_refs: List[Optional[str]] = []
+    output_domain_versions: List[Optional[str]] = []
+    ood_contract_versions: List[Optional[str]] = []
+    replay_governance_reasons: List[Optional[str]] = []
     dp_versions: List[Optional[str]] = []
     exclusion_dicts: List[Optional[Dict[str, List[str]]]] = []
     exclusion_labels: List[Optional[str]] = []
@@ -524,6 +693,10 @@ def _normalize_decision_trace_frame(df: pd.DataFrame) -> pd.DataFrame:
         scope_dicts.append(scope if scope else None)
         scope_labels.append(_summarize_calibration_scope(scope))
         artifact_hashes.append(_resolve_calibration_artifact_hash(row))
+        evidence_refs.append(_resolve_calibration_evidence_ref(row))
+        output_domain_versions.append(_resolve_output_domain_contract_version(row))
+        ood_contract_versions.append(_resolve_ood_contract_version(row))
+        replay_governance_reasons.append(_resolve_replay_governance_reason(row))
         dp_versions.append(_resolve_decision_path_contract_version(row))
         exclusion_dicts.append(exclusions if exclusions else None)
         exclusion_labels.append(_summarize_decision_path_exclusions(exclusions))
@@ -533,6 +706,10 @@ def _normalize_decision_trace_frame(df: pd.DataFrame) -> pd.DataFrame:
     normalized["calibration_scope"] = scope_dicts
     normalized["calibration_scope_label"] = scope_labels
     normalized["calibration_artifact_hash"] = artifact_hashes
+    normalized["calibration_evidence_ref"] = evidence_refs
+    normalized["output_domain_contract_version"] = output_domain_versions
+    normalized["ood_contract_version"] = ood_contract_versions
+    normalized["replay_governance_reason"] = replay_governance_reasons
     normalized["decision_path_contract_version"] = dp_versions
     normalized["decision_path_exclusions"] = exclusion_dicts
     normalized["decision_path_exclusions_text"] = exclusion_labels
@@ -555,7 +732,8 @@ def build_prediction_contract_frame(con: duckdb.DuckDBPyConnection, snapshot_id:
         ORDER BY COALESCE(p.horizon_seconds, p.horizon_minutes * 60, 0), p.horizon_minutes NULLS LAST
     """
     df = con.execute(query, [snapshot_id]).fetchdf()
-    return _normalize_prediction_contract_frame(df)
+    normalized = _normalize_prediction_contract_frame(df)
+    return _attach_snapshot_provenance_summary(normalized, _snapshot_timestamp_provenance_summary(con, snapshot_id))
 
 
 def build_realized_prediction_contract_frame(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
@@ -615,7 +793,8 @@ def build_decision_trace_frame(con: duckdb.DuckDBPyConnection, snapshot_id: str)
     df = con.execute(query, [snapshot_id]).fetchdf()
     if not df.empty and "created_at_utc" in df.columns:
         df["created_at_utc"] = pd.to_datetime(df["created_at_utc"], utc=True).dt.tz_convert(ET)
-    return _normalize_decision_trace_frame(df)
+    normalized = _normalize_decision_trace_frame(df)
+    return _attach_snapshot_provenance_summary(normalized, _snapshot_timestamp_provenance_summary(con, snapshot_id))
 
 
 def render_prediction_contract_report(con: duckdb.DuckDBPyConnection, snapshot_id: str) -> None:
@@ -630,12 +809,17 @@ def render_prediction_contract_report(con: duckdb.DuckDBPyConnection, snapshot_i
         return
 
     counts = df["governance_state"].value_counts(dropna=False).to_dict()
-    metric_cols = ui.columns(5)
+    metric_cols = ui.columns(6)
     metric_cols[0].metric("Horizons", int(len(df)))
     metric_cols[1].metric("Calibrated", int(counts.get("CALIBRATED", 0)))
     metric_cols[2].metric("Degraded", int(counts.get("DEGRADED", 0)))
     metric_cols[3].metric("Unknown governance", int(counts.get("UNKNOWN_GOVERNANCE", 0)))
     metric_cols[4].metric("Suppressed", int(counts.get("SUPPRESSED", 0)))
+    degraded_ts_count = int(df["time_provenance_degraded_count"].dropna().iloc[0]) if "time_provenance_degraded_count" in df.columns and not df.empty else 0
+    metric_cols[5].metric("TS provenance degraded", degraded_ts_count)
+    degraded_ts_features = _clean_optional_text(df["time_provenance_degraded_features_text"].dropna().iloc[0]) if "time_provenance_degraded_features_text" in df.columns and df["time_provenance_degraded_features_text"].notna().any() else None
+    if degraded_ts_features:
+        ui.caption(f"Snapshot timestamp provenance degraded features: {degraded_ts_features}")
 
     display_cols = [
         "horizon_minutes",
@@ -648,9 +832,14 @@ def render_prediction_contract_report(con: duckdb.DuckDBPyConnection, snapshot_i
         "target_version",
         "calibration_version",
         "calibration_scope_label",
+        "calibration_artifact_hash",
+        "calibration_evidence_ref",
         "replay_mode",
+        "replay_governance_reason",
         "ood_state",
         "ood_reason",
+        "ood_contract_version",
+        "output_domain_contract_version",
         "decision_path_exclusions_text",
         "suppression_reason",
         "calibrated_prob_up",
@@ -689,6 +878,13 @@ def render_decision_trace(con: duckdb.DuckDBPyConnection, snapshot_id: str) -> N
     if df.empty:
         return
     ui.subheader("🧾 Decision Trace")
+    degraded_ts_count = int(df["time_provenance_degraded_count"].dropna().iloc[0]) if "time_provenance_degraded_count" in df.columns and not df.empty else 0
+    degraded_ts_features = _clean_optional_text(df["time_provenance_degraded_features_text"].dropna().iloc[0]) if "time_provenance_degraded_features_text" in df.columns and df["time_provenance_degraded_features_text"].notna().any() else None
+    if degraded_ts_count:
+        caption = f"Snapshot timestamp provenance degraded features: {degraded_ts_count}"
+        if degraded_ts_features:
+            caption += f" ({degraded_ts_features})"
+        ui.caption(caption)
     ui.dataframe(
         df[
             [
@@ -702,11 +898,16 @@ def render_decision_trace(con: duckdb.DuckDBPyConnection, snapshot_id: str) -> N
                 "governance_reason",
                 "ood_state",
                 "ood_reason",
+                "ood_contract_version",
                 "calibration_version",
                 "calibration_scope_label",
+                "calibration_artifact_hash",
+                "calibration_evidence_ref",
+                "replay_mode",
+                "replay_governance_reason",
+                "output_domain_contract_version",
                 "decision_path_exclusions_text",
                 "suppression_reason",
-                "replay_mode",
             ]
         ],
         use_container_width=True,

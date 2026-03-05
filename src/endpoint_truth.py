@@ -130,24 +130,42 @@ class SourceTimeHints:
 
 PAYLOAD_EVENT_TIME_KEYS: Tuple[str, ...] = (
     "event_time", "event_at", "executed_at", "trade_time", "occurred_at",
-    "timestamp", "time", "t", "date", "updated_at", "last_updated"
+    "timestamp", "time", "t", "date", "updated_at", "last_updated",
+    "eventTime", "executedAt", "tradeTime", "occurredAt", "lastUpdated",
+    "event_timestamp", "eventTimestamp", "trade_timestamp", "tradeTimestamp",
 )
 PAYLOAD_PUBLISH_TIME_KEYS: Tuple[str, ...] = (
     "source_publish_time", "source_publish_time_utc", "published_at",
-    "publish_time", "report_time", "report_date"
+    "publish_time", "report_time", "report_date", "generated_at",
+    "publishedAt", "publishTime", "reportTime", "generatedAt",
+    "generated_time", "generatedTime", "publication_time", "publicationTime",
 )
 PAYLOAD_EFFECTIVE_TIME_KEYS: Tuple[str, ...] = (
-    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of"
+    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of",
+    "effectiveAt", "effectiveTs", "effectiveTime", "as_of_time", "asOf",
+    "asOfTime", "snapshot_time", "snapshotTime", "snapshot_at", "snapshotAt",
 )
 PAYLOAD_SOURCE_REVISION_KEYS: Tuple[str, ...] = (
-    "source_revision", "revision", "rev", "version", "sequence_id", "update_id"
+    "source_revision", "revision", "rev", "version", "sequence_id", "update_id",
+    "sourceRevision", "sequenceId", "updateId",
+)
+RESPONSE_HEADER_EVENT_KEYS: Tuple[str, ...] = (
+    "x-source-event-time", "x-event-time", "x-provider-event-time",
 )
 RESPONSE_HEADER_PUBLISH_KEYS: Tuple[str, ...] = (
-    "x-source-publish-time", "x-published-at", "last-modified"
+    "x-source-publish-time", "x-published-at", "last-modified",
+    "x-generated-at", "x-response-generated-at", "x-provider-publish-time",
+)
+RESPONSE_HEADER_EFFECTIVE_KEYS: Tuple[str, ...] = (
+    "x-effective-time", "x-as-of-time", "x-data-as-of", "x-snapshot-time",
 )
 RESPONSE_HEADER_REVISION_KEYS: Tuple[str, ...] = (
-    "x-source-revision", "x-revision", "etag"
+    "x-source-revision", "x-revision", "etag", "x-version", "x-data-revision",
 )
+
+
+def _normalize_contract_key(key: Any) -> str:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum())
 
 
 def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
@@ -186,7 +204,7 @@ def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
 def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, max_nodes: int = 256) -> Optional[datetime.datetime]:
     if payload is None:
         return None
-    keyset = {str(k).lower() for k in candidate_keys}
+    keyset = {_normalize_contract_key(k) for k in candidate_keys}
     queue = deque([payload])
     seen = 0
     best_dt: Optional[datetime.datetime] = None
@@ -196,7 +214,7 @@ def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, 
         seen += 1
         if isinstance(current, Mapping):
             for key, value in current.items():
-                if str(key).lower() in keyset:
+                if _normalize_contract_key(key) in keyset:
                     dt_val = _coerce_optional_utc_dt(value)
                     if dt_val is not None and (best_dt is None or dt_val > best_dt):
                         best_dt = dt_val
@@ -213,7 +231,7 @@ def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, 
 def _find_first_nested_value(payload: Any, candidate_keys: Sequence[str], *, max_nodes: int = 256) -> Any:
     if payload is None:
         return None
-    keyset = {str(k).lower() for k in candidate_keys}
+    keyset = {_normalize_contract_key(k) for k in candidate_keys}
     queue = deque([payload])
     seen = 0
 
@@ -222,7 +240,7 @@ def _find_first_nested_value(payload: Any, candidate_keys: Sequence[str], *, max
         seen += 1
         if isinstance(current, Mapping):
             for key, value in current.items():
-                if str(key).lower() in keyset and value not in (None, ""):
+                if _normalize_contract_key(key) in keyset and value not in (None, ""):
                     return value
             for value in current.values():
                 if isinstance(value, (Mapping, list, tuple)):
@@ -255,6 +273,11 @@ def infer_source_time_hints(
     explicit_revision: Optional[str] = None,
 ) -> SourceTimeHints:
     headers = _normalize_response_headers(response_headers)
+    normalized_headers = {
+        _normalize_contract_key(key): value
+        for key, value in headers.items()
+        if value not in (None, "")
+    }
 
     explicit_event = _coerce_optional_utc_dt(explicit_event_time_raw)
     explicit_publish = _coerce_optional_utc_dt(explicit_publish_time_raw)
@@ -265,23 +288,35 @@ def infer_source_time_hints(
     payload_effective = _find_best_nested_timestamp(payload_json, PAYLOAD_EFFECTIVE_TIME_KEYS)
     payload_revision = _find_first_nested_value(payload_json, PAYLOAD_SOURCE_REVISION_KEYS)
 
+    header_event = None
+    for key in RESPONSE_HEADER_EVENT_KEYS:
+        header_event = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        if header_event is not None:
+            break
+
     header_publish = None
     for key in RESPONSE_HEADER_PUBLISH_KEYS:
-        if key in headers:
-            header_publish = _coerce_optional_utc_dt(headers.get(key))
-            if header_publish is not None:
-                break
+        header_publish = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        if header_publish is not None:
+            break
+
+    header_effective = None
+    for key in RESPONSE_HEADER_EFFECTIVE_KEYS:
+        header_effective = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        if header_effective is not None:
+            break
 
     header_revision = None
     for key in RESPONSE_HEADER_REVISION_KEYS:
-        if key in headers and headers.get(key) not in (None, ""):
-            header_revision = headers.get(key)
+        header_value = normalized_headers.get(_normalize_contract_key(key))
+        if header_value not in (None, ""):
+            header_revision = header_value
             break
 
     return SourceTimeHints(
-        event_time_utc=explicit_event or payload_event,
+        event_time_utc=explicit_event or payload_event or header_event,
         source_publish_time_utc=explicit_publish or payload_publish or header_publish,
-        effective_time_utc=explicit_effective or payload_effective,
+        effective_time_utc=explicit_effective or payload_effective or header_effective,
         source_revision=str(explicit_revision) if explicit_revision not in (None, "") else (str(payload_revision) if payload_revision not in (None, "") else header_revision),
     )
 
