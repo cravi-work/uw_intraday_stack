@@ -19,6 +19,7 @@ def test_canonical_session_labels():
     # Test P_STRUCTURAL endpoint
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "RTH") == EmptyPayloadPolicy.EMPTY_INVALID
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "AFTERHOURS") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
+    assert get_empty_policy("GET", "/api/stock/{ticker}/ohlc/{candle_size}", "RTH") == EmptyPayloadPolicy.EMPTY_INVALID
 
 def test_legacy_session_labels_explicit_failure(caplog):
     """

@@ -30,7 +30,12 @@ from .logging_config import log_prediction_decision, structured_log
 from .scheduler import ET, UTC, coerce_session_state, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
-from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
+from .endpoint_rules import (
+    EmptyPayloadPolicy,
+    normalize_runtime_query_params,
+    validate_plan_coverage,
+    validate_runtime_request_shape,
+)
 from .features import extract_all
 from .models import (
     bounded_additive_score,
@@ -55,9 +60,11 @@ from .endpoint_truth import (
     NaReasonCode,
     PayloadAssessment,
     classify_payload, 
+    get_endpoint_time_semantics,
     infer_source_time_hints,
     resolve_effective_payload, 
-    to_utc_dt
+    to_utc_dt,
+    uses_documented_asof_contemporaneous,
 )
 from .freshness_policy import (
     FeatureDecisionReason,
@@ -68,6 +75,33 @@ from .ood import OODAssessment, assess_operational_ood, resolve_ood_policy
 from .calibration_registry import CalibrationSelectionResult, resolve_calibration_regime, select_calibration_artifact
 
 logger = logging.getLogger(__name__)
+
+
+# --- Endpoint payload observability helpers ---
+_PROVIDER_TIME_SOURCES = {"effective_time", "event_time", "source_publish_time"}
+
+
+def _provider_timestamp_found(effective_time_source: Optional[str]) -> bool:
+    return bool(effective_time_source) and effective_time_source in _PROVIDER_TIME_SOURCES
+
+
+def _payload_row_count(payload: Any) -> Optional[int]:
+    """Best-effort row-count for heterogeneous endpoint payloads.
+
+    Used only for observability / lineage (NOT for gating).
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for k in ("data", "results", "rows", "trades", "candles", "items", "result"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return len(v)
+        return 0 if len(payload) == 0 else 1
+    return None
+
 
 @dataclass(frozen=True)
 class PlannedCall:
@@ -442,13 +476,23 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
             )
             if entry["purpose"] == "disabled":
                 continue
+            normalized_query_params = normalize_runtime_query_params(
+                entry["method"],
+                entry["path"],
+                entry["query_params"],
+            )
+            validate_runtime_request_shape(
+                entry["method"],
+                entry["path"],
+                normalized_query_params,
+            )
             planned.append(
                 PlannedCall(
                     entry["name"],
                     entry["method"],
                     entry["path"],
                     entry["path_params"],
-                    entry["query_params"],
+                    normalized_query_params,
                     market,
                     entry["purpose"],
                     entry["decision_path"],
@@ -1714,6 +1758,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         attempt_ts_utc, is_success_class, is_changed
                     )
 
+                    time_semantics = get_endpoint_time_semantics(call.path)
                     resolved = resolve_effective_payload(
                         str(event_id), asof_utc, assessment, prev_state,
                         fallback_max_age_seconds=fallback_max_age_seconds,
@@ -1725,6 +1770,9 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         processed_at_raw=attempt_ts_utc,
                         as_of_time_raw=asof_utc,
                         source_revision=source_time_hints.source_revision,
+                        documented_asof_contemporaneous=time_semantics.documented_asof_contemporaneous,
+                        max_trusted_source_age_seconds=time_semantics.max_trusted_source_age_seconds,
+                        time_semantics_family=time_semantics.family,
                     )
                     
                     enforced_freshness = resolved.freshness_state
@@ -1822,6 +1870,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             decision_path=call.decision_path,
                             missing_affects_confidence=call.missing_affects_confidence,
                             stale_affects_confidence=call.stale_affects_confidence,
+                            time_semantics_family=time_semantics.family,
+                            max_trusted_source_age_seconds=time_semantics.max_trusted_source_age_seconds,
                             purpose_contract_version=call.purpose_contract_version,
                         )
                         contexts[endpoint_id] = ctx
@@ -1862,6 +1912,8 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "timestamp_quality": ctx.timestamp_quality,
                                 "lagged": ctx.lagged,
                                 "time_provenance_degraded": ctx.time_provenance_degraded,
+                                "payload_row_count": _payload_row_count(eff_payload),
+                                "provider_timestamp_found": _provider_timestamp_found(ctx.effective_time_source),
                                 "source_revision": ctx.source_revision,
                             }
                         )

@@ -44,6 +44,31 @@ DISABLED_DEFAULT_PATHS = {
 }
 
 
+
+DATE_REQUIRED_FETCHED_PATHS = {
+    "/api/stock/{ticker}/ohlc/{candle_size}",
+    "/api/stock/{ticker}/spot-exposures",
+    "/api/stock/{ticker}/spot-exposures/strike",
+    "/api/stock/{ticker}/greek-exposure",
+    "/api/stock/{ticker}/greek-exposure/strike",
+    "/api/stock/{ticker}/greek-exposure/expiry",
+    "/api/stock/{ticker}/spot-exposures/expiry-strike",
+    "/api/stock/{ticker}/flow-per-strike-intraday",
+    "/api/stock/{ticker}/flow-per-strike",
+    "/api/stock/{ticker}/oi-per-strike",
+    "/api/stock/{ticker}/oi-change",
+    "/api/stock/{ticker}/volatility/term-structure",
+    "/api/stock/{ticker}/iv-rank",
+    "/api/stock/{ticker}/historical-risk-reversal-skew",
+    "/api/darkpool/{ticker}",
+    "/api/lit-flow/{ticker}",
+}
+
+DATE_REQUIRED_MARKET_CONTEXT_PATHS = {
+    "/api/market/market-tide",
+    "/api/market/top-net-impact",
+}
+
 MARKET_CONTEXT_PATHS = {
     "/api/market/market-tide",
     "/api/market/economic-calendar",
@@ -113,6 +138,10 @@ def test_default_plan_dry_run_excludes_disabled_overfetch_and_exposes_purposes()
     assert all(call.missing_affects_confidence == call.decision_path for call in core)
     assert all(call.stale_affects_confidence == call.decision_path for call in core)
     assert len(core) == 17
+    assert {
+        call.path for call in core
+        if call.query_params.get("date") == "{date}"
+    }.issuperset(DATE_REQUIRED_FETCHED_PATHS)
 
     summary = summarize_effective_endpoint_plan(cfg, plan)
     assert {item["name"] for item in summary["disabled_default"]} == DISABLED_DEFAULT_NAMES
@@ -137,6 +166,10 @@ def test_market_context_plan_fetches_only_context_endpoints_when_enabled():
     assert all(call.decision_path is False for call in market)
     assert all(call.missing_affects_confidence is False for call in market)
     assert all(call.stale_affects_confidence is False for call in market)
+    assert {
+        call.path for call in market
+        if call.query_params.get("date") == "{date}"
+    }.issuperset(DATE_REQUIRED_MARKET_CONTEXT_PATHS)
 
     summary = summarize_effective_endpoint_plan(cfg, plan)
     assert {item["path"] for item in summary["fetched_market_context"]} == MARKET_CONTEXT_PATHS

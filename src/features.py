@@ -73,13 +73,16 @@ BULLISH_SIDE_ALIASES = {"ASK", "BUY", "BULL", "BULLISH", "BOT"}
 BEARISH_SIDE_ALIASES = {"BID", "SELL", "BEAR", "BEARISH", "SOLD"}
 EVENT_TIME_KEYS = (
     "event_time", "event_at", "executed_at", "trade_time", "occurred_at",
-    "timestamp", "time", "t", "date", "updated_at", "last_updated"
+    "timestamp", "time", "t", "ts", "date", "datetime", "date_time",
+    "updated_at", "last_updated", "created_at", "start", "end"
 )
 PUBLISH_TIME_KEYS = (
-    "source_publish_time", "published_at", "publish_time", "report_time", "report_date"
+    "source_publish_time", "published_at", "publish_time", "report_time", "report_date",
+    "generated_at", "created_at"
 )
 EFFECTIVE_TIME_KEYS = (
-    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of"
+    "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of",
+    "snapshot_time", "snapshot_at", "snapshot_date"
 )
 SOURCE_REVISION_KEYS = (
     "source_revision", "revision", "rev", "version", "sequence_id", "update_id"
@@ -219,13 +222,41 @@ def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
         return None
     return max(-1.0, min(1.0, val / scale))
 
+def _normalize_epoch_seconds(value: float) -> Optional[float]:
+    if not math.isfinite(float(value)):
+        return None
+    epoch_value = float(value)
+    magnitude = abs(epoch_value)
+    if magnitude >= 1e17:
+        epoch_value /= 1_000_000_000.0
+    elif magnitude >= 1e14:
+        epoch_value /= 1_000_000.0
+    elif magnitude >= 1e11:
+        epoch_value /= 1_000.0
+    return epoch_value
+
+
 def _parse_strict_ts(row: dict, key: str) -> float:
     ts_val = row.get(key)
-    if isinstance(ts_val, (int, float)): 
-        return float(ts_val)
+    if isinstance(ts_val, (int, float)):
+        normalized = _normalize_epoch_seconds(float(ts_val))
+        return float(normalized) if normalized is not None else 0.0
     if isinstance(ts_val, str):
+        raw = ts_val.strip()
+        if not raw:
+            return 0.0
         try:
-            return datetime.datetime.fromisoformat(ts_val.replace('Z', '+00:00')).timestamp()
+            parsed = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            else:
+                parsed = parsed.astimezone(datetime.timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+        try:
+            normalized = _normalize_epoch_seconds(float(raw))
+            return float(normalized) if normalized is not None else 0.0
         except ValueError:
             pass
     return 0.0
@@ -251,10 +282,11 @@ def _coerce_ts_iso(value: Any) -> Optional[str]:
             value = value.astimezone(datetime.timezone.utc)
         return value.isoformat()
     if isinstance(value, (int, float)):
-        if not math.isfinite(float(value)):
+        normalized = _normalize_epoch_seconds(float(value))
+        if normalized is None:
             return None
         try:
-            return datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc).isoformat()
+            return datetime.datetime.fromtimestamp(normalized, datetime.timezone.utc).isoformat()
         except (OverflowError, OSError, ValueError):
             return None
     if isinstance(value, str):
@@ -262,10 +294,18 @@ def _coerce_ts_iso(value: Any) -> Optional[str]:
         if not raw:
             return None
         try:
-            return datetime.datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(datetime.timezone.utc).isoformat()
+            parsed = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            else:
+                parsed = parsed.astimezone(datetime.timezone.utc)
+            return parsed.isoformat()
         except ValueError:
             try:
-                return datetime.datetime.fromtimestamp(float(raw), datetime.timezone.utc).isoformat()
+                normalized = _normalize_epoch_seconds(float(raw))
+                if normalized is None:
+                    return None
+                return datetime.datetime.fromtimestamp(normalized, datetime.timezone.utc).isoformat()
             except (TypeError, ValueError, OverflowError, OSError):
                 return None
     return None
@@ -319,10 +359,66 @@ def _find_first_payload_value(payload: Any, keys: Tuple[str, ...]) -> Optional[A
 
 
 def _extract_payload_provenance(payload: Any) -> Dict[str, Any]:
+    """Extract minimal, deterministic provenance details from a raw endpoint payload.
+
+    This function is used for lineage + observability. Keep it:
+      * deterministic (no clock reads)
+      * lightweight (no deep parsing)
+      * JSON-serializable
+    """
+    details: Dict[str, Any] = {}
+
     event_iso, event_key, event_invalid = _find_payload_timestamp(payload, EVENT_TIME_KEYS)
     publish_iso, publish_key, publish_invalid = _find_payload_timestamp(payload, PUBLISH_TIME_KEYS)
-    effective_iso, effective_key, effective_invalid = _find_payload_timestamp(payload, EFFECTIVE_TIME_KEYS)
-    revision = _find_first_payload_value(payload, SOURCE_REVISION_KEYS)
+
+    details["provider_event_time_key"] = event_key
+    details["provider_publish_time_key"] = publish_key
+    details["provider_event_time_invalid"] = event_invalid
+    details["provider_publish_time_invalid"] = publish_invalid
+
+    # Shape / row-count hints (helps debug "200 OK but unusable" payloads)
+    if payload is None:
+        details["payload_family"] = "none"
+        details["payload_is_empty"] = True
+    elif isinstance(payload, list):
+        details["payload_family"] = "list"
+        details["payload_list_len"] = len(payload)
+        details["payload_is_empty"] = len(payload) == 0
+    elif isinstance(payload, dict):
+        details["payload_family"] = "dict"
+        details["payload_keys"] = sorted(payload.keys())[:50]
+
+        # Try to identify a common wrapper list ("data", "results", etc.)
+        wrapper_key = None
+        wrapper_len = None
+        for k in ("data", "results", "rows", "trades", "candles", "items", "result"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                wrapper_key = k
+                wrapper_len = len(v)
+                break
+
+        if wrapper_key is not None:
+            details["payload_list_key"] = wrapper_key
+            details["payload_list_len"] = wrapper_len
+            details["payload_is_empty"] = (wrapper_len == 0)
+        else:
+            # Single-object dict payloads are treated as one "row" for observability.
+            details["payload_dict_len"] = len(payload)
+            details["payload_is_empty"] = len(payload) == 0
+    else:
+        details["payload_family"] = type(payload).__name__
+
+    rev = payload.get("revision") if isinstance(payload, dict) else None
+    if isinstance(rev, (str, int)):
+        details["provider_revision"] = str(rev)
+
+    # Prefer explicit provider times if present.
+    if event_iso:
+        details["provider_event_time_utc"] = event_iso
+    if publish_iso:
+        details["provider_publish_time_utc"] = publish_iso
+    return details
 
     details: Dict[str, Any] = {}
     if effective_iso is not None:
@@ -354,6 +450,276 @@ def _extract_payload_provenance(payload: Any) -> Dict[str, Any]:
             "effective_at": effective_key,
         }
     return details
+
+
+def _merge_provenance_details(*sources: Mapping[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key, value in source.items():
+            if key == "payload_timestamp_keys":
+                if not isinstance(value, Mapping):
+                    continue
+                payload_keys = dict(merged.get("payload_timestamp_keys") or {})
+                for sub_key, sub_value in value.items():
+                    if sub_value in (None, ""):
+                        continue
+                    payload_keys[sub_key] = sub_value
+                if payload_keys:
+                    merged["payload_timestamp_keys"] = payload_keys
+                continue
+            if key in {"effective_at_utc", "event_time_utc", "source_publish_time_utc"}:
+                if value in (None, ""):
+                    merged.setdefault(key, value)
+                    continue
+                if value == "INVALID" and merged.get(key) not in (None, "", "INVALID"):
+                    continue
+                merged[key] = value
+                continue
+            if value in (None, ""):
+                merged.setdefault(key, value)
+                continue
+            merged[key] = value
+    return merged
+
+
+SNAPSHOT_TIME_ANCHORED_FAMILIES = {"gex_snapshot", "greeks_snapshot", "oi_snapshot", "vol_snapshot"}
+
+
+# --- Endpoint payload observability helpers ---
+# Used to surface "200 OK but unusable" payloads (empty/stale/invalid/time-degraded) with
+# structured, per-endpoint-family diagnostics.
+PROVIDER_TIME_SOURCES = {"effective_time", "event_time", "source_publish_time"}
+
+
+def _provider_timestamp_found_count(ctx: EndpointContext) -> int:
+    src = getattr(ctx, "effective_time_source", None)
+    return 1 if src in PROVIDER_TIME_SOURCES else 0
+
+
+def _infer_payload_row_count(payload: Any, provenance_details: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+    if provenance_details is not None:
+        v = provenance_details.get("payload_list_len")
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+
+    if payload is None:
+        return 0
+
+    if isinstance(payload, list):
+        return len(payload)
+
+    if isinstance(payload, dict):
+        for k in ("data", "results", "rows", "trades", "candles", "items", "result"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return len(v)
+        return 0 if len(payload) == 0 else 1
+
+    return None
+
+
+def _extract_int(details: Mapping[str, Any], keys: Tuple[str, ...]) -> Optional[int]:
+    for key in keys:
+        value = details.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+    return None
+
+
+def _log_endpoint_payload_observability(
+    ctx: EndpointContext,
+    endpoint_family: str,
+    payload: Any,
+    meta: Optional[Mapping[str, Any]],
+    features: Mapping[str, Any],
+) -> None:
+    meta_obj = dict(meta or {})
+    details = meta_obj.get("details") if isinstance(meta_obj.get("details"), Mapping) else {}
+
+    raw_row_count = _infer_payload_row_count(payload, details)
+    parsed_row_count = _extract_int(
+        details,
+        (
+            "parsed_rows",
+            "parsed_trades",
+            "parsed_rows_total",
+            "valid_rows",
+            "parsed_exposures",
+            "parsed_items",
+        ),
+    )
+
+    # If the payload is explicitly empty, treat parsed_row_count as 0 for consistency.
+    if parsed_row_count is None and isinstance(raw_row_count, int) and raw_row_count == 0:
+        parsed_row_count = 0
+
+    rows_discarded = None
+    if isinstance(raw_row_count, int) and isinstance(parsed_row_count, int):
+        rows_discarded = max(0, raw_row_count - parsed_row_count)
+
+    emitted_count = sum(1 for v in features.values() if v is not None)
+    total_count = len(features)
+
+    provider_ts_found_count = _provider_timestamp_found_count(ctx)
+    effective_ts_source = getattr(ctx, "effective_time_source", None)
+
+    feature_output_reason = (
+        meta_obj.get("na_reason")
+        or details.get("status")
+        or details.get("error")
+        or ("no_emitted_features" if emitted_count == 0 else "ok")
+    )
+
+    is_anomaly = (
+        emitted_count == 0
+        or provider_ts_found_count == 0
+        or (isinstance(raw_row_count, int) and raw_row_count == 0)
+        or bool(getattr(ctx, "time_provenance_degraded", False))
+        or getattr(ctx, "payload_class", None) not in ("SUCCESS_NONEMPTY",)
+        or getattr(ctx, "na_reason", None) is not None
+    )
+
+    # Avoid spamming for report-only/context-only endpoints; focus on decision-path or anomalous endpoints.
+    decision_path = bool(getattr(ctx, "decision_path", False))
+    if not decision_path and not is_anomaly:
+        return
+
+    if not is_anomaly:
+        return
+
+    structured_log(
+        logger,
+        logging.INFO,
+        event="endpoint_payload_observability",
+        msg="Endpoint payload observability anomaly",
+        endpoint_name=getattr(ctx, "endpoint_name", None) or getattr(ctx, "operation_id", None),
+        endpoint_id=getattr(ctx, "endpoint_id", None),
+        endpoint_family=endpoint_family,
+        endpoint_path_template=getattr(ctx, "path", None),
+        payload_class=getattr(ctx, "payload_class", None),
+        freshness_state=getattr(ctx, "freshness_state", None),
+        stale_age_min=getattr(ctx, "stale_age_min", None),
+        payload_row_count=raw_row_count,
+        parsed_row_count=parsed_row_count,
+        rows_discarded_before_extraction=rows_discarded,
+        provider_timestamp_found_count=provider_ts_found_count,
+        effective_timestamp_source=effective_ts_source,
+        time_provenance_degraded=bool(getattr(ctx, "time_provenance_degraded", False)),
+        timestamp_quality=getattr(ctx, "timestamp_quality", None),
+        emitted_feature_count=emitted_count,
+        total_feature_count=total_count,
+        feature_output_reason=feature_output_reason,
+    )
+
+
+
+def _parse_iso_dtlike(value: Any) -> Optional[datetime.datetime]:
+    if value in (None, "", "INVALID"):
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        else:
+            parsed = parsed.astimezone(datetime.timezone.utc)
+        return parsed
+    return None
+
+
+def _sanitize_snapshot_family_provenance(ctx: EndpointContext, details: Mapping[str, Any]) -> Dict[str, Any]:
+    out = dict(details or {})
+    family = getattr(ctx, "time_semantics_family", None)
+    if family not in SNAPSHOT_TIME_ANCHORED_FAMILIES:
+        return out
+
+    ctx_effective = getattr(ctx, "effective_ts_utc", None)
+    if not isinstance(ctx_effective, datetime.datetime):
+        return out
+    if ctx_effective.tzinfo is None:
+        ctx_effective = ctx_effective.replace(tzinfo=datetime.timezone.utc)
+    else:
+        ctx_effective = ctx_effective.astimezone(datetime.timezone.utc)
+
+    max_age = getattr(ctx, "max_trusted_source_age_seconds", None)
+    if not isinstance(max_age, int) or max_age <= 0:
+        max_age = 7200
+
+    reclassified: Dict[str, int] = {}
+    for key in ("effective_at_utc", "event_time_utc", "source_publish_time_utc"):
+        ts_dt = _parse_iso_dtlike(out.get(key))
+        if ts_dt is None:
+            if out.get(key) == "INVALID" and getattr(ctx, "effective_ts_utc", None) is not None:
+                out.pop(key, None)
+            continue
+        delta_seconds = int(abs((ctx_effective - ts_dt).total_seconds()))
+        if delta_seconds > max_age:
+            out.pop(key, None)
+            reclassified[key] = delta_seconds
+
+    if reclassified:
+        out["time_provenance_degraded"] = True
+        out["lagged"] = True
+        out["snapshot_time_semantics"] = "session_anchored_context_fallback"
+        out["reclassified_snapshot_timestamps"] = reclassified
+        out["reclassified_snapshot_family"] = family
+        out.setdefault("effective_time_source", "documented_asof_contemporaneous")
+        payload_keys = dict(out.get("payload_timestamp_keys") or {})
+        if payload_keys:
+            out["payload_timestamp_keys"] = payload_keys
+    return out
+
+
+def _extract_best_row_timestamp(row: Any, keys: Tuple[str, ...] = EVENT_TIME_KEYS) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(row, Mapping):
+        return None, None
+    best_iso: Optional[str] = None
+    best_dt: Optional[datetime.datetime] = None
+    best_key: Optional[str] = None
+    for key in keys:
+        if key not in row:
+            continue
+        iso_val = _coerce_ts_iso(row.get(key))
+        if iso_val is None:
+            continue
+        dt_val = datetime.datetime.fromisoformat(iso_val)
+        if best_dt is None or dt_val > best_dt:
+            best_dt = dt_val
+            best_iso = iso_val
+            best_key = key
+    return best_iso, best_key
+
+
+def _select_latest_payload_row(rows: List[Dict[str, Any]], keys: Tuple[str, ...] = EVENT_TIME_KEYS) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+    if not rows:
+        raise ValueError("rows must not be empty")
+    best_index = len(rows) - 1
+    best_iso: Optional[str] = None
+    best_key: Optional[str] = None
+    best_dt: Optional[datetime.datetime] = None
+    for idx, row in enumerate(rows):
+        iso_val, row_key = _extract_best_row_timestamp(row, keys)
+        if iso_val is None:
+            continue
+        dt_val = datetime.datetime.fromisoformat(iso_val)
+        if best_dt is None or dt_val > best_dt:
+            best_dt = dt_val
+            best_iso = iso_val
+            best_key = row_key
+            best_index = idx
+    return rows[best_index], best_iso, best_key
 
 
 def _extract_spot_reference(payload: Any) -> Optional[float]:
@@ -593,35 +959,54 @@ def _annotate_level_usage_contract(meta: Dict[str, Any], level_type: str) -> Dic
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "spot",
-        "fields_used": ["close", "t"],
+        "fields_used": ["close", "t", "date", "timestamp", "time"],
         "units_expected": "USD",
         "normalization": "none",
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None if missing required explicit keys",
         "criticality": "CRITICAL"
     }, emitted_units="USD", raw_input_units="USD", bounded_output=False, output_domain="unbounded_scalar")
-    
+
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, ctx.na_reason or "missing_dependency")})
-        
+
     rows = grab_list(ohlc_payload)
     if not rows:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "no_rows")})
-    
-    latest_row = max(rows, key=lambda r: _parse_strict_ts(r, "t"))
-    
+
+    latest_row, latest_row_ts_iso, latest_row_ts_key = _select_latest_payload_row(
+        rows,
+        keys=("t", "timestamp", "time", "date", "datetime", "updated_at", "last_updated", "start", "end"),
+    )
+
     close_val = latest_row.get("close")
-    t_val = latest_row.get("t")
-    
     if close_val is None:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "missing_explicit_close_field")})
-        
-    close_float = safe_float(close_val)
-    ts_float = _parse_strict_ts(latest_row, "t")
 
-    eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
-    prov = _extract_payload_provenance(latest_row)
-    prov.update({"last_ts": t_val, "effective_at_utc": eff_ts, "event_time_utc": eff_ts})
+    close_float = safe_float(close_val)
+    payload_prov = _extract_payload_provenance(ohlc_payload)
+    row_prov = _extract_payload_provenance(latest_row)
+    prov = _merge_provenance_details(payload_prov, row_prov)
+
+    if latest_row_ts_iso is not None:
+        prov["effective_at_utc"] = latest_row_ts_iso
+        prov["event_time_utc"] = latest_row_ts_iso
+        prov["last_ts"] = latest_row.get(latest_row_ts_key) if latest_row_ts_key else latest_row.get("t")
+        payload_keys = dict(prov.get("payload_timestamp_keys") or {})
+        if latest_row_ts_key:
+            payload_keys["event_time"] = latest_row_ts_key
+            payload_keys.setdefault("effective_at", latest_row_ts_key)
+        if payload_keys:
+            prov["payload_timestamp_keys"] = payload_keys
+    else:
+        prov.setdefault("last_ts", latest_row.get("t") or latest_row.get("date") or latest_row.get("timestamp") or latest_row.get("time"))
+        if getattr(ctx, "effective_ts_utc", None) is not None:
+            if prov.get("effective_at_utc") == "INVALID":
+                prov.pop("effective_at_utc", None)
+            if prov.get("event_time_utc") == "INVALID":
+                prov.pop("event_time_utc", None)
+            if prov.get("source_publish_time_utc") == "INVALID":
+                prov.pop("source_publish_time_utc", None)
 
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, prov)})
 
@@ -765,8 +1150,9 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     ts_float = _parse_strict_ts(latest, "date")
     eff_ts = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else "INVALID"
 
-    prov = _extract_payload_provenance(latest)
+    prov = _merge_provenance_details(_extract_payload_provenance(greek_payload), _extract_payload_provenance(latest))
     prov.update({"ts": latest.get("date"), "scale_used": norm_scale, "effective_at_utc": eff_ts, "event_time_utc": eff_ts, "contract_normalization": norm_summary.as_dict()})
+    prov = _sanitize_snapshot_family_provenance(ctx, prov)
     identity = _normalized_identity_for_row(contract_map, latest_idx)
     if identity is not None:
         prov["canonical_contract_key"] = identity.canonical_contract_key
@@ -812,7 +1198,8 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
     else: 
         sign = 1.0 if tot_gamma > 0 else -1.0
 
-    meta = _build_meta(ctx, "extract_gex_sign", lineage, {**_extract_payload_provenance(spot_exposures_payload), "total": tot_gamma, "n_strikes": valid_rows})
+    prov = _sanitize_snapshot_family_provenance(ctx, {**_extract_payload_provenance(spot_exposures_payload), "total": tot_gamma, "n_strikes": valid_rows})
+    meta = _build_meta(ctx, "extract_gex_sign", lineage, prov)
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
@@ -902,7 +1289,7 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         return FeatureBundle({"oi_pressure": None}, {"oi": meta})
 
     pressure = _normalize_balance(weighted_call_oi, weighted_put_oi)
-    meta = _build_meta(ctx, "extract_oi", lineage, {
+    meta = _build_meta(ctx, "extract_oi", lineage, _sanitize_snapshot_family_provenance(ctx, {
         **_extract_payload_provenance(payload),
         "contract_normalization": norm_summary.as_dict(),
         "n_rows": len(rows),
@@ -913,7 +1300,7 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         "weighted_put_oi": weighted_put_oi,
         "spot_reference": spot_ref,
         "weighting": "near_spot_inverse_distance" if spot_ref is not None else "unweighted_call_put_balance",
-    })
+    }))
     return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
 
 def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
@@ -937,7 +1324,7 @@ def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBu
     if val is None or not math.isfinite(val):
         return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, "missing_iv_rank")})
     
-    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, _extract_payload_provenance(payload))})
+    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, _sanitize_snapshot_family_provenance(ctx, _extract_payload_provenance(payload)))})
 
 def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
@@ -969,12 +1356,12 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
     valid_pts.sort(key=lambda x: x[0])
     slope = valid_pts[-1][1] - valid_pts[0][1]
     
-    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)})})
+    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, _sanitize_snapshot_family_provenance(ctx, {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)}))})
 
 def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "vol_skew",
-        "fields_used": ["skew", "risk_reversal", "value"],
+        "fields_used": ["skew", "risk_reversal", "value", "date", "timestamp", "time"],
         "units_expected": "Skew Ratio",
         "normalization": "none",
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
@@ -983,21 +1370,43 @@ def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     }, emitted_units="skew_ratio", raw_input_units="Skew Ratio", bounded_output=False, output_domain="unbounded_scalar")
     if is_na(payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, ctx.na_reason or "missing_dependency")})
-    
+
     rows = grab_list(payload)
     if not rows and isinstance(payload, dict):
         rows = [payload]
-        
+
     if not rows:
         return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "no_rows")})
-        
-    latest = rows[0]
+
+    latest, latest_row_ts_iso, latest_row_ts_key = _select_latest_payload_row(rows)
     skew_val = safe_float(latest.get("skew") or latest.get("risk_reversal") or latest.get("value"))
-    
+
     if skew_val is None or not math.isfinite(skew_val):
         return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "missing_or_invalid_skew")})
-        
-    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, _extract_payload_provenance(payload))})
+
+    payload_prov = _extract_payload_provenance(payload)
+    row_prov = _extract_payload_provenance(latest)
+    prov = _merge_provenance_details(payload_prov, row_prov)
+    if latest_row_ts_iso is not None:
+        prov.setdefault("effective_at_utc", latest_row_ts_iso)
+        prov.setdefault("event_time_utc", latest_row_ts_iso)
+        payload_keys = dict(prov.get("payload_timestamp_keys") or {})
+        if latest_row_ts_key:
+            payload_keys.setdefault("event_time", latest_row_ts_key)
+        if payload_keys:
+            prov["payload_timestamp_keys"] = payload_keys
+        prov["selected_timestamp_value_utc"] = latest_row_ts_iso
+        prov["selected_timestamp_key"] = latest_row_ts_key
+    elif getattr(ctx, "effective_ts_utc", None) is not None:
+        if prov.get("effective_at_utc") == "INVALID":
+            prov.pop("effective_at_utc", None)
+        if prov.get("event_time_utc") == "INVALID":
+            prov.pop("event_time_utc", None)
+        if prov.get("source_publish_time_utc") == "INVALID":
+            prov.pop("source_publish_time_utc", None)
+
+    prov = _sanitize_snapshot_family_provenance(ctx, prov)
+    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, prov)})
 
 def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
@@ -1154,6 +1563,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
         
         if routing_key == "GEX":
             f_bundle = extract_gex_sign(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("gex"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             
@@ -1166,21 +1576,25 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 
         elif routing_key == "FLOW":
             f_bundle = extract_smart_whale_pressure(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("flow"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("flow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "GREEKS":
             f_bundle = extract_dealer_greeks(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("greeks"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("greeks", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "PRICE":
             f_bundle = extract_price_features(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("price"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "OI":
             f_bundle = extract_oi_features(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("oi"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1192,21 +1606,25 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                 
         elif routing_key == "VOL":
             f_bundle = extract_volatility_features(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("vol"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_TERM":
             f_bundle = extract_vol_term_structure(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("vol_ts"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_SKEW":
             f_bundle = extract_vol_skew(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("skew"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "DARKPOOL":
             f_bundle = extract_darkpool_pressure(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("darkpool"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1218,6 +1636,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
 
         elif routing_key == "LITFLOW":
             f_bundle = extract_litflow_pressure(payload, ctx)
+            _log_endpoint_payload_observability(ctx, routing_key, payload, f_bundle.meta.get("litflow"), f_bundle.features)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 

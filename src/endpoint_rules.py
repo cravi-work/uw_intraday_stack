@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,28 @@ class EndpointRule:
     required_any_keys: Optional[Tuple[str, ...]] = None
     required_all_keys: Optional[Tuple[str, ...]] = None
     data_container_keys: Tuple[str, ...] = ("data", "results", "items", "trades", "history")
+
+
+RUNTIME_REQUEST_SHAPE_DEFAULTS: Dict[Tuple[str, str], Dict[str, Any]] = {
+    ("GET", "/api/stock/{ticker}/ohlc/{candle_size}"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/spot-exposures"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/spot-exposures/strike"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/greek-exposure"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/greek-exposure/strike"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/greek-exposure/expiry"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/spot-exposures/expiry-strike"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/flow-per-strike-intraday"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/flow-per-strike"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/oi-per-strike"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/oi-change"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/volatility/term-structure"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/iv-rank"): {"date": "{date}"},
+    ("GET", "/api/stock/{ticker}/historical-risk-reversal-skew"): {"date": "{date}"},
+    ("GET", "/api/darkpool/{ticker}"): {"date": "{date}"},
+    ("GET", "/api/lit-flow/{ticker}"): {"date": "{date}"},
+    ("GET", "/api/market/market-tide"): {"date": "{date}"},
+    ("GET", "/api/market/top-net-impact"): {"date": "{date}"},
+}
 
 RULE_REGISTRY: Dict[Tuple[str, str], EndpointRule] = {}
 
@@ -56,6 +78,7 @@ for p in [
     "/api/stock/{ticker}/oi-per-strike", "/api/stock/{ticker}/oi-change", "/api/stock/{ticker}/option/volume-oi-expiry",
     "/api/stock/{ticker}/option-chains", "/api/stock/{ticker}/option-contracts", "/api/stock/{ticker}/volatility/term-structure",
     "/api/stock/{ticker}/interpolated-iv", "/api/stock/{ticker}/iv-rank", "/api/stock/{ticker}/historical-risk-reversal-skew",
+    "/api/stock/{ticker}/ohlc/{candle_size}",
     "/api/stock/{ticker}/greek-exposure", "/api/stock/{ticker}/greek-exposure/strike", "/api/stock/{ticker}/greek-exposure/expiry",
     "/api/stock/{ticker}/spot-exposures", "/api/stock/{ticker}/spot-exposures/strike", "/api/stock/{ticker}/spot-exposures/expiry-strike",
     "/api/stock/{ticker}/max-pain",
@@ -78,6 +101,39 @@ def get_empty_policy(method: str, path: str, session_label: str) -> EmptyPayload
         raise ValueError(f"Unknown session label: {session_label}. Allowed: {', '.join(allowed)}")
         
     return rule.empty_policy_by_session.get(session_label, EmptyPayloadPolicy.EMPTY_INVALID)
+
+
+def normalize_runtime_query_params(method: str, path: str, params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    norm: Dict[str, Any] = dict(params or {})
+    defaults = RUNTIME_REQUEST_SHAPE_DEFAULTS.get((method.upper(), path), {})
+    for key, value in defaults.items():
+        if key not in norm or norm[key] in (None, ""):
+            norm[key] = value
+
+    # UW endpoints sometimes model boolean-like query flags as numeric (0/1).
+    # In production logs, passing Python bools can serialize to 'true'/'false' and
+    # trigger 400s for certain endpoints (e.g. market-tide interval flags).
+    # We normalize bools to 0/1 to be maximally compatible.
+    for key, value in list(norm.items()):
+        if isinstance(value, bool):
+            norm[key] = 1 if value else 0
+    return norm
+
+
+def required_runtime_query_params(method: str, path: str) -> Tuple[str, ...]:
+    defaults = RUNTIME_REQUEST_SHAPE_DEFAULTS.get((method.upper(), path), {})
+    return tuple(defaults.keys())
+
+
+def validate_runtime_request_shape(method: str, path: str, params: Mapping[str, Any]) -> None:
+    missing = [
+        key for key in required_runtime_query_params(method, path)
+        if key not in params or params[key] in (None, "")
+    ]
+    if missing:
+        raise ValueError(
+            f"Runtime request shape missing required query params for {method.upper()} {path}: {missing}"
+        )
 
 def validate_plan_coverage(plan_yaml: Dict[str, Any]) -> None:
     missing = []
