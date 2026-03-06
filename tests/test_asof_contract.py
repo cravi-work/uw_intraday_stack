@@ -2,7 +2,7 @@ from unittest.mock import Mock
 import datetime as dt
 
 from src.endpoint_rules import EmptyPayloadPolicy
-from src.endpoint_truth import EndpointPayloadClass, EndpointStateRow, FreshnessState, PayloadAssessment, get_endpoint_time_semantics, infer_source_time_hints, resolve_effective_payload, uses_documented_asof_contemporaneous
+from src.endpoint_truth import EndpointPayloadClass, EndpointStateRow, FreshnessState, PayloadAssessment, infer_source_time_hints, resolve_effective_payload
 
 
 def test_resolved_lineage_carries_explicit_time_fields():
@@ -206,6 +206,17 @@ def test_nested_payload_provider_timestamps_reduce_degraded_fallback():
     assert resolved.time_provenance_degraded is False
 
 
+def test_epoch_millis_timestamps_are_normalized_in_source_time_hints():
+    # Some UW endpoints emit epoch timestamps in milliseconds; these must not be dropped.
+    ts_s = 1700000060.0
+    ts_ms = ts_s * 1000.0
+    payload = [{"t": ts_ms, "close": 151.0}]
+
+    hints = infer_source_time_hints(payload_json=payload)
+    assert hints.event_time_utc is not None
+    assert hints.event_time_utc == dt.datetime.fromtimestamp(ts_s, tz=dt.timezone.utc)
+
+
 def test_response_header_publish_time_and_revision_are_used_when_payload_is_timestamp_poor():
     asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
     headers = {
@@ -399,102 +410,3 @@ def test_uw_client_preserves_provider_time_headers_for_downstream_inference():
     assert headers["x-generated-at"] == "2026-01-01T11:59:40+00:00"
     assert headers["x-data-revision"] == "rev-provider-meta"
     assert "ignored" not in headers
-
-
-def test_millisecond_epoch_payload_time_is_inferred_correctly():
-    event_dt = dt.datetime(2026, 1, 1, 11, 59, 40, tzinfo=dt.timezone.utc)
-    payload = {"data": [{"t": int(event_dt.timestamp() * 1000)}]}
-
-    hints = infer_source_time_hints(payload_json=payload)
-
-    assert hints.event_time_utc == event_dt
-
-
-def test_historical_risk_reversal_path_uses_documented_asof_fallback_when_timestamp_poor():
-    asof_utc = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
-    assessment = PayloadAssessment(
-        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
-        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
-        is_empty=False,
-        changed=True,
-        error_reason=None,
-    )
-
-    resolved = resolve_effective_payload(
-        current_event_id="evt-skew-asof",
-        current_ts_raw=asof_utc,
-        assessment=assessment,
-        prev_state=None,
-        as_of_time_raw=asof_utc,
-        documented_asof_contemporaneous=uses_documented_asof_contemporaneous("/api/stock/{ticker}/historical-risk-reversal-skew"),
-    )
-
-    assert resolved.effective_ts_utc == asof_utc
-    assert resolved.effective_time_source == "documented_asof_contemporaneous"
-    assert resolved.timestamp_quality == "DEGRADED"
-    assert resolved.time_provenance_degraded is True
-
-
-def test_snapshot_family_reclassifies_out_of_window_provider_time_to_documented_asof():
-    asof_utc = dt.datetime(2026, 3, 5, 15, 0, tzinfo=dt.timezone.utc)
-    semantics = get_endpoint_time_semantics("/api/stock/{ticker}/greek-exposure")
-    assessment = PayloadAssessment(
-        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
-        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
-        is_empty=False,
-        changed=True,
-        error_reason=None,
-    )
-
-    resolved = resolve_effective_payload(
-        current_event_id="evt-greeks",
-        current_ts_raw=asof_utc,
-        assessment=assessment,
-        prev_state=None,
-        as_of_time_raw=asof_utc,
-        received_at_raw=asof_utc,
-        processed_at_raw=asof_utc,
-        source_event_time_raw=asof_utc - dt.timedelta(hours=8),
-        documented_asof_contemporaneous=semantics.documented_asof_contemporaneous,
-        max_trusted_source_age_seconds=semantics.max_trusted_source_age_seconds,
-        time_semantics_family=semantics.family,
-    )
-
-    assert resolved.effective_ts_utc == asof_utc
-    assert resolved.effective_time_source == "documented_asof_contemporaneous"
-    assert resolved.timestamp_quality == "DEGRADED"
-    assert resolved.time_provenance_degraded is True
-    assert resolved.lagged is True
-    assert "provider_time_out_of_window" in (resolved.na_reason or "")
-
-
-def test_snapshot_family_keeps_recent_provider_time_inside_trust_window():
-    asof_utc = dt.datetime(2026, 3, 5, 15, 0, tzinfo=dt.timezone.utc)
-    semantics = get_endpoint_time_semantics("/api/stock/{ticker}/oi-per-strike")
-    recent_event_time = asof_utc - dt.timedelta(minutes=30)
-    assessment = PayloadAssessment(
-        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
-        empty_policy=EmptyPayloadPolicy.EMPTY_IS_DATA,
-        is_empty=False,
-        changed=True,
-        error_reason=None,
-    )
-
-    resolved = resolve_effective_payload(
-        current_event_id="evt-oi",
-        current_ts_raw=asof_utc,
-        assessment=assessment,
-        prev_state=None,
-        as_of_time_raw=asof_utc,
-        received_at_raw=asof_utc,
-        processed_at_raw=asof_utc,
-        source_event_time_raw=recent_event_time,
-        documented_asof_contemporaneous=semantics.documented_asof_contemporaneous,
-        max_trusted_source_age_seconds=semantics.max_trusted_source_age_seconds,
-        time_semantics_family=semantics.family,
-    )
-
-    assert resolved.effective_ts_utc == recent_event_time
-    assert resolved.effective_time_source == "event_time"
-    assert resolved.timestamp_quality == "VALID"
-    assert resolved.time_provenance_degraded is False

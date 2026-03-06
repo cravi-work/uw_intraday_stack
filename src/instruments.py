@@ -165,6 +165,11 @@ class ContractNormalizationSummary:
 
     def as_dict(self) -> Dict[str, Any]:
         sample_keys = [r.identity.canonical_contract_key for r in self.normalized_rows[:5]]
+        inferred_standard_contract_count = sum(
+            1
+            for r in self.results
+            if r.status == "NORMALIZED" and bool((r.details or {}).get("inferred_standard_contract"))
+        )
         return {
             "status": self.status,
             "required_row_count": self.required_row_count,
@@ -172,6 +177,7 @@ class ContractNormalizationSummary:
             "invalid_row_count": self.invalid_row_count,
             "adjusted_contract_count": self.adjusted_contract_count,
             "duplicate_contract_keys": self.duplicate_contract_keys,
+            "inferred_standard_contract_count": inferred_standard_contract_count,
             "failure_reason": self.failure_reason,
             "series_conflicts": list(self.series_conflicts or []),
             "sample_contract_keys": sample_keys,
@@ -346,8 +352,28 @@ def normalize_option_contract(
     if normalized_deliverable is not None and (not deliverable_repr or deliverable_repr == _default_deliverable_repr(100.0)):
         deliverable_repr = _default_deliverable_repr(normalized_deliverable)
 
+    explicit_adjusted = _extract_adjustment_flag(row)
+    inferred_standard_contract = False
+
+    # Live provider payloads sometimes omit both multiplier and deliverable information for
+    # *standard* contracts. If the row is not explicitly adjusted, infer a standard
+    # 100-share contract shape so decision-eligible features remain operational.
+    #
+    # If the row is explicitly adjusted, we must reject (cannot safely infer).
     if normalized_multiplier is None or normalized_deliverable is None:
-        return _invalid_result(row_index, source_fields, "missing_multiplier", {"source_symbol": source_symbol})
+        if explicit_adjusted:
+            return _invalid_result(
+                row_index,
+                source_fields,
+                "missing_multiplier",
+                {"source_symbol": source_symbol, "explicit_adjusted": True},
+            )
+
+        inferred_standard_contract = True
+        normalized_multiplier = normalized_multiplier or 100.0
+        normalized_deliverable = normalized_deliverable or 100.0
+        if not deliverable_repr:
+            deliverable_repr = _default_deliverable_repr(float(normalized_deliverable))
     if normalized_multiplier <= 0 or normalized_deliverable <= 0:
         return _invalid_result(
             row_index,
@@ -360,7 +386,6 @@ def normalize_option_contract(
             },
         )
 
-    explicit_adjusted = _extract_adjustment_flag(row)
     adjustment_flag = bool(
         explicit_adjusted
         or not math.isclose(normalized_multiplier, 100.0, rel_tol=0.0, abs_tol=1e-9)
@@ -394,7 +419,11 @@ def normalize_option_contract(
         row_index=row_index,
         relevant=True,
         source_fields=tuple(source_fields),
-        details={"source_symbol": source_symbol} if source_symbol else {},
+        details={
+            **({"source_symbol": source_symbol} if source_symbol else {}),
+            "explicit_adjusted": explicit_adjusted,
+            **({"inferred_standard_contract": True} if inferred_standard_contract else {}),
+        },
     )
 
 

@@ -165,7 +165,7 @@ def test_unparseable_display_symbol_suppresses_greek_metric():
 
 
 
-def test_missing_multiplier_suppresses_contract_level_oi_metric():
+def test_missing_multiplier_infers_standard_contract_for_oi_metric():
     ctx = _mock_ctx()
     payload = [
         {
@@ -177,6 +177,28 @@ def test_missing_multiplier_suppresses_contract_level_oi_metric():
         }
     ]
 
+    bundle = extract_oi_features(payload, ctx)
+
+    assert bundle.features["oi_pressure"] == pytest.approx(1.0)
+    assert bundle.meta["oi"]["na_reason"] is None
+    assert bundle.meta["oi"]["details"]["contract_normalization"]["status"] == "NORMALIZED"
+    assert bundle.meta["oi"]["details"]["contract_normalization"]["inferred_standard_contract_count"] == 1
+
+
+def test_missing_multiplier_with_explicit_adjusted_is_rejected():
+    # If a contract is explicitly adjusted but missing multiplier/deliverables, we must not infer.
+    ctx = _mock_ctx()
+    payload = [
+        {
+            "ticker": "XYZ",
+            "expiration": "2026-03-20",
+            "strike": 100.0,
+            "type": "call",
+            "oi": 10,
+            "adjusted": True,
+            # intentionally omit multiplier/deliverables
+        }
+    ]
     bundle = extract_oi_features(payload, ctx)
 
     assert bundle.features["oi_pressure"] is None

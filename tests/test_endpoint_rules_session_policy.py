@@ -19,7 +19,12 @@ def test_canonical_session_labels():
     # Test P_STRUCTURAL endpoint
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "RTH") == EmptyPayloadPolicy.EMPTY_INVALID
     assert get_empty_policy("GET", "/api/stock/{ticker}/max-pain", "AFTERHOURS") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
+
+    # OHLC candles: empty is invalid during RTH (should exist), but treated as stale outside RTH.
     assert get_empty_policy("GET", "/api/stock/{ticker}/ohlc/{candle_size}", "RTH") == EmptyPayloadPolicy.EMPTY_INVALID
+    assert get_empty_policy("GET", "/api/stock/{ticker}/ohlc/{candle_size}", "PREMARKET") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
+    assert get_empty_policy("GET", "/api/stock/{ticker}/ohlc/{candle_size}", "AFTERHOURS") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
+    assert get_empty_policy("GET", "/api/stock/{ticker}/ohlc/{candle_size}", "CLOSED") == EmptyPayloadPolicy.EMPTY_MEANS_STALE
 
 def test_legacy_session_labels_explicit_failure(caplog):
     """

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.endpoint_truth import EndpointContext
-from src.features import extract_dealer_greeks, extract_gex_sign, extract_price_features, extract_smart_whale_pressure, extract_vol_skew
+from src.features import extract_price_features, extract_smart_whale_pressure
 
 
 @pytest.fixture
@@ -46,6 +46,39 @@ def test_payload_valid_timestamp_priority(mock_ctx):
     assert lineage["as_of_time"] == mock_ctx.as_of_time_utc.isoformat()
 
 
+def test_payload_epoch_millis_timestamp_is_supported(mock_ctx):
+    """Some UW endpoints emit epoch timestamps in milliseconds; those must not lose effective_ts_utc."""
+    ts_s = 1700000000.0
+    payload = [{"close": 150.0, "t": ts_s * 1000.0}]
+
+    bundle = extract_price_features(payload, mock_ctx)
+    lineage = bundle.meta["price"]["metric_lineage"]
+
+    expected_iso = dt.datetime.fromtimestamp(ts_s, tz=dt.timezone.utc).isoformat()
+    assert lineage["timestamp_source"] == "payload_effective_time"
+    assert lineage["timestamp_quality"] == "VALID"
+    assert lineage["effective_ts_utc"] == expected_iso
+
+
+def test_payload_candle_start_end_time_timestamp_is_supported(mock_ctx):
+    """UW OHLC Candle objects commonly provide `start_time`/`end_time` ISO8601 timestamps."""
+    payload = [
+        {
+            "close": 150.0,
+            "start_time": "2026-03-05T14:31:00Z",
+            "end_time": "2026-03-05T14:32:00Z",
+        }
+    ]
+
+    bundle = extract_price_features(payload, mock_ctx)
+    lineage = bundle.meta["price"]["metric_lineage"]
+
+    assert lineage["timestamp_source"] == "payload_effective_time"
+    assert lineage["timestamp_quality"] == "VALID"
+    assert lineage["effective_ts_utc"] == "2026-03-05T14:32:00+00:00"
+    assert lineage["event_time"] == "2026-03-05T14:32:00+00:00"
+
+
 def test_missing_provider_timestamp_is_explicitly_degraded(mock_ctx):
     payload = [{"premium": 15000.0, "dte": 5.0, "side": "ASK", "put_call": "CALL"}]
     bundle = extract_smart_whale_pressure(payload, mock_ctx)
@@ -68,112 +101,3 @@ def test_malformed_payload_timestamp_keeps_feature(mock_ctx):
     assert lineage["timestamp_source"] == "payload_effective_time"
     assert lineage["timestamp_quality"] == "INVALID"
     assert lineage["effective_ts_utc"] is None
-
-
-def test_price_feature_uses_row_date_when_t_is_missing(mock_ctx):
-    payload = [{"close": 151.25, "date": "2026-01-01T10:00:30+00:00"}]
-    bundle = extract_price_features(payload, mock_ctx)
-
-    lineage = bundle.meta["price"]["metric_lineage"]
-    assert bundle.features["spot"] == 151.25
-    assert lineage["effective_ts_utc"] == "2026-01-01T10:00:30+00:00"
-    assert lineage["event_time"] == "2026-01-01T10:00:30+00:00"
-    assert lineage["timestamp_quality"] == "VALID"
-
-
-def test_price_feature_preserves_context_effective_time_when_row_timestamp_is_invalid(mock_ctx):
-    mock_ctx.effective_ts_utc = dt.datetime(2026, 1, 1, 10, 0, 45, tzinfo=dt.timezone.utc)
-    mock_ctx.event_time_utc = mock_ctx.effective_ts_utc
-    mock_ctx.effective_time_source = "event_time"
-    mock_ctx.timestamp_quality = "VALID"
-    mock_ctx.time_provenance_degraded = False
-
-    payload = [{"close": 150.0, "t": "invalid_date_string"}]
-    bundle = extract_price_features(payload, mock_ctx)
-
-    lineage = bundle.meta["price"]["metric_lineage"]
-    assert bundle.features["spot"] == 150.0
-    assert lineage["effective_ts_utc"] == mock_ctx.effective_ts_utc.isoformat()
-    assert lineage["timestamp_source"] == "event_time"
-    assert lineage["timestamp_quality"] == "VALID"
-
-
-def test_vol_skew_uses_latest_row_timestamp_when_available(mock_ctx):
-    payload = {
-        "history": [
-            {"value": 0.11, "date": "2026-01-01T09:59:00+00:00"},
-            {"value": 0.19, "date": "2026-01-01T10:00:30+00:00"},
-        ]
-    }
-    bundle = extract_vol_skew(payload, mock_ctx)
-
-    lineage = bundle.meta["skew"]["metric_lineage"]
-    assert bundle.features["vol_skew"] == 0.19
-    assert lineage["effective_ts_utc"] == "2026-01-01T10:00:30+00:00"
-    assert bundle.meta["skew"]["details"]["selected_timestamp_key"] == "date"
-
-
-def test_vol_skew_uses_context_degraded_effective_time_when_payload_is_timestamp_poor(mock_ctx):
-    mock_ctx.effective_ts_utc = dt.datetime(2026, 1, 1, 10, 1, 0, tzinfo=dt.timezone.utc)
-    mock_ctx.effective_time_source = "documented_asof_contemporaneous"
-    mock_ctx.timestamp_quality = "DEGRADED"
-    mock_ctx.time_provenance_degraded = True
-
-    payload = {"history": [{"value": 0.13}]}
-    bundle = extract_vol_skew(payload, mock_ctx)
-
-    lineage = bundle.meta["skew"]["metric_lineage"]
-    assert bundle.features["vol_skew"] == 0.13
-    assert lineage["effective_ts_utc"] == mock_ctx.effective_ts_utc.isoformat()
-    assert lineage["timestamp_source"] == "documented_asof_contemporaneous"
-    assert lineage["timestamp_quality"] == "DEGRADED"
-
-
-def test_dealer_greeks_snapshot_family_reclassifies_stale_row_timestamp_to_context(mock_ctx):
-    mock_ctx.effective_ts_utc = dt.datetime(2026, 3, 5, 15, 0, tzinfo=dt.timezone.utc)
-    mock_ctx.event_time_utc = mock_ctx.effective_ts_utc
-    mock_ctx.effective_time_source = "documented_asof_contemporaneous"
-    mock_ctx.timestamp_quality = "DEGRADED"
-    mock_ctx.time_provenance_degraded = True
-    mock_ctx.lagged = True
-    mock_ctx.time_semantics_family = "greeks_snapshot"
-    mock_ctx.max_trusted_source_age_seconds = 7200
-
-    payload = [
-        {
-            "gamma_exposure": 1500000.0,
-            "vanna_exposure": 250000.0,
-            "charm_exposure": -125000.0,
-            "date": "2026-03-05T03:00:00+00:00",
-        }
-    ]
-    bundle = extract_dealer_greeks(payload, mock_ctx)
-    lineage = bundle.meta["greeks"]["metric_lineage"]
-
-    assert lineage["effective_ts_utc"] == mock_ctx.effective_ts_utc.isoformat()
-    assert lineage["timestamp_source"] == "documented_asof_contemporaneous"
-    assert lineage["time_provenance_degraded"] is True
-    assert bundle.meta["greeks"]["details"]["reclassified_snapshot_family"] == "greeks_snapshot"
-
-
-def test_gex_snapshot_family_reclassifies_stale_payload_timestamp_to_context(mock_ctx):
-    mock_ctx.effective_ts_utc = dt.datetime(2026, 3, 5, 15, 0, tzinfo=dt.timezone.utc)
-    mock_ctx.event_time_utc = mock_ctx.effective_ts_utc
-    mock_ctx.effective_time_source = "documented_asof_contemporaneous"
-    mock_ctx.timestamp_quality = "DEGRADED"
-    mock_ctx.time_provenance_degraded = True
-    mock_ctx.lagged = True
-    mock_ctx.time_semantics_family = "gex_snapshot"
-    mock_ctx.max_trusted_source_age_seconds = 7200
-
-    payload = [
-        {"gamma_exposure": 100.0, "date": "2026-03-05T04:00:00+00:00"},
-        {"gamma_exposure": 50.0, "date": "2026-03-05T04:05:00+00:00"},
-    ]
-    bundle = extract_gex_sign(payload, mock_ctx)
-    lineage = bundle.meta["gex"]["metric_lineage"]
-
-    assert bundle.features["net_gex_sign"] == 1.0
-    assert lineage["effective_ts_utc"] == mock_ctx.effective_ts_utc.isoformat()
-    assert lineage["timestamp_source"] == "documented_asof_contemporaneous"
-    assert bundle.meta["gex"]["details"]["reclassified_snapshot_family"] == "gex_snapshot"

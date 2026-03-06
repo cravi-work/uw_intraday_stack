@@ -30,12 +30,7 @@ from .logging_config import log_prediction_decision, structured_log
 from .scheduler import ET, UTC, coerce_session_state, floor_to_interval, get_market_hours
 from .storage import DbWriter
 from .uw_client import UwClient
-from .endpoint_rules import (
-    EmptyPayloadPolicy,
-    normalize_runtime_query_params,
-    validate_plan_coverage,
-    validate_runtime_request_shape,
-)
+from .endpoint_rules import EmptyPayloadPolicy, validate_plan_coverage
 from .features import extract_all
 from .models import (
     bounded_additive_score,
@@ -60,11 +55,9 @@ from .endpoint_truth import (
     NaReasonCode,
     PayloadAssessment,
     classify_payload, 
-    get_endpoint_time_semantics,
     infer_source_time_hints,
     resolve_effective_payload, 
-    to_utc_dt,
-    uses_documented_asof_contemporaneous,
+    to_utc_dt
 )
 from .freshness_policy import (
     FeatureDecisionReason,
@@ -75,33 +68,6 @@ from .ood import OODAssessment, assess_operational_ood, resolve_ood_policy
 from .calibration_registry import CalibrationSelectionResult, resolve_calibration_regime, select_calibration_artifact
 
 logger = logging.getLogger(__name__)
-
-
-# --- Endpoint payload observability helpers ---
-_PROVIDER_TIME_SOURCES = {"effective_time", "event_time", "source_publish_time"}
-
-
-def _provider_timestamp_found(effective_time_source: Optional[str]) -> bool:
-    return bool(effective_time_source) and effective_time_source in _PROVIDER_TIME_SOURCES
-
-
-def _payload_row_count(payload: Any) -> Optional[int]:
-    """Best-effort row-count for heterogeneous endpoint payloads.
-
-    Used only for observability / lineage (NOT for gating).
-    """
-    if payload is None:
-        return 0
-    if isinstance(payload, list):
-        return len(payload)
-    if isinstance(payload, dict):
-        for k in ("data", "results", "rows", "trades", "candles", "items", "result"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return len(v)
-        return 0 if len(payload) == 0 else 1
-    return None
-
 
 @dataclass(frozen=True)
 class PlannedCall:
@@ -476,23 +442,13 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
             )
             if entry["purpose"] == "disabled":
                 continue
-            normalized_query_params = normalize_runtime_query_params(
-                entry["method"],
-                entry["path"],
-                entry["query_params"],
-            )
-            validate_runtime_request_shape(
-                entry["method"],
-                entry["path"],
-                normalized_query_params,
-            )
             planned.append(
                 PlannedCall(
                     entry["name"],
                     entry["method"],
                     entry["path"],
                     entry["path_params"],
-                    normalized_query_params,
+                    entry["query_params"],
                     market,
                     entry["purpose"],
                     entry["decision_path"],
@@ -575,7 +531,37 @@ async def fetch_all(
     async def _one(tkr: str, c: PlannedCall, pp: Dict[str, Any], qp: Dict[str, Any]):
         async with sem:
             sig, res, cb = await client.request(c.method, c.path, path_params=pp, query_params=qp)
-            return (tkr, c, sig, qp, res, cb)
+
+            # Known live behavior: /api/market/market-tide can return HTTP 422 when the optional
+            # 'date' parameter is supplied (e.g., some accounts/dates do not support same-day).
+            # Since this endpoint is context-only, a single safe retry without 'date' is allowed.
+            qp_used = qp
+            try:
+                status_code = getattr(res, "status_code", None)
+            except Exception:
+                status_code = None
+
+            if c.name == "market_tide" and status_code == 422 and isinstance(qp, dict) and "date" in qp:
+                qp2 = dict(qp)
+                original_date = qp2.pop("date", None)
+                logger.warning(
+                    "market_tide returned 422 with date parameter; retrying once without date",
+                    extra={
+                        "event": "market_tide_date_fallback_retry",
+                        "ticker": tkr,
+                        "original_date": original_date,
+                    },
+                )
+                sig2, res2, cb2 = await client.request(c.method, c.path, path_params=pp, query_params=qp2)
+                try:
+                    status2 = getattr(res2, "status_code", None)
+                except Exception:
+                    status2 = None
+                if status2 is not None and status2 < 400:
+                    sig, res, cb = sig2, res2, cb2
+                    qp_used = qp2
+
+            return (tkr, c, sig, qp_used, res, cb)
 
     for tkr in sorted(tickers):
         for c in core:
@@ -1723,6 +1709,11 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                     prev_state = db.get_endpoint_state(con, tkr, endpoint_id)
                     prev_hash = prev_state.last_payload_hash if prev_state else None
                     
+                    attempt_ts_utc = to_utc_dt(
+                        res.received_at_utc,
+                        fallback=to_utc_dt(res.requested_at_utc, fallback=dt.datetime.now(UTC))
+                    )
+
                     source_time_hints = infer_source_time_hints(
                         payload_json=getattr(res, "payload_json", None),
                         response_headers=getattr(res, "response_headers", None),
@@ -1730,6 +1721,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         explicit_publish_time_raw=getattr(res, "source_publish_time_utc", None),
                         explicit_effective_time_raw=getattr(res, "effective_time_utc", None),
                         explicit_revision=getattr(res, "source_revision", None),
+                        reference_utc=attempt_ts_utc,
                     )
 
                     event_id = db.insert_raw_event(
@@ -1740,11 +1732,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         source_revision=source_time_hints.source_revision,
                     )
 
-                    attempt_ts_utc = to_utc_dt(
-                        res.received_at_utc, 
-                        fallback=to_utc_dt(res.requested_at_utc, fallback=dt.datetime.now(UTC))
-                    )
-                    
                     assessment = classify_payload(res, prev_hash, call.method, call.path, sess_str)
 
                     is_success_class = (
@@ -1758,7 +1745,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         attempt_ts_utc, is_success_class, is_changed
                     )
 
-                    time_semantics = get_endpoint_time_semantics(call.path)
                     resolved = resolve_effective_payload(
                         str(event_id), asof_utc, assessment, prev_state,
                         fallback_max_age_seconds=fallback_max_age_seconds,
@@ -1770,9 +1756,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         processed_at_raw=attempt_ts_utc,
                         as_of_time_raw=asof_utc,
                         source_revision=source_time_hints.source_revision,
-                        documented_asof_contemporaneous=time_semantics.documented_asof_contemporaneous,
-                        max_trusted_source_age_seconds=time_semantics.max_trusted_source_age_seconds,
-                        time_semantics_family=time_semantics.family,
                     )
                     
                     enforced_freshness = resolved.freshness_state
@@ -1870,8 +1853,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                             decision_path=call.decision_path,
                             missing_affects_confidence=call.missing_affects_confidence,
                             stale_affects_confidence=call.stale_affects_confidence,
-                            time_semantics_family=time_semantics.family,
-                            max_trusted_source_age_seconds=time_semantics.max_trusted_source_age_seconds,
                             purpose_contract_version=call.purpose_contract_version,
                         )
                         contexts[endpoint_id] = ctx
@@ -1912,8 +1893,6 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                                 "timestamp_quality": ctx.timestamp_quality,
                                 "lagged": ctx.lagged,
                                 "time_provenance_degraded": ctx.time_provenance_degraded,
-                                "payload_row_count": _payload_row_count(eff_payload),
-                                "provider_timestamp_found": _provider_timestamp_found(ctx.effective_time_source),
                                 "source_revision": ctx.source_revision,
                             }
                         )

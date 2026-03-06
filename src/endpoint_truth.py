@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Optional, List, Dict, Any, Tuple, Mapping, Sequence
 from collections import deque
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 import datetime
 import math
 
@@ -77,17 +78,7 @@ class EndpointContext:
     decision_path: Optional[bool] = None
     missing_affects_confidence: Optional[bool] = None
     stale_affects_confidence: Optional[bool] = None
-    time_semantics_family: Optional[str] = None
-    max_trusted_source_age_seconds: Optional[int] = None
     purpose_contract_version: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class EndpointTimeSemantics:
-    family: str = "default"
-    documented_asof_contemporaneous: bool = False
-    max_trusted_source_age_seconds: Optional[int] = None
-    lagged: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,23 +131,24 @@ class SourceTimeHints:
 
 PAYLOAD_EVENT_TIME_KEYS: Tuple[str, ...] = (
     "event_time", "event_at", "executed_at", "trade_time", "occurred_at",
-    "timestamp", "time", "t", "ts", "date", "datetime", "date_time",
-    "updated_at", "last_updated", "created_at", "start", "end",
+    "timestamp", "time", "t", "date", "updated_at", "last_updated",
+    # Common Candle schema fields (e.g., UW OHLC endpoints)
+    "start_time", "end_time", "startTime", "endTime",
     "eventTime", "executedAt", "tradeTime", "occurredAt", "lastUpdated",
-    "createdAt", "dateTime", "quoteTime", "quote_time", "snapshotDate",
-    "snapshot_date", "event_timestamp", "eventTimestamp", "trade_timestamp", "tradeTimestamp",
+    "event_timestamp", "eventTimestamp", "trade_timestamp", "tradeTimestamp",
 )
 PAYLOAD_PUBLISH_TIME_KEYS: Tuple[str, ...] = (
     "source_publish_time", "source_publish_time_utc", "published_at",
-    "publish_time", "report_time", "report_date", "generated_at", "created_at",
-    "publishedAt", "publishTime", "reportTime", "generatedAt", "createdAt",
+    "publish_time", "report_time", "report_date", "generated_at",
+    "publishedAt", "publishTime", "reportTime", "generatedAt",
     "generated_time", "generatedTime", "publication_time", "publicationTime",
 )
 PAYLOAD_EFFECTIVE_TIME_KEYS: Tuple[str, ...] = (
     "effective_at", "effective_ts", "effective_ts_utc", "effective_time", "as_of",
     "effectiveAt", "effectiveTs", "effectiveTime", "as_of_time", "asOf",
     "asOfTime", "snapshot_time", "snapshotTime", "snapshot_at", "snapshotAt",
-    "snapshot_date", "snapshotDate", "current_date", "currentDate",
+    # Common Candle schema fields (e.g., UW OHLC endpoints)
+    "start_time", "end_time", "startTime", "endTime",
 )
 PAYLOAD_SOURCE_REVISION_KEYS: Tuple[str, ...] = (
     "source_revision", "revision", "rev", "version", "sequence_id", "update_id",
@@ -176,120 +168,23 @@ RESPONSE_HEADER_REVISION_KEYS: Tuple[str, ...] = (
     "x-source-revision", "x-revision", "etag", "x-version", "x-data-revision",
 )
 
-DOCUMENTED_ASOF_CONTEMPORANEOUS_PATHS: Tuple[str, ...] = (
-    "/api/stock/{ticker}/historical-risk-reversal-skew",
-    "/api/stock/{ticker}/spot-exposures",
-    "/api/stock/{ticker}/spot-exposures/strike",
-    "/api/stock/{ticker}/spot-exposures/expiry-strike",
-    "/api/stock/{ticker}/greek-exposure",
-    "/api/stock/{ticker}/greek-exposure/strike",
-    "/api/stock/{ticker}/greek-exposure/expiry",
-    "/api/stock/{ticker}/oi-per-strike",
-    "/api/stock/{ticker}/oi-change",
-    "/api/stock/{ticker}/iv-rank",
-    "/api/stock/{ticker}/volatility/term-structure",
-)
 
-
-ENDPOINT_TIME_SEMANTICS: Dict[str, EndpointTimeSemantics] = {
-    "/api/stock/{ticker}/spot-exposures": EndpointTimeSemantics(
-        family="gex_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/spot-exposures/strike": EndpointTimeSemantics(
-        family="gex_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/spot-exposures/expiry-strike": EndpointTimeSemantics(
-        family="gex_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/greek-exposure": EndpointTimeSemantics(
-        family="greeks_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/greek-exposure/strike": EndpointTimeSemantics(
-        family="greeks_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/greek-exposure/expiry": EndpointTimeSemantics(
-        family="greeks_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/oi-per-strike": EndpointTimeSemantics(
-        family="oi_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/oi-change": EndpointTimeSemantics(
-        family="oi_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/iv-rank": EndpointTimeSemantics(
-        family="vol_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/volatility/term-structure": EndpointTimeSemantics(
-        family="vol_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-    "/api/stock/{ticker}/historical-risk-reversal-skew": EndpointTimeSemantics(
-        family="vol_snapshot",
-        documented_asof_contemporaneous=True,
-        max_trusted_source_age_seconds=7200,
-        lagged=True,
-    ),
-}
-
-
-def get_endpoint_time_semantics(path: Optional[str]) -> EndpointTimeSemantics:
-    if not path:
-        return EndpointTimeSemantics()
-    return ENDPOINT_TIME_SEMANTICS.get(str(path), EndpointTimeSemantics())
-
-
-def uses_documented_asof_contemporaneous(path: Optional[str]) -> bool:
-    return bool(get_endpoint_time_semantics(path).documented_asof_contemporaneous)
+# Many Unusual Whales endpoints emit ISO timestamps without timezone offsets. In practice these
+# represent exchange time (America/New_York). We only apply this assumption when parsing provider
+# payload timestamps (not internal asof/received/processed timestamps).
+_DEFAULT_PROVIDER_NAIVE_TZ = "America/New_York"
 
 
 def _normalize_contract_key(key: Any) -> str:
     return "".join(ch for ch in str(key).lower() if ch.isalnum())
 
 
-def _normalize_epoch_seconds(value: float) -> Optional[float]:
-    if not math.isfinite(float(value)):
-        return None
-    epoch_value = float(value)
-    magnitude = abs(epoch_value)
-    if magnitude >= 1e17:
-        epoch_value /= 1_000_000_000.0
-    elif magnitude >= 1e14:
-        epoch_value /= 1_000_000.0
-    elif magnitude >= 1e11:
-        epoch_value /= 1_000.0
-    return epoch_value
-
-
-def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
+def _coerce_optional_utc_dt(
+    x: Any,
+    *,
+    reference_utc: Optional[datetime.datetime] = None,
+    assume_naive_tz: Optional[str] = None,
+) -> Optional[datetime.datetime]:
     if x is None:
         return None
     if isinstance(x, datetime.datetime):
@@ -297,44 +192,82 @@ def _coerce_optional_utc_dt(x: Any) -> Optional[datetime.datetime]:
             return x.replace(tzinfo=datetime.timezone.utc)
         return x.astimezone(datetime.timezone.utc)
     if isinstance(x, (int, float)):
-        epoch_value = _normalize_epoch_seconds(float(x))
-        if epoch_value is None:
+        if not math.isfinite(float(x)):
             return None
         try:
-            return datetime.datetime.fromtimestamp(epoch_value, datetime.timezone.utc)
-        except (OverflowError, OSError, ValueError):
+            ts = float(x)
+            abs_ts = abs(ts)
+
+            # Some Unusual Whales endpoints emit UNIX epoch timestamps in milliseconds (or higher precision).
+            # Normalize to seconds so provider timestamps are not silently lost.
+            if abs_ts > 1e14:
+                # Likely microseconds or nanoseconds.
+                ts = ts / (1e9 if abs_ts > 1e17 else 1e6)
+            elif abs_ts > 1e11:
+                # Likely milliseconds.
+                ts = ts / 1e3
+
+            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+            # Plausibility guard: avoid treating non-time numeric fields (e.g., strikes) as timestamps.
+            if dt.year < 1990 or dt.year > 2100:
+                return None
+            return dt
+        except (OverflowError, ValueError, OSError):
             return None
     if isinstance(x, str):
         raw = x.strip()
         if not raw:
             return None
         try:
-            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-            else:
-                parsed = parsed.astimezone(datetime.timezone.utc)
-            return parsed
+            dt_obj = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+            if dt_obj.tzinfo is None:
+                # Naive string timestamps are ambiguous. For internal timestamps we keep the existing
+                # default assumption (UTC). For provider payload timestamps we allow the caller to
+                # supply an exchange/local timezone, and when a reference timestamp exists we choose
+                # the interpretation that is closest to that reference.
+                if not assume_naive_tz:
+                    dt_obj = dt_obj.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    cand_utc = dt_obj.replace(tzinfo=datetime.timezone.utc)
+                    cand_local = dt_obj.replace(tzinfo=ZoneInfo(assume_naive_tz)).astimezone(datetime.timezone.utc)
+                    if reference_utc is not None and reference_utc.tzinfo is not None:
+                        ref = reference_utc.astimezone(datetime.timezone.utc)
+                        dt_obj = cand_local if abs(ref - cand_local) < abs(ref - cand_utc) else cand_utc
+                    else:
+                        dt_obj = cand_local
+
+            dt_obj = dt_obj.astimezone(datetime.timezone.utc)
+            if dt_obj.year < 1990 or dt_obj.year > 2100:
+                return None
+            return dt_obj
         except ValueError:
             try:
                 parsed = parsedate_to_datetime(raw)
                 if parsed is not None:
                     if parsed.tzinfo is None:
                         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-                    return parsed.astimezone(datetime.timezone.utc)
+                    parsed = parsed.astimezone(datetime.timezone.utc)
+                    if parsed.year < 1990 or parsed.year > 2100:
+                        return None
+                    return parsed
             except (TypeError, ValueError, OverflowError, IndexError):
                 pass
             try:
-                epoch_value = _normalize_epoch_seconds(float(raw))
-                if epoch_value is None:
-                    return None
-                return datetime.datetime.fromtimestamp(epoch_value, datetime.timezone.utc)
-            except (TypeError, ValueError, OverflowError, OSError):
+                return _coerce_optional_utc_dt(float(raw))
+            except (TypeError, ValueError, OverflowError):
                 return None
     return None
 
 
-def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, max_nodes: int = 256) -> Optional[datetime.datetime]:
+def _find_best_nested_timestamp(
+    payload: Any,
+    candidate_keys: Sequence[str],
+    *,
+    reference_utc: Optional[datetime.datetime] = None,
+    assume_naive_tz: Optional[str] = None,
+    max_nodes: int = 256,
+) -> Optional[datetime.datetime]:
     if payload is None:
         return None
     keyset = {_normalize_contract_key(k) for k in candidate_keys}
@@ -348,7 +281,7 @@ def _find_best_nested_timestamp(payload: Any, candidate_keys: Sequence[str], *, 
         if isinstance(current, Mapping):
             for key, value in current.items():
                 if _normalize_contract_key(key) in keyset:
-                    dt_val = _coerce_optional_utc_dt(value)
+                    dt_val = _coerce_optional_utc_dt(value, reference_utc=reference_utc, assume_naive_tz=assume_naive_tz)
                     if dt_val is not None and (best_dt is None or dt_val > best_dt):
                         best_dt = dt_val
             for value in current.values():
@@ -404,6 +337,8 @@ def infer_source_time_hints(
     explicit_publish_time_raw: Any = None,
     explicit_effective_time_raw: Any = None,
     explicit_revision: Optional[str] = None,
+    reference_utc: Optional[datetime.datetime] = None,
+    provider_naive_tz: str = _DEFAULT_PROVIDER_NAIVE_TZ,
 ) -> SourceTimeHints:
     headers = _normalize_response_headers(response_headers)
     normalized_headers = {
@@ -412,30 +347,69 @@ def infer_source_time_hints(
         if value not in (None, "")
     }
 
-    explicit_event = _coerce_optional_utc_dt(explicit_event_time_raw)
-    explicit_publish = _coerce_optional_utc_dt(explicit_publish_time_raw)
-    explicit_effective = _coerce_optional_utc_dt(explicit_effective_time_raw)
+    explicit_event = _coerce_optional_utc_dt(
+        explicit_event_time_raw,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
+    explicit_publish = _coerce_optional_utc_dt(
+        explicit_publish_time_raw,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
+    explicit_effective = _coerce_optional_utc_dt(
+        explicit_effective_time_raw,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
 
-    payload_event = _find_best_nested_timestamp(payload_json, PAYLOAD_EVENT_TIME_KEYS)
-    payload_publish = _find_best_nested_timestamp(payload_json, PAYLOAD_PUBLISH_TIME_KEYS)
-    payload_effective = _find_best_nested_timestamp(payload_json, PAYLOAD_EFFECTIVE_TIME_KEYS)
+    payload_event = _find_best_nested_timestamp(
+        payload_json,
+        PAYLOAD_EVENT_TIME_KEYS,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
+    payload_publish = _find_best_nested_timestamp(
+        payload_json,
+        PAYLOAD_PUBLISH_TIME_KEYS,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
+    payload_effective = _find_best_nested_timestamp(
+        payload_json,
+        PAYLOAD_EFFECTIVE_TIME_KEYS,
+        reference_utc=reference_utc,
+        assume_naive_tz=provider_naive_tz,
+    )
     payload_revision = _find_first_nested_value(payload_json, PAYLOAD_SOURCE_REVISION_KEYS)
 
     header_event = None
     for key in RESPONSE_HEADER_EVENT_KEYS:
-        header_event = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        header_event = _coerce_optional_utc_dt(
+            normalized_headers.get(_normalize_contract_key(key)),
+            reference_utc=reference_utc,
+            assume_naive_tz=provider_naive_tz,
+        )
         if header_event is not None:
             break
 
     header_publish = None
     for key in RESPONSE_HEADER_PUBLISH_KEYS:
-        header_publish = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        header_publish = _coerce_optional_utc_dt(
+            normalized_headers.get(_normalize_contract_key(key)),
+            reference_utc=reference_utc,
+            assume_naive_tz=provider_naive_tz,
+        )
         if header_publish is not None:
             break
 
     header_effective = None
     for key in RESPONSE_HEADER_EFFECTIVE_KEYS:
-        header_effective = _coerce_optional_utc_dt(normalized_headers.get(_normalize_contract_key(key)))
+        header_effective = _coerce_optional_utc_dt(
+            normalized_headers.get(_normalize_contract_key(key)),
+            reference_utc=reference_utc,
+            assume_naive_tz=provider_naive_tz,
+        )
         if header_effective is not None:
             break
 
@@ -478,44 +452,12 @@ def _resolve_source_time(
     effective_time_raw: Any,
     as_of_time: datetime.datetime,
     documented_asof_contemporaneous: bool,
-    max_trusted_source_age_seconds: Optional[int] = None,
-    time_semantics_family: Optional[str] = None,
 ) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], Optional[datetime.datetime], Optional[str], str, bool, Optional[str]]:
     event_time = _coerce_optional_utc_dt(source_event_time_raw)
     source_publish_time = _coerce_optional_utc_dt(source_publish_time_raw)
     explicit_effective_time = _coerce_optional_utc_dt(effective_time_raw)
 
-    def _reclassify_out_of_window(
-        candidate_ts: Optional[datetime.datetime],
-        *,
-        source_name: str,
-    ) -> Optional[Tuple[Optional[datetime.datetime], Optional[datetime.datetime], Optional[datetime.datetime], Optional[str], str, bool, Optional[str]]]:
-        if candidate_ts is None or not documented_asof_contemporaneous:
-            return None
-        if max_trusted_source_age_seconds is None:
-            return None
-        age_seconds = int((as_of_time - candidate_ts).total_seconds())
-        if age_seconds <= max_trusted_source_age_seconds:
-            return None
-        family = str(time_semantics_family or "snapshot")
-        reason = _merge_reason(
-            NaReasonCode.TIME_PROVENANCE_DEGRADED.value,
-            f"{family}_provider_time_out_of_window:{age_seconds}s_gt_{max_trusted_source_age_seconds}s",
-        )
-        return (
-            as_of_time,
-            event_time,
-            source_publish_time,
-            "documented_asof_contemporaneous",
-            "DEGRADED",
-            True,
-            reason,
-        )
-
     if explicit_effective_time is not None:
-        reclassified = _reclassify_out_of_window(explicit_effective_time, source_name="payload_effective_time")
-        if reclassified is not None:
-            return reclassified
         return (
             explicit_effective_time,
             event_time,
@@ -527,9 +469,6 @@ def _resolve_source_time(
         )
 
     if event_time is not None:
-        reclassified = _reclassify_out_of_window(event_time, source_name="event_time")
-        if reclassified is not None:
-            return reclassified
         return (
             event_time,
             event_time,
@@ -541,9 +480,6 @@ def _resolve_source_time(
         )
 
     if source_publish_time is not None:
-        reclassified = _reclassify_out_of_window(source_publish_time, source_name="source_publish_time")
-        if reclassified is not None:
-            return reclassified
         return (
             source_publish_time,
             event_time,
@@ -731,8 +667,6 @@ def resolve_effective_payload(
     as_of_time_raw: Any = None,
     source_revision: Optional[str] = None,
     documented_asof_contemporaneous: bool = False,
-    max_trusted_source_age_seconds: Optional[int] = None,
-    time_semantics_family: Optional[str] = None,
 ) -> ResolvedLineage:
     current_ts = to_utc_dt(current_ts_raw, fallback=datetime.datetime.now(datetime.timezone.utc))
     as_of_time = to_utc_dt(as_of_time_raw, fallback=current_ts)
@@ -748,8 +682,6 @@ def resolve_effective_payload(
             effective_time_raw=effective_time_raw,
             as_of_time=as_of_time,
             documented_asof_contemporaneous=documented_asof_contemporaneous,
-            max_trusted_source_age_seconds=max_trusted_source_age_seconds,
-            time_semantics_family=time_semantics_family,
         )
         resolved = _build_resolved_lineage(
             used_event_id=current_event_id,
@@ -766,7 +698,7 @@ def resolve_effective_payload(
             source_revision=source_revision,
             effective_time_source=source_name,
             timestamp_quality=ts_quality,
-            lagged=bool(source_name == "documented_asof_contemporaneous"),
+            lagged=False,
             time_provenance_degraded=degraded,
         )
         return _enforce_invariants(resolved)
