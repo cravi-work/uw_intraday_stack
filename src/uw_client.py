@@ -10,7 +10,23 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Tuple, Union, List
 
 import httpx
-from aiolimiter import AsyncLimiter
+# aiolimiter is used in production for polite API rate limiting.
+# The kata/test environment may not have the dependency installed, so we provide
+# a tiny no-op fallback to keep pure-Python unit tests runnable.
+try:
+    from aiolimiter import AsyncLimiter  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    class AsyncLimiter:  # noqa: D401
+        """No-op async context manager fallback for environments without aiolimiter."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
 
 from .api_catalog_loader import ApiCatalogError, EndpointRegistry
 

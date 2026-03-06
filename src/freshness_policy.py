@@ -180,58 +180,32 @@ _ENDPOINT_POLICIES: Tuple[EndpointFreshnessPolicy, ...] = (
         time_provenance_degraded_behavior=PolicyAction.DEGRADE,
     ),
     EndpointFreshnessPolicy(
-        name="gex_session_snapshot",
-        path_patterns=(
-            "/api/stock/{ticker}/spot-exposures",
-            "/api/stock/{ticker}/spot-exposures/strike",
-            "/api/stock/{ticker}/spot-exposures/expiry-strike",
-        ),
-        max_tolerated_age_seconds=5400,
-        join_skew_tolerance_seconds=5400,
-        criticality=EndpointCriticality.CRITICAL,
-        lag_class=LagClass.SNAPSHOT,
-        stale_behavior=PolicyAction.DEGRADE,
-        carry_forward_behavior=PolicyAction.DEGRADE,
-        time_provenance_degraded_behavior=PolicyAction.DEGRADE,
-    ),
-    EndpointFreshnessPolicy(
-        name="greeks_session_snapshot",
-        path_patterns=(
-            "/api/stock/{ticker}/greek-exposure",
-            "/api/stock/{ticker}/greek-exposure/strike",
-            "/api/stock/{ticker}/greek-exposure/expiry",
-        ),
-        max_tolerated_age_seconds=5400,
-        join_skew_tolerance_seconds=5400,
-        criticality=EndpointCriticality.CRITICAL,
-        lag_class=LagClass.SNAPSHOT,
-        stale_behavior=PolicyAction.DEGRADE,
-        carry_forward_behavior=PolicyAction.DEGRADE,
-        time_provenance_degraded_behavior=PolicyAction.DEGRADE,
-    ),
-    EndpointFreshnessPolicy(
-        name="oi_session_snapshot",
+        name="options_snapshot",
         path_patterns=(
             "/api/stock/{ticker}/oi-per-strike",
             "/api/stock/{ticker}/oi-change",
-        ),
-        max_tolerated_age_seconds=5400,
-        join_skew_tolerance_seconds=5400,
-        criticality=EndpointCriticality.CRITICAL,
-        lag_class=LagClass.SNAPSHOT,
-        stale_behavior=PolicyAction.DEGRADE,
-        carry_forward_behavior=PolicyAction.DEGRADE,
-        time_provenance_degraded_behavior=PolicyAction.DEGRADE,
-    ),
-    EndpointFreshnessPolicy(
-        name="vol_session_snapshot",
-        path_patterns=(
+            "/api/stock/{ticker}/spot-exposures",
+            "/api/stock/{ticker}/spot-exposures/strike",
+            "/api/stock/{ticker}/spot-exposures/expiry-strike",
+            "/api/stock/{ticker}/greek-exposure",
+            "/api/stock/{ticker}/greek-exposure/strike",
+            "/api/stock/{ticker}/greek-exposure/expiry",
             "/api/stock/{ticker}/iv-rank",
             "/api/stock/{ticker}/volatility/term-structure",
             "/api/stock/{ticker}/historical-risk-reversal-skew",
         ),
-        max_tolerated_age_seconds=5400,
-        join_skew_tolerance_seconds=5400,
+        # Unusual Whales "snapshot" endpoints (OI, vol surfaces, exposures) often update
+        # at session cadence rather than true intraday cadence. During LIVE runs this means a
+        # valid snapshot can be ~15-72h old (prior session / weekend) even though the payload
+        # itself is "fresh" (200 OK) and structurally valid.
+        #
+        # If we keep a tight join-skew (e.g., 1.5h), the engine will drop these inputs and can
+        # end up with near-zero feature coverage, triggering OOD + risk-gate blocks.
+        #
+        # Guardrail: we still reject extremely old snapshots (weeks/months) by bounding the
+        # allowable join-skew/age window.
+        max_tolerated_age_seconds=7 * 24 * 3600,
+        join_skew_tolerance_seconds=7 * 24 * 3600,
         criticality=EndpointCriticality.NON_CRITICAL,
         lag_class=LagClass.SNAPSHOT,
         stale_behavior=PolicyAction.DEGRADE,

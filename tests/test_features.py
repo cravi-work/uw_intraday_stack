@@ -58,3 +58,26 @@ def test_canonical_session_applicability_tokens():
     flow_meta = f_bundle_flow.meta["flow"]
     flow_sessions = flow_meta["metric_lineage"]["session_applicability"].split("/")
     assert set(flow_sessions) == {"RTH"}
+
+
+def test_smart_whale_pressure_empty_payload_emits_neutral_zero_with_degraded_meta():
+    """Empty flow payloads should not hard-block LIVE; emit neutral 0 with degraded meta."""
+    ctx = EndpointContext(
+        endpoint_id=1,
+        method="GET",
+        path="/api/stock/{ticker}/flow-recent",
+        operation_id="opt",
+        signature="GET /api/stock/{ticker}/flow-recent",
+        used_event_id=None,
+        payload_class="SUCCESS_HAS_DATA",
+        freshness_state="FRESH",
+        stale_age_min=None,
+        na_reason=None,
+    )
+
+    bundle = extract_smart_whale_pressure([], ctx)
+    assert bundle.features["smart_whale_pressure"] == 0.0
+    meta = bundle.meta["flow"]
+    assert meta.get("freshness_state") == "EMPTY_VALID"
+    assert meta.get("details", {}).get("confidence_impact") == "DEGRADED"
+    assert meta.get("details", {}).get("status") == "computed_neutral_from_empty"

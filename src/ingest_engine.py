@@ -516,6 +516,49 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
     return path_params, query_params
 
+def _market_tide_retry_query_params(initial: Optional[Dict[str, Any]]) -> list[Optional[Dict[str, Any]]]:
+    """Build a small, deterministic retry sequence for `/api/market/market-tide`.
+
+    UW has historically changed query param contracts for this endpoint (e.g.,
+    `interval_5m=true` deprecation, or rejecting explicit `date=` for the
+    current session). When we receive a client error, we retry with progressively
+    simpler query param sets.
+
+    Order:
+      1) drop `interval_5m`
+      2) drop `date`
+      3) no query params
+
+    Returns a list of query_params dicts (or None) to try in order.
+    """
+
+    if not initial:
+        return []
+
+    qp: Dict[str, Any] = dict(initial)
+    retries: list[Optional[Dict[str, Any]]] = []
+
+    if 'interval_5m' in qp:
+        qp1 = dict(qp)
+        qp1.pop('interval_5m', None)
+        retries.append(qp1 or None)
+        qp = qp1
+
+    if 'date' in qp:
+        qp2 = dict(qp)
+        qp2.pop('date', None)
+        retry = qp2 or None
+        if not retries or retries[-1] != retry:
+            retries.append(retry)
+        qp = qp2
+
+    # Ensure we always end at "no query params" for a final attempt.
+    if not retries or retries[-1] is not None:
+        retries.append(None)
+
+    return retries
+
+
 async def fetch_all(
     client: UwClient, 
     tickers: List[str], 
@@ -541,25 +584,35 @@ async def fetch_all(
             except Exception:
                 status_code = None
 
-            if c.name == "market_tide" and status_code == 422 and isinstance(qp, dict) and "date" in qp:
-                qp2 = dict(qp)
-                original_date = qp2.pop("date", None)
-                logger.warning(
-                    "market_tide returned 422 with date parameter; retrying once without date",
-                    extra={
-                        "event": "market_tide_date_fallback_retry",
-                        "ticker": tkr,
-                        "original_date": original_date,
-                    },
-                )
-                sig2, res2, cb2 = await client.request(c.method, c.path, path_params=pp, query_params=qp2)
-                try:
-                    status2 = getattr(res2, "status_code", None)
-                except Exception:
-                    status2 = None
-                if status2 is not None and status2 < 400:
-                    sig, res, cb = sig2, res2, cb2
-                    qp_used = qp2
+            if c.name == "market_tide" and status_code in (400, 422) and isinstance(qp, dict) and qp:
+                for qp_retry in _market_tide_retry_query_params(qp):
+                    if qp_retry == qp:
+                        continue
+                    logger.warning(
+                        "market_tide client error; retrying with adjusted query params",
+                        extra={
+                            "event": "market_tide_query_param_retry",
+                            "ticker": tkr,
+                            "orig_status_code": status_code,
+                            "orig_query_params": qp,
+                            "retry_query_params": qp_retry,
+                        },
+                    )
+                    sig2, res2, cb2 = await client.request(
+                        c.method,
+                        c.path,
+                        path_params=pp,
+                        query_params=(qp_retry or {}),
+                    )
+                    try:
+                        status2 = getattr(res2, "status_code", None)
+                    except Exception:
+                        status2 = None
+                    if status2 is not None and status2 < 400:
+                        sig, res, cb = sig2, res2, cb2
+                        qp_used = (qp_retry or {})
+                        break
+
 
             return (tkr, c, sig, qp_used, res, cb)
 

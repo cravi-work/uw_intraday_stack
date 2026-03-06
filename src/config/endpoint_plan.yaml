@@ -213,36 +213,24 @@ plans:
       <<: *signal_critical_contract
       method: GET
       path: /api/stock/{ticker}/greek-exposure/strike
-      path_params: {}
-      query_params:
-        date: "{date}"
 
     - name: greek-exposure-expiry
       purpose: signal-critical
       <<: *signal_critical_contract
       method: GET
       path: /api/stock/{ticker}/greek-exposure/expiry
-      path_params: {}
-      query_params:
-        date: "{date}"
 
     - name: spot-exposures-expiry-strike
       purpose: signal-critical
       <<: *signal_critical_contract
       method: GET
       path: /api/stock/{ticker}/spot-exposures/expiry-strike
-      path_params: {}
-      query_params:
-        date: "{date}"
 
     - name: flow-per-strike
       purpose: signal-critical
       <<: *signal_critical_contract
       method: GET
       path: /api/stock/{ticker}/flow-per-strike
-      path_params: {}
-      query_params:
-        date: "{date}"
 
     - name: flow-alerts
       purpose: disabled
@@ -267,9 +255,6 @@ plans:
       <<: *signal_critical_contract
       method: GET
       path: /api/stock/{ticker}/historical-risk-reversal-skew
-      path_params: {}
-      query_params:
-        date: "{date}"
 
   market_context:
     - name: market_tide
@@ -280,7 +265,6 @@ plans:
       path_params: {}
       query_params:
         date: "{date}"
-        interval_5m: true
 
     - name: economic_calendar
       purpose: context-only
@@ -295,9 +279,6 @@ plans:
       <<: *non_decision_contract
       method: GET
       path: /api/market/top-net-impact
-      path_params: {}
-      query_params:
-        date: "{date}"
 
     - name: market-total-options-volume
       purpose: context-only

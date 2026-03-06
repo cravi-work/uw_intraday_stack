@@ -706,8 +706,26 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
     if not trades:
-        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, {**_extract_payload_provenance(flow_payload), "status": "computed_zero_from_empty_valid", "n_trades": 0})
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
+        # Neutral (0.0) when the endpoint returns an empty set.
+        #
+        # Rationale: returning None here can hard-block LIVE predictions when flow endpoints
+        # intermittently return empty payloads (common near open or for quieter tickers).
+        # A neutral value preserves safety (no directional signal) while meta marks the
+        # confidence impact as degraded.
+        meta = _build_meta(
+            ctx,
+            "extract_smart_whale_pressure",
+            lineage,
+            {
+                **_extract_payload_provenance(flow_payload),
+                "status": "computed_neutral_from_empty",
+                "n_trades": 0,
+                "confidence_impact": "DEGRADED",
+            },
+        )
+        meta["freshness_state"] = "EMPTY_VALID"
+        meta["na_reason"] = "empty_payload"
+        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
     norm_summary = normalize_option_rows(trades)
     if norm_summary.status == "INVALID":
@@ -773,14 +791,14 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
 
     if valid_count == 0:
         details.update({
-            "status": "filtered_zero_treated_as_unknown",
+            "status": "computed_neutral_no_trades_met_thresholds",
             "skipped_threshold": skip_threshold,
             "confidence_impact": "DEGRADED",
         })
         meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, details)
         meta["freshness_state"] = "EMPTY_VALID"
         meta["na_reason"] = "no_trades_met_policy_thresholds"
-        return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
+        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
 
     net = whale_call - whale_put
     details.update({"net_prem": net, "n_valid": valid_count})

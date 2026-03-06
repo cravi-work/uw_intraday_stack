@@ -7,6 +7,7 @@ from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 import datetime
 import math
+import re
 
 from .endpoint_rules import EmptyPayloadPolicy, EndpointRule, get_empty_policy, get_endpoint_rule
 
@@ -174,6 +175,16 @@ RESPONSE_HEADER_REVISION_KEYS: Tuple[str, ...] = (
 # payload timestamps (not internal asof/received/processed timestamps).
 _DEFAULT_PROVIDER_NAIVE_TZ = "America/New_York"
 
+# NOTE:
+# Some UW endpoints return rows keyed by a field named "date" that is **not** a payload
+# as-of time (e.g., option expiry date). If we treat those nested date-only values as
+# effective timestamps, we can produce impossibly stale "effective_ts_utc" (hundreds of
+# days) and drop otherwise-usable snapshot features.
+#
+# We therefore ignore **nested** date-only values under the key "date" when inferring
+# payload timestamps. Top-level (or shallow) date-only "date" fields remain eligible.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def _normalize_contract_key(key: Any) -> str:
     return "".join(ch for ch in str(key).lower() if ch.isalnum())
@@ -218,6 +229,19 @@ def _coerce_optional_utc_dt(
         raw = x.strip()
         if not raw:
             return None
+
+        # Numeric epoch values sometimes arrive as strings (e.g., "1700003600000").
+        # Treat purely-numeric strings as unix epochs (s/ms), falling back to date parsing
+        # only when epoch coercion fails plausibility checks.
+        if raw.replace(".", "", 1).isdigit():
+            try:
+                num = float(raw)
+            except (TypeError, ValueError):
+                num = None
+            if num is not None:
+                dt_num = _coerce_optional_utc_dt(num, reference_utc=reference_utc, assume_naive_tz=assume_naive_tz)
+                if dt_num is not None:
+                    return dt_num
         try:
             dt_obj = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
@@ -271,26 +295,31 @@ def _find_best_nested_timestamp(
     if payload is None:
         return None
     keyset = {_normalize_contract_key(k) for k in candidate_keys}
-    queue = deque([payload])
+    # Track depth so we can ignore nested date-only values under a 'date' key (commonly
+    # option expiry dates, not payload as-of timestamps).
+    queue = deque([(payload, 0)])
     seen = 0
     best_dt: Optional[datetime.datetime] = None
 
     while queue and seen < max_nodes:
-        current = queue.popleft()
+        current, depth = queue.popleft()
         seen += 1
         if isinstance(current, Mapping):
             for key, value in current.items():
-                if _normalize_contract_key(key) in keyset:
+                nk = _normalize_contract_key(key)
+                if nk in keyset:
+                    if nk == 'date' and depth >= 2 and isinstance(value, str) and _DATE_ONLY_RE.match(value.strip()):
+                        continue
                     dt_val = _coerce_optional_utc_dt(value, reference_utc=reference_utc, assume_naive_tz=assume_naive_tz)
                     if dt_val is not None and (best_dt is None or dt_val > best_dt):
                         best_dt = dt_val
             for value in current.values():
                 if isinstance(value, (Mapping, list, tuple)):
-                    queue.append(value)
+                    queue.append((value, depth + 1))
         elif isinstance(current, (list, tuple)):
             for value in current[:32]:
                 if isinstance(value, (Mapping, list, tuple)):
-                    queue.append(value)
+                    queue.append((value, depth + 1))
     return best_dt
 
 
