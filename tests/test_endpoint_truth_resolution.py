@@ -132,3 +132,39 @@ def test_empty_means_stale_no_prior():
     assert resolved.freshness_state == FreshnessState.ERROR
     assert resolved.used_event_id is None
     assert resolved.na_reason == NaReasonCode.NO_PRIOR_SUCCESS.value
+
+
+def test_documented_asof_fallback_marks_time_provenance_degraded():
+    """If provider time is missing, documented-asof fallback should keep packet usable.
+
+    This is only enabled per-endpoint via the endpoint plan. We validate the
+    core resolver behavior here.
+    """
+
+    current_ts = datetime.datetime(2026, 3, 6, 20, 30, tzinfo=datetime.timezone.utc)
+
+    assessment = PayloadAssessment(
+        payload_class=EndpointPayloadClass.SUCCESS_HAS_DATA,
+        empty_policy=EmptyPayloadPolicy.EMPTY_INVALID,
+        is_empty=False,
+        changed=True,
+        error_reason=None,
+    )
+
+    resolved = resolve_effective_payload(
+        current_event_id="curr_doc_asof",
+        current_ts_raw=current_ts,
+        assessment=assessment,
+        prev_state=None,
+        source_event_time_raw=None,
+        source_publish_time_raw=None,
+        effective_time_raw=None,
+        received_at_raw=current_ts,
+        processed_at_raw=current_ts,
+        as_of_time_raw=current_ts,
+        documented_asof_contemporaneous=True,
+    )
+
+    assert resolved.effective_ts_utc == current_ts
+    assert resolved.timestamp_quality == "DEGRADED"
+    assert resolved.time_provenance_degraded is True

@@ -82,6 +82,12 @@ class PlannedCall:
     missing_affects_confidence: bool = True
     stale_affects_confidence: bool = True
     purpose_contract_version: str = "v1"
+    # Some endpoints are documented as "as-of" snapshots but do not expose a
+    # machine-readable provider timestamp (payload or headers). When enabled,
+    # we allow the request as-of time to stand in as the effective timestamp
+    # (marked DEGRADED) rather than dropping the packet for
+    # missing_effective_timestamp.
+    documented_asof_contemporaneous: bool = False
 
 
 def _require_mapping(mapping: Dict[str, Any], key: str, path: str) -> Dict[str, Any]:
@@ -455,6 +461,7 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
                     entry["missing_affects_confidence"],
                     entry["stale_affects_confidence"],
                     entry["purpose_contract_version"],
+                    bool(entry.get("documented_asof_contemporaneous", False)),
                 )
             )
         return planned
@@ -1126,12 +1133,17 @@ def generate_predictions(
         assessments_by_feature[assessment.feature_key] = assessment
 
         if assessment.normalized_future_ts:
+            drift_sec = (
+                assessment.future_drift_seconds
+                if getattr(assessment, "future_drift_seconds", None) is not None
+                else (0 if assessment.delta_seconds is None else abs(int(assessment.delta_seconds)))
+            )
             logger.info(
                 f"normalized_future_ts: {assessment.feature_key} timestamp clamped to {asof_utc.isoformat()}",
                 extra={
                     "counter": "normalized_future_ts_count",
                     "feature_key": assessment.feature_key,
-                    "drift_sec": 0 if assessment.delta_seconds is None else abs(int(assessment.delta_seconds)),
+                    "drift_sec": drift_sec,
                 },
             )
             meta = f.setdefault("meta_json", {})
@@ -1139,6 +1151,9 @@ def generate_predictions(
             metric_lineage["effective_ts_utc"] = asof_utc.isoformat()
             details = meta.setdefault("details", {})
             details["clamped_future_ts"] = True
+            if drift_sec is not None:
+                details["clamped_future_drift_seconds"] = drift_sec
+            details["clamped_future_ts_degraded"] = bool(assessment.degraded)
             normalized_future_ts_features.append(assessment.feature_key)
 
         if assessment.include_in_scoring:
@@ -1654,7 +1669,22 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
     invalid_after_seconds = val_cfg["invalid_after_minutes"] * 60
 
     now_et = dt.datetime.now(ET)
-    asof_et = floor_to_interval(now_et, int(cfg["ingestion"]["cadence_minutes"]))
+
+    # `cadence_minutes` controls how often the pipeline is scheduled to run.
+    # `asof_rounding_minutes` controls how the prediction snapshot (as-of) time is chosen.
+    #
+    # In live operation, most vendor endpoints return "latest" data. If the process starts
+    # mid-cadence and we floor `asof` to the cadence bucket, much of that "latest" data can
+    # legitimately appear "from the future" relative to the snapshot, which correctly triggers
+    # look-ahead protections and suppresses signals.
+    #
+    # Allow operators to use minute-level snapshots (or any configured rounding) without
+    # changing the job schedule cadence.
+    cadence_minutes = int(cfg["ingestion"].get("cadence_minutes", 5))
+    asof_rounding_minutes = int(cfg["ingestion"].get("asof_rounding_minutes", cadence_minutes))
+    if asof_rounding_minutes <= 0:
+        asof_rounding_minutes = cadence_minutes
+    asof_et = floor_to_interval(now_et, asof_rounding_minutes)
     asof_utc = asof_et.astimezone(UTC)
 
     hours = get_market_hours(asof_et.date(), cfg["ingestion"])
@@ -1774,7 +1804,17 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         explicit_publish_time_raw=getattr(res, "source_publish_time_utc", None),
                         explicit_effective_time_raw=getattr(res, "effective_time_utc", None),
                         explicit_revision=getattr(res, "source_revision", None),
-                        reference_utc=attempt_ts_utc,
+                        # Anchor provider-time inference to the *prediction as-of time*.
+                        #
+                        # Rationale:
+                        # - We may fetch endpoints a few minutes after the as-of bucket boundary
+                        #   (scheduler drift / queueing).
+                        # - Several vendor endpoints return "latest" rows whose timestamps can
+                        #   be newer than the snapshot as-of timestamp.
+                        # - If we infer provider time relative to wall-clock receive time, we can
+                        #   accidentally select a provider timestamp that is > asof_utc and then
+                        #   later fail the as-of contract with future_ts violations.
+                        reference_utc=asof_utc,
                     )
 
                     event_id = db.insert_raw_event(
@@ -1809,6 +1849,7 @@ def _ingest_once_impl(cfg: Dict[str, Any], catalog_path: str, config_path: str) 
                         processed_at_raw=attempt_ts_utc,
                         as_of_time_raw=asof_utc,
                         source_revision=source_time_hints.source_revision,
+                        documented_asof_contemporaneous=call.documented_asof_contemporaneous,
                     )
                     
                     enforced_freshness = resolved.freshness_state

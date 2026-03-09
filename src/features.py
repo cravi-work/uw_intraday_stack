@@ -4,6 +4,7 @@ import copy
 import datetime
 import logging
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Mapping, Iterable
 from dataclasses import dataclass
 
@@ -20,8 +21,95 @@ from .logging_config import structured_log
 
 logger = logging.getLogger(__name__)
 
+# Some UW endpoints only provide a daily "date" (no timestamp). For those snapshot-style
+# metrics we allow a deterministic default to midnight UTC of the provided date.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 _grab_list = grab_list 
 _as_float = safe_float 
+
+
+def _parse_utc_dt(value: Any) -> Optional[datetime.datetime]:
+    """Best-effort coercion of payload time values to timezone-aware UTC datetimes."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        dt = value
+    elif isinstance(value, datetime.date):
+        dt = datetime.datetime(value.year, value.month, value.day)
+    elif isinstance(value, (int, float)):
+        # Treat as epoch seconds.
+        try:
+            dt = datetime.datetime.fromtimestamp(float(value), tz=datetime.timezone.utc)
+        except Exception:
+            return None
+    elif isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # Accept trailing Z.
+        s = s.replace("Z", "+00:00")
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+        except Exception:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return dt
+
+
+def _infer_daily_snapshot_effective_ts_utc(payload: Any) -> Optional[datetime.datetime]:
+    """Infer an effective timestamp for snapshot endpoints that only return a date.
+
+    Heuristic (intentionally narrow and deterministic):
+    - Prefer a top-level "date" when present.
+    - Otherwise look at the first row in a common container.
+    - Only apply when the value is date-only (YYYY-MM-DD), and default to midnight UTC.
+    """
+
+    def _coerce_date_only(val: Any) -> Optional[datetime.datetime]:
+        if not isinstance(val, str):
+            return None
+        s = val.strip()
+        if not _DATE_ONLY_RE.match(s):
+            return None
+        dt = _parse_utc_dt(s)
+        if dt is None:
+            return None
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if isinstance(payload, dict):
+        # 1) Top-level date
+        top = _coerce_date_only(payload.get("date"))
+        if top is not None:
+            return top
+        for k in ("as_of", "asof", "snapshot_date", "snapshotDate"):
+            top = _coerce_date_only(payload.get(k))
+            if top is not None:
+                return top
+
+        # 2) First row in common containers
+        for container_key in ("data", "results", "result", "items"):
+            rows = payload.get(container_key)
+            if isinstance(rows, list) and rows:
+                first = rows[0]
+                if isinstance(first, dict):
+                    row_date = _coerce_date_only(first.get("date"))
+                    if row_date is not None:
+                        return row_date
+
+    elif isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            row_date = _coerce_date_only(first.get("date"))
+            if row_date is not None:
+                return row_date
+    return None
 
 class FeatureRow(TypedDict):
     feature_key: str
@@ -405,6 +493,130 @@ def _normalize_put_call(value: Any) -> Optional[str]:
         return "PUT"
     return None
 
+
+def _extract_call_put_totals(payload: Any) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+    """Best-effort extraction of aggregate call/put open-interest totals.
+
+    Some vendor endpoints return OI as a single summary object (no per-contract rows and/or
+    no put/call field). In those cases we can still compute a directional imbalance if we can
+    locate aggregate call/put totals.
+    """
+
+    prov: Dict[str, Any] = {"totals_source": None, "call_total_key": None, "put_total_key": None}
+
+    def _maybe_float(x: Any) -> Optional[float]:
+        f = safe_float(x)
+        if f is None or not math.isfinite(f):
+            return None
+        return f
+
+    # Candidate containers to scan (shallow).
+    containers: List[Tuple[str, Any]] = [("payload", payload)]
+    if isinstance(payload, dict):
+        for k in ("data", "result", "results", "summary", "totals"):
+            if k in payload:
+                containers.append((k, payload.get(k)))
+
+    # Lowercase key candidates.
+    call_keys = (
+        "call_open_interest",
+        "calls_open_interest",
+        "call_oi",
+        "calls_oi",
+        "calloi",
+        "callopeninterest",
+        "call_openinterest",
+        "callopen_interest",
+        "calloi_total",
+        "call_open_interest_total",
+        "calloiTotal".lower(),
+        "callOpenInterest".lower(),
+    )
+    put_keys = (
+        "put_open_interest",
+        "puts_open_interest",
+        "put_oi",
+        "puts_oi",
+        "putoi",
+        "putopeninterest",
+        "put_openinterest",
+        "putopen_interest",
+        "putoi_total",
+        "put_open_interest_total",
+        "putoiTotal".lower(),
+        "putOpenInterest".lower(),
+    )
+
+    def _scan_mapping(m: Dict[str, Any], label: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+        lower_map = {str(k).lower(): k for k in m.keys()}
+
+        call_val = None
+        call_key_used = None
+        for ck in call_keys:
+            k = lower_map.get(ck)
+            if k is None:
+                continue
+            call_val = _maybe_float(m.get(k))
+            if call_val is not None:
+                call_key_used = str(k)
+                break
+
+        put_val = None
+        put_key_used = None
+        for pk in put_keys:
+            k = lower_map.get(pk)
+            if k is None:
+                continue
+            put_val = _maybe_float(m.get(k))
+            if put_val is not None:
+                put_key_used = str(k)
+                break
+
+        # Nested shape: {"calls": {"open_interest": ...}, "puts": {...}}
+        if call_val is None:
+            calls_obj = m.get(lower_map.get("calls")) or m.get(lower_map.get("call"))
+            if isinstance(calls_obj, dict):
+                nested = {str(k).lower(): k for k in calls_obj.keys()}
+                for nk in ("open_interest", "openinterest", "oi"):
+                    kk = nested.get(nk)
+                    if kk is None:
+                        continue
+                    call_val = _maybe_float(calls_obj.get(kk))
+                    if call_val is not None:
+                        call_key_used = f"{lower_map.get('calls') or lower_map.get('call')}.{kk}"
+                        break
+
+        if put_val is None:
+            puts_obj = m.get(lower_map.get("puts")) or m.get(lower_map.get("put"))
+            if isinstance(puts_obj, dict):
+                nested = {str(k).lower(): k for k in puts_obj.keys()}
+                for nk in ("open_interest", "openinterest", "oi"):
+                    kk = nested.get(nk)
+                    if kk is None:
+                        continue
+                    put_val = _maybe_float(puts_obj.get(kk))
+                    if put_val is not None:
+                        put_key_used = f"{lower_map.get('puts') or lower_map.get('put')}.{kk}"
+                        break
+
+        return call_val, put_val, call_key_used, put_key_used
+
+    for label, obj in containers:
+        if not isinstance(obj, dict):
+            continue
+        call_val, put_val, call_key_used, put_key_used = _scan_mapping(obj, label)
+        if call_val is not None and put_val is not None:
+            prov.update({
+                "totals_source": label,
+                "call_total_key": call_key_used,
+                "put_total_key": put_key_used,
+            })
+            return call_val, put_val, prov
+
+    # Nothing found.
+    prov["totals_source"] = "not_found"
+    return None, None, prov
+
 def _build_contract_normalization_failure_bundle(
     ctx: EndpointContext,
     extractor_name: str,
@@ -644,7 +856,27 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
             or 0.0
         )
     
-    latest_row = max(rows, key=_row_ts)
+    # As-of contract: when running an as-of snapshot (rounded bucket), the vendor payload can
+    # include candles newer than ctx.as_of_time_utc (e.g., if the fetch happens a few minutes
+    # after the bucket boundary). We must not select a candle whose timestamp is after the
+    # snapshot as-of time.
+    asof_ts: Optional[float] = None
+    if getattr(ctx, "as_of_time_utc", None) is not None:
+        try:
+            asof_ts = float(ctx.as_of_time_utc.timestamp())
+        except Exception:
+            asof_ts = None
+
+    eligible_rows = rows
+    if asof_ts is not None:
+        eligible_rows = [r for r in rows if (ts := _row_ts(r)) and ts <= asof_ts]
+        if not eligible_rows:
+            # If nothing is at-or-before as-of (e.g., as-of before market open), fall back to
+            # the latest row to preserve prior behaviour while still surfacing the mismatch via
+            # downstream as-of validation.
+            eligible_rows = rows
+
+    latest_row = max(eligible_rows, key=_row_ts)
     
     close_val = latest_row.get("close")
     # Prefer close-of-candle timestamps when available.
@@ -861,6 +1093,19 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
         "scale_used": norm_scale,
         "contract_normalization": norm_summary.as_dict(),
     })
+
+    # If EndpointTruth could not infer a true snapshot timestamp, allow a deterministic fallback
+    # for date-only payloads: midnight UTC of the provided YYYY-MM-DD. This prevents downstream
+    # freshness gating from treating the feature as missing time provenance entirely.
+    if ctx.effective_ts_utc is None:
+        inferred_snapshot_ts_utc = _infer_daily_snapshot_effective_ts_utc(greek_payload)
+        if inferred_snapshot_ts_utc is not None:
+            prov.update({
+                "effective_ts_utc": inferred_snapshot_ts_utc,
+                "effective_time_source": "payload_date_midnight_utc",
+                "timestamp_quality": "DATE_ONLY",
+                "time_provenance_degraded": True,
+            })
     identity = _normalized_identity_for_row(contract_map, latest_idx)
     if identity is not None:
         prov["canonical_contract_key"] = identity.canonical_contract_key
@@ -875,7 +1120,9 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "net_gex_sign",
-        "fields_used": ["gamma_exposure"],
+        # UW payloads for spot exposures are not fully stable; different endpoints / versions
+        # have been observed to emit the aggregate gamma exposure under different keys.
+        "fields_used": ["gamma_exposure", "gex", "gamma", "total_gamma", "net_gamma", "net_gex"],
         "units_expected": "Directional Sign [-1, 1]",
         "normalization": "Directional sign clamping",
         "session_applicability": "PREMARKET/RTH",
@@ -887,19 +1134,88 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency")})
 
     rows = grab_list(spot_exposures_payload)
+    if not rows and isinstance(spot_exposures_payload, dict):
+        # Some vendor responses return a single dict row (sometimes nested under wrapper keys).
+        for k in ("data", "result", "results", "item", "summary"):
+            v = spot_exposures_payload.get(k)
+            if isinstance(v, dict):
+                rows = [v]
+                break
+        if not rows:
+            rows = [spot_exposures_payload]
     if not rows:
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "no_rows")})
+
+    # Keys we attempt (in priority order) for gamma exposure.
+    # Vendor responses vary across endpoints; we support both snake_case and camelCase.
+    gex_aliases = (
+        # snake_case
+        "net_gamma_exposure",
+        "net_gamma_exposure_notional",
+        "net_gamma",
+        "net_gex",
+        "net_gex_notional",
+        "gamma_exposure",
+        "total_gamma",
+        "gamma",
+        "gex",
+        # camelCase variants
+        "netGammaExposure",
+        "netGammaExposureNotional",
+        "netGamma",
+        "netGex",
+        "netGexNotional",
+        "gammaExposure",
+    )
+
+    def _extract_gex_value(row: Dict[str, Any]) -> Optional[float]:
+        lower_map = {str(k).lower(): k for k in row.keys()}
+        for alias in gex_aliases:
+            k = lower_map.get(alias.lower())
+            if k is None:
+                continue
+            v = row.get(k)
+            # Accept 0 values as valid.
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "":
+                continue
+            f = safe_float(v)
+            if f is not None:
+                return f
+
+        # Heuristic fallback: a numeric field that looks like a net gamma exposure.
+        for k, v in row.items():
+            lk = str(k).lower()
+            if "net" in lk and ("gex" in lk or "gamma" in lk) and ("exposure" in lk or "notional" in lk):
+                f = safe_float(v)
+                if f is not None:
+                    return f
+        return None
     
     tot_gamma = 0.0
     valid_rows = 0
     for r in rows:
-        g = safe_float(r.get("gamma_exposure"))
+        g = _extract_gex_value(r)
         if g is not None:
             tot_gamma += g
             valid_rows += 1
             
     if valid_rows == 0:
-        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "missing_gamma_exposure_fields")})
+        # Keep the error reason stable for existing dashboards, but attach helpful diagnostics.
+        sample_keys = sorted({k for r in rows[:3] for k in (r or {}).keys()})
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(
+            ctx,
+            "extract_gex_sign",
+            lineage,
+            "missing_gamma_exposure_fields",
+            details={
+                "attempted_field_aliases": list(gex_aliases),
+                "sample_row_keys": sample_keys,
+                "sample_row_count": min(3, len(rows)),
+                "total_row_count": len(rows),
+            }
+        )})
     
     if abs(tot_gamma) <= 1e-9: 
         sign = 0.0
@@ -912,7 +1228,32 @@ def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> Featu
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "oi_pressure",
-        "fields_used": ["open_interest", "strike", "put_call", "expiration", "option_symbol", "multiplier", "deliverable"],
+        "fields_used": [
+            "open_interest",
+            "oi",
+            "strike",
+            "strike_price",
+            # put/call semantics (provider varies)
+            "put_call",
+            "option_type",
+            "type",
+            "pc",
+            "right",
+            "call_put",
+            "callPut",
+            "side",
+            "cp",
+            "putCall",
+            "optionType",
+            "is_call",
+            "is_put",
+            "direction",
+            # contract-normalization aids
+            "expiration",
+            "option_symbol",
+            "multiplier",
+            "deliverable",
+        ],
         "units_expected": "Directional Imbalance Ratio [-1, 1]",
         "normalization": "(weighted_call_equivalent_oi - weighted_put_equivalent_oi) / (weighted_call_equivalent_oi + weighted_put_equivalent_oi) with canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
@@ -924,6 +1265,25 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
 
     rows = grab_list(payload)
     if not rows:
+        # Fallback: some payloads only provide aggregate call/put totals.
+        call_total, put_total, totals_prov = _extract_call_put_totals(payload)
+        if call_total is not None and put_total is not None:
+            pressure = _normalize_balance(call_total, put_total)
+            meta = _build_meta(
+                ctx,
+                "extract_oi",
+                lineage,
+                {
+                    **_extract_payload_provenance(payload),
+                    **totals_prov,
+                    "status": "computed_from_summary_totals",
+                    "call_total": call_total,
+                    "put_total": put_total,
+                    "weighting": "summary_call_put_totals",
+                },
+            )
+            return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
+
         return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
 
     norm_summary = normalize_option_rows(rows)
@@ -940,6 +1300,40 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     contract_map = normalized_contract_map(norm_summary)
 
     spot_ref = _extract_spot_reference(payload)
+
+    # Provider schemas vary; attempt multiple key aliases for call/put semantics.
+    pc_key_aliases = (
+        "put_call",
+        "option_type",
+        "type",
+        "pc",
+        "right",
+        "call_put",
+        "callPut",
+        "side",
+        "cp",
+        "putCall",
+        "optionType",
+        "direction",
+    )
+
+    def _extract_put_call_raw(row: Dict[str, Any]) -> Any:
+        # Boolean flags (seen in some vendor payloads)
+        if "is_call" in row and row.get("is_call") is not None:
+            return "CALL" if bool(row.get("is_call")) else "PUT"
+        if "is_put" in row and row.get("is_put") is not None:
+            return "PUT" if bool(row.get("is_put")) else "CALL"
+
+        for k in pc_key_aliases:
+            if k not in row:
+                continue
+            v = row.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "":
+                continue
+            return v
+        return None
     weighted_call_oi = 0.0
     weighted_put_oi = 0.0
     directional_rows = 0
@@ -951,7 +1345,13 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
         identity = _normalized_identity_for_row(contract_map, idx)
         oi_val = safe_float(r.get("open_interest") or r.get("oi"))
         strike = identity.strike if identity is not None else safe_float(r.get("strike") or r.get("strike_price"))
-        pc_norm = identity.put_call if identity is not None else _normalize_put_call(r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc"))
+
+        # Prefer contract-derived put/call when present; otherwise fall back to row aliases.
+        pc_norm = None
+        if identity is not None and identity.put_call:
+            pc_norm = identity.put_call
+        if pc_norm is None:
+            pc_norm = _normalize_put_call(_extract_put_call_raw(r))
 
         if oi_val is None or not math.isfinite(oi_val) or oi_val < 0:
             continue
@@ -977,6 +1377,26 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
             weighted_put_oi += equivalent_oi * weight
 
     if directional_rows == 0:
+        # Fallback: attempt to compute from summary totals if available.
+        call_total, put_total, totals_prov = _extract_call_put_totals(payload)
+        if call_total is not None and put_total is not None:
+            pressure = _normalize_balance(call_total, put_total)
+            meta = _build_meta(ctx, "extract_oi", lineage, {
+                **_extract_payload_provenance(payload),
+                "contract_normalization": norm_summary.as_dict(),
+                "n_rows": len(rows),
+                "parsed_rows": parsed_rows,
+                "missing_put_call_rows": missing_put_call_rows,
+                "normalized_contract_rows": normalized_contract_rows,
+                **totals_prov,
+                "status": "computed_from_summary_totals_fallback",
+                "call_total": call_total,
+                "put_total": put_total,
+                "spot_reference": spot_ref,
+                "weighting": "summary_call_put_totals",
+            })
+            return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
+
         logger.warning(
             "unsafe_oi_pressure_suppressed",
             extra={"counter": "unsafe_directional_metric_suppressed", "feature_key": "oi_pressure", "reason": "missing_put_call_or_directional_rows"},
@@ -991,6 +1411,8 @@ def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
             "status": "suppressed_directionless_oi_total",
             "suppression_reason": "missing_put_call_or_directional_rows",
             "spot_reference": spot_ref,
+            "attempted_put_call_aliases": list(pc_key_aliases),
+            "sample_row_keys": sorted({k for rr in rows[:3] for k in (rr or {}).keys()}),
         })
         meta["na_reason"] = "missing_put_call_or_directional_rows"
         return FeatureBundle({"oi_pressure": None}, {"oi": meta})
@@ -1062,8 +1484,19 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
         
     valid_pts.sort(key=lambda x: x[0])
     slope = valid_pts[-1][1] - valid_pts[0][1]
-    
-    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)})})
+
+    prov = {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)}
+    if ctx.effective_ts_utc is None:
+        inferred_snapshot_ts_utc = _infer_daily_snapshot_effective_ts_utc(payload)
+        if inferred_snapshot_ts_utc is not None:
+            prov.update({
+                "effective_ts_utc": inferred_snapshot_ts_utc,
+                "effective_time_source": "payload_date_midnight_utc",
+                "timestamp_quality": "DATE_ONLY",
+                "time_provenance_degraded": True,
+            })
+
+    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, prov)})
 
 def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({

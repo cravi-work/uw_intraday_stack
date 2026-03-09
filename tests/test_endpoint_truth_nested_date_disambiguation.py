@@ -44,3 +44,23 @@ def test_infer_source_time_hints_allows_nested_date_with_time_component() -> Non
     hints = infer_source_time_hints(payload_json=payload, response_headers={}, reference_utc=reference_utc)
 
     assert hints.event_time_utc == datetime.datetime(2026, 3, 6, 12, 15, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_infer_source_time_hints_scans_tail_of_long_sequences() -> None:
+    """Don't miss the newest timestamp in long ascending arrays.
+
+    Some endpoints return time series arrays sorted ascending. If we only scan
+    the head of a long list, we can infer an old timestamp and drop the packet
+    as stale/misaligned.
+    """
+
+    reference_utc = datetime.datetime(2026, 3, 6, 20, 30, tzinfo=datetime.timezone.utc)
+
+    payload = {
+        "data": [{"t": "2026-03-06T10:00:00Z", "v": i} for i in range(99)]
+        + [{"t": "2026-03-06T20:30:00Z", "v": 999}],
+    }
+
+    hints = infer_source_time_hints(payload_json=payload, response_headers={}, reference_utc=reference_utc)
+
+    assert hints.event_time_utc == reference_utc

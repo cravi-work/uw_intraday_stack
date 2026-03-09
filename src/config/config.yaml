@@ -7,6 +7,15 @@ ingestion:
   - NFLX
   - TSLA
   cadence_minutes: 5
+  # Choose how the prediction snapshot time (as-of) is rounded.
+  #
+  # `cadence_minutes` controls how frequently the job runs.
+  # `asof_rounding_minutes` controls how far the as-of timestamp can lag "now" when
+  # starting mid-cadence.
+  #
+  # Keeping this small (e.g. 1) avoids "future timestamp" look-ahead blocks when the
+  # process starts in the middle of an ingest cadence bucket.
+  asof_rounding_minutes: 1
   ingest_start_et: 04:00
   ingest_end_et: '20:00'
   premarket_start_et: 04:00
@@ -27,6 +36,9 @@ validation:
   tolerance_minutes: 10
   max_horizon_drift_minutes: 10
   alignment_tolerance_sec: 900
+  # Allow small forward drift between local as-of time and provider timestamps.
+  # Useful when the host clock is slightly behind (e.g., VM / Windows time skew).
+  allow_future_ts_seconds: 600
   emit_to_close_horizon: true
   use_default_required_features: false
   fallback_max_age_minutes: 15

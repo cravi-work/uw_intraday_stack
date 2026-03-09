@@ -87,6 +87,9 @@ class FeaturePolicyAssessment:
     stale_age_minutes: Optional[int]
     time_provenance_degraded: bool
     policy_source: str
+    # When we clamp an effective timestamp that is slightly ahead of asof_utc, record
+    # the original observed forward drift (seconds). This helps diagnose local clock skew.
+    future_drift_seconds: Optional[int] = None
 
 
 def _cfg_scope(cfg: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -401,11 +404,26 @@ def assess_feature_freshness(
             policy_source=",".join(policy.sources) if policy.sources else "default",
         )
 
+    # Allow a small amount of provider-time forward drift to be normalized/clamped.
+    # Default behavior remains cadence-based; callers can widen this to tolerate clock skew.
+    allow_future_ts_seconds = cadence_seconds
+    try:
+        validation_cfg = cfg.get("validation") if isinstance(cfg, dict) else None
+        if isinstance(validation_cfg, dict) and validation_cfg.get("allow_future_ts_seconds") is not None:
+            allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
+    except Exception:
+        allow_future_ts_seconds = cadence_seconds
+
     normalized_future_ts = False
+    future_drift_seconds: Optional[int] = None
+    future_ts_degraded = False
     delta_seconds = int((asof_utc - eff_ts).total_seconds())
     if delta_seconds < 0:
         drift = abs(delta_seconds)
-        if drift < cadence_seconds:
+        if drift < allow_future_ts_seconds:
+            # Clamp to asof_utc so downstream join-skew/staleness calculations remain conservative.
+            future_drift_seconds = drift
+            future_ts_degraded = drift > cadence_seconds
             eff_ts = asof_utc
             delta_seconds = 0
             normalized_future_ts = True
@@ -426,6 +444,7 @@ def assess_feature_freshness(
                 stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
                 time_provenance_degraded=time_provenance_degraded,
                 policy_source=",".join(policy.sources) if policy.sources else "default",
+                future_drift_seconds=drift,
             )
 
     if freshness_state == "STALE_CARRY" and stale_age_seconds is not None and stale_age_seconds > policy.max_tolerated_age_seconds:
@@ -445,6 +464,7 @@ def assess_feature_freshness(
             stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
             time_provenance_degraded=time_provenance_degraded,
             policy_source=",".join(policy.sources) if policy.sources else "default",
+            future_drift_seconds=future_drift_seconds,
         )
 
     if delta_seconds > policy.join_skew_tolerance_seconds:
@@ -597,6 +617,12 @@ def assess_feature_freshness(
         degraded = True
         dq_reason = dq_reason or f"{feature_key}_time_provenance_degraded"
 
+    # If we had to clamp a timestamp that was materially ahead of asof_utc (beyond cadence),
+    # keep the feature but mark it degraded for downstream confidence/coverage logic.
+    if future_ts_degraded and future_drift_seconds is not None:
+        degraded = True
+        dq_reason = dq_reason or f"{feature_key}_future_ts_clamped_{future_drift_seconds}s"
+
     return FeaturePolicyAssessment(
         feature_key=feature_key,
         policy=policy,
@@ -613,4 +639,5 @@ def assess_feature_freshness(
         stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
         time_provenance_degraded=time_provenance_degraded,
         policy_source=",".join(policy.sources) if policy.sources else "default",
+        future_drift_seconds=future_drift_seconds,
     )

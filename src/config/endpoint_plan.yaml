@@ -73,6 +73,7 @@ plans:
       path_params: {}
       query_params:
         date: "{date}"
+      documented_asof_contemporaneous: true
 
     # Options flow / pressure
     - name: flow_per_strike_intraday
@@ -140,6 +141,7 @@ plans:
       path_params: {}
       query_params:
         date: "{date}"
+      documented_asof_contemporaneous: true
 
     - name: interpolated_iv
       purpose: disabled

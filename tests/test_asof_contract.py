@@ -410,3 +410,18 @@ def test_uw_client_preserves_provider_time_headers_for_downstream_inference():
     assert headers["x-generated-at"] == "2026-01-01T11:59:40+00:00"
     assert headers["x-data-revision"] == "rev-provider-meta"
     assert "ignored" not in headers
+
+
+def test_infer_source_time_hints_prefers_timestamp_at_or_before_reference():
+    """Regression: provider-time inference must not pick timestamps in the future vs as-of."""
+
+    ref = dt.datetime(2026, 3, 6, 20, 30, 0, tzinfo=dt.timezone.utc)
+    payload = {
+        "data": [
+            {"t": (ref - dt.timedelta(minutes=1)).isoformat()},
+            {"t": (ref + dt.timedelta(minutes=1)).isoformat()},
+        ]
+    }
+
+    hints = infer_source_time_hints(payload_json=payload, reference_utc=ref)
+    assert hints.event_time_utc == ref - dt.timedelta(minutes=1)

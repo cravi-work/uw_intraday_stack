@@ -300,6 +300,38 @@ def _find_best_nested_timestamp(
     queue = deque([(payload, 0)])
     seen = 0
     best_dt: Optional[datetime.datetime] = None
+    # Normalize the as-of reference to an aware UTC datetime (when provided).
+    #
+    # Many endpoints return "latest" rows that can be newer than a rounded as-of bucket.
+    # When we are building a snapshot anchored at reference_utc, we must not select timestamps
+    # that are in the future relative to that snapshot.
+    ref_utc: Optional[datetime.datetime] = None
+    if reference_utc is not None:
+        if reference_utc.tzinfo is None:
+            ref_utc = reference_utc.replace(tzinfo=datetime.timezone.utc)
+        else:
+            ref_utc = reference_utc.astimezone(datetime.timezone.utc)
+
+    def _iter_seq_samples(seq: Any) -> Sequence[Any]:
+        """Return a bounded sample from a list/tuple.
+
+        Many vendor endpoints return time series arrays sorted ascending.
+        If we only scan the head, we can miss the most recent timestamp and
+        incorrectly mark packets as stale or misaligned.
+
+        We therefore sample from both the head and the tail for long sequences.
+        """
+
+        if not isinstance(seq, (list, tuple)):
+            return []
+        n = len(seq)
+        if n <= 32:
+            return seq
+        head_n = 16
+        tail_n = 16
+        if n <= head_n + tail_n:
+            return seq
+        return list(seq[:head_n]) + list(seq[-tail_n:])
 
     while queue and seen < max_nodes:
         current, depth = queue.popleft()
@@ -311,13 +343,16 @@ def _find_best_nested_timestamp(
                     if nk == 'date' and depth >= 2 and isinstance(value, str) and _DATE_ONLY_RE.match(value.strip()):
                         continue
                     dt_val = _coerce_optional_utc_dt(value, reference_utc=reference_utc, assume_naive_tz=assume_naive_tz)
+                    if ref_utc is not None and dt_val is not None and dt_val > ref_utc:
+                        # Ignore timestamps that are after the snapshot reference.
+                        continue
                     if dt_val is not None and (best_dt is None or dt_val > best_dt):
                         best_dt = dt_val
             for value in current.values():
                 if isinstance(value, (Mapping, list, tuple)):
                     queue.append((value, depth + 1))
         elif isinstance(current, (list, tuple)):
-            for value in current[:32]:
+            for value in _iter_seq_samples(current):
                 if isinstance(value, (Mapping, list, tuple)):
                     queue.append((value, depth + 1))
     return best_dt

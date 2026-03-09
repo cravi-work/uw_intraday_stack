@@ -60,6 +60,23 @@ def test_payload_epoch_millis_timestamp_is_supported(mock_ctx):
     assert lineage["effective_ts_utc"] == expected_iso
 
 
+def test_payload_future_candles_are_ignored_relative_to_asof(mock_ctx):
+    """As-of contract: do not select candles whose timestamp is after ctx.as_of_time_utc."""
+
+    asof_ts = mock_ctx.as_of_time_utc.timestamp()
+    payload = [
+        {"close": 111.0, "t": asof_ts - 60.0},
+        {"close": 999.0, "t": asof_ts + 120.0},
+    ]
+
+    bundle = extract_price_features(payload, mock_ctx)
+    assert bundle.features["spot"] == 111.0
+
+    lineage = bundle.meta["price"]["metric_lineage"]
+    assert lineage["timestamp_quality"] == "VALID"
+    assert lineage["event_time"] == dt.datetime.fromtimestamp(asof_ts - 60.0, tz=dt.timezone.utc).isoformat()
+
+
 def test_payload_candle_start_end_time_timestamp_is_supported(mock_ctx):
     """UW OHLC Candle objects commonly provide `start_time`/`end_time` ISO8601 timestamps."""
     payload = [
