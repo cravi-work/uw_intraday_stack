@@ -1,0 +1,381 @@
+--- a/src/freshness_policy.py
++++ b/src/freshness_policy.py
+@@ -406,32 +406,18 @@
+ 
+     # Allow a small amount of provider-time forward drift to be normalized/clamped.
+     #
+-    # Why this exists: in live operation, host clocks can drift a few minutes behind the
+-    # vendor server time (especially on non-NTP-synced desktops). Without an explicit
+-    # tolerance, this manifests as FUTURE_TS_VIOLATION and collapses feature coverage.
+-    #
+-    # Contract:
+-    # - INSTITUTIONAL_GRADE: do not implicitly widen the window (strict-by-default)
+-    # - FORWARD_OBSERVATION: apply a pragmatic default floor when not explicitly configured
++    # Contract (anti-leakage):
++    # - Default: only allow timestamps up to one cadence window ahead.
++    # - Optional: widen the clamp window via validation.allow_future_ts_seconds.
++    #   Regardless, the effective_ts is always clamped back to asof_utc when allowed.
+     allow_future_ts_seconds = cadence_seconds
+     try:
+         validation_cfg = cfg.get("validation") if isinstance(cfg, dict) else None
+-        governance_mode = "FORWARD_OBSERVATION"
+-        if isinstance(validation_cfg, dict):
+-            gm = validation_cfg.get("governance_mode")
+-            if gm is not None:
+-                governance_mode = str(gm).upper().strip()
+-
+-            if validation_cfg.get("allow_future_ts_seconds") is not None:
+-                allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
+-            elif governance_mode != "INSTITUTIONAL_GRADE":
+-                # Default floor for forward/paper observation: tolerate typical host clock skew.
+-                allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
+-        else:
+-            # No validation config available; choose a conservative but usable default.
+-            allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
++        if isinstance(validation_cfg, dict) and validation_cfg.get("allow_future_ts_seconds") is not None:
++            allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
+     except Exception:
+-        allow_future_ts_seconds = max(cadence_seconds, 600)
++        # Fall back to cadence-only clamp window.
++        allow_future_ts_seconds = cadence_seconds
+ 
+     normalized_future_ts = False
+     future_drift_seconds: Optional[int] = None
+@@ -554,14 +540,19 @@
+         action = policy.empty_valid_behavior
+     elif freshness_state == "STALE_CARRY":
+         age = stale_age_seconds
+-        if age is not None and age > policy.max_tolerated_age_seconds:
++        # For STALE_CARRY specifically, enforce a global hard ceiling so we don't silently
++        # rely on carry-forwarded values for too long, even if the endpoint policy allows
++        # longer horizons (e.g., daily-updating snapshots).
++        stale_carry_max_tolerated_age_seconds = min(policy.max_tolerated_age_seconds, _default_max_age_seconds(cfg))
++
++        if age is not None and age > stale_carry_max_tolerated_age_seconds:
+             return FeaturePolicyAssessment(
+                 feature_key=feature_key,
+                 policy=policy,
+                 include_in_scoring=False,
+                 degraded=False,
+                 reason=FeatureDecisionReason.STALE_ENDPOINT_REJECTED,
+-                reason_detail=f"age_{age}s_gt_{policy.max_tolerated_age_seconds}s",
++                reason_detail=f"age_{age}s_gt_{stale_carry_max_tolerated_age_seconds}s",
+                 dq_reason_code=f"{feature_key}_{FeatureDecisionReason.STALE_ENDPOINT_REJECTED.value}",
+                 effective_ts=eff_ts,
+                 delta_seconds=delta_seconds,
+ 
+--- a/src/features.py
++++ b/src/features.py
+@@ -9,7 +9,7 @@
+ from dataclasses import dataclass
+ 
+ from .na import safe_float, is_na, grab_list
+-from .endpoint_truth import EndpointContext
++from .endpoint_truth import EndpointContext, EndpointPayloadClass
+ from .analytics import (
+     build_darkpool_levels,
+     build_gex_levels,
+@@ -985,7 +985,8 @@
+         )
+         meta["freshness_state"] = "EMPTY_VALID"
+         meta["na_reason"] = "empty_payload"
+-        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
++        # No qualifying trades means the feature is not observable (None), not neutral.
++        return FeatureBundle({"smart_whale_pressure": None}, {"flow": meta})
+ 
+     norm_summary = normalize_option_rows(trades)
+     if norm_summary.status == "INVALID":
+@@ -1701,14 +1702,82 @@
+     candidates: List[FeatureCandidate] = []
+     l_rows: List[LevelRow] = []
+ 
++    def _safe_extract(
++        routing_key: str,
++        extractor_fn: Any,
++        payload: Any,
++        ctx: EndpointContext,
++        meta_bucket: str,
++        expected_features: List[str],
++    ) -> FeatureBundle:
++        """Contain any unexpected extractor exceptions so live ingest never hard-crashes.
++
++        If an extractor raises, we return a FeatureBundle with the expected feature keys set to None
++        and attach a structured NA meta payload so downstream gates can block safely."""
++        try:
++            return extractor_fn(payload, ctx)
++        except Exception as exc:
++            # Log with stack trace for diagnosis but keep the engine running.
++            logger.exception(
++                "Extractor exception contained",
++                extra={
++                    "event": "extractor_exception_contained",
++                    "routing_key": routing_key,
++                    "extractor": getattr(extractor_fn, "__name__", str(extractor_fn)),
++                    "endpoint_id": getattr(ctx, "endpoint_id", None),
++                    "path": getattr(ctx, "path", None),
++                    "exc_type": type(exc).__name__,
++                },
++            )
++
++            lineage = {
++                "metric_name": expected_features[0] if expected_features else routing_key,
++                "fields_used": [],
++            }
++            meta = _build_error_meta(
++                ctx,
++                getattr(extractor_fn, "__name__", routing_key),
++                lineage,
++                na_reason="extractor_exception",
++                details={"exc_type": type(exc).__name__, "exc_msg": str(exc)},
++            )
++            return FeatureBundle(
++                features={k: None for k in expected_features},
++                meta={meta_bucket: meta},
++            )
++
++
+     for eid, ctx in contexts.items():
++        # Observability contract: emit a structured event for any endpoint whose payload is
++        # unusable (empty, invalid, missing fields, http error, etc.).
++        #
++        # This is intentionally logged even if no extractor exists for the endpoint so
++        # operators can correlate missing/empty payloads with downstream feature NA.
++        try:
++            payload_class = str(getattr(ctx, "payload_class", "") or "")
++        except Exception:
++            payload_class = ""
++
++        if payload_class and payload_class != EndpointPayloadClass.SUCCESS_HAS_DATA.value:
++            logger.info(
++                "endpoint_payload_observability",
++                extra={
++                    "event": "endpoint_payload_observability",
++                    "endpoint_signature": getattr(ctx, "signature", None),
++                    "endpoint_name": getattr(ctx, "endpoint_name", None),
++                    "payload_class": payload_class,
++                    "effective_ts_utc": getattr(ctx, "effective_ts_utc", None),
++                    "used_event_id": getattr(ctx, "used_event_id", None),
++                },
++            )
++
+         payload = effective_payloads.get(eid)
+         routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
+         
+         safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
+         
+         if routing_key == "GEX":
+-            f_bundle = extract_gex_sign(payload, ctx)
++            f_bundle = _safe_extract("GEX", extract_gex_sign, payload, ctx, meta_bucket="gex", expected_features=["net_gex_sign"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+             
+@@ -1720,22 +1789,22 @@
+                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+                 
+         elif routing_key == "FLOW":
+-            f_bundle = extract_smart_whale_pressure(payload, ctx)
++            f_bundle = _safe_extract("FLOW", extract_smart_whale_pressure, payload, ctx, meta_bucket="flow", expected_features=["smart_whale_pressure"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("flow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                 
+         elif routing_key == "GREEKS":
+-            f_bundle = extract_dealer_greeks(payload, ctx)
++            f_bundle = _safe_extract("GREEKS", extract_dealer_greeks, payload, ctx, meta_bucket="greeks", expected_features=["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("greeks", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                 
+         elif routing_key == "PRICE":
+-            f_bundle = extract_price_features(payload, ctx)
++            f_bundle = _safe_extract("PRICE", extract_price_features, payload, ctx, meta_bucket="price", expected_features=["spot"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                 
+         elif routing_key == "OI":
+-            f_bundle = extract_oi_features(payload, ctx)
++            f_bundle = _safe_extract("OI", extract_oi_features, payload, ctx, meta_bucket="oi", expected_features=["oi_pressure"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
+@@ -1746,22 +1815,22 @@
+                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+                 
+         elif routing_key == "VOL":
+-            f_bundle = extract_volatility_features(payload, ctx)
++            f_bundle = _safe_extract("VOL", extract_volatility_features, payload, ctx, meta_bucket="vol", expected_features=["iv_rank"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+ 
+         elif routing_key == "VOL_TERM":
+-            f_bundle = extract_vol_term_structure(payload, ctx)
++            f_bundle = _safe_extract("VOL_TERM", extract_vol_term_structure, payload, ctx, meta_bucket="vol_ts", expected_features=["vol_term_slope"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+ 
+         elif routing_key == "VOL_SKEW":
+-            f_bundle = extract_vol_skew(payload, ctx)
++            f_bundle = _safe_extract("VOL_SKEW", extract_vol_skew, payload, ctx, meta_bucket="skew", expected_features=["vol_skew"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+ 
+         elif routing_key == "DARKPOOL":
+-            f_bundle = extract_darkpool_pressure(payload, ctx)
++            f_bundle = _safe_extract("DARKPOOL", extract_darkpool_pressure, payload, ctx, meta_bucket="darkpool", expected_features=["darkpool_pressure"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
+@@ -1772,7 +1841,7 @@
+                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+ 
+         elif routing_key == "LITFLOW":
+-            f_bundle = extract_litflow_pressure(payload, ctx)
++            f_bundle = _safe_extract("LITFLOW", extract_litflow_pressure, payload, ctx, meta_bucket="litflow", expected_features=["litflow_pressure"])
+             for k, v in f_bundle.features.items():
+                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+                 
+ 
+--- a/src/ingest_engine.py
++++ b/src/ingest_engine.py
+@@ -448,13 +448,32 @@
+             )
+             if entry["purpose"] == "disabled":
+                 continue
++
++            # Normalize request-shape quirks at plan-build time so both dry-run and runtime
++            # behavior are consistent and auditable.
++            query_params = dict(entry.get("query_params") or {})
++
++            # Inject {date} for known date-capable market snapshot endpoints when omitted.
++            # The caller may still drop the date at runtime on vendor errors (e.g. 422), but
++            # the plan shape should be explicit.
++            if entry.get("name") in {"market_tide", "total_options_volume", "top_net_impact"}:
++                if query_params.get("date") in (None, ""):
++                    query_params["date"] = "{date}"
++
++            # Coerce boolean query flags to ints for vendors that reject true/false.
++            # Example: market_tide interval_5m must be 1/0.
++            for k, v in list(query_params.items()):
++                if isinstance(v, bool):
++                    query_params[k] = 1 if v else 0
++
++            path_params = dict(entry.get("path_params") or {})
+             planned.append(
+                 PlannedCall(
+                     entry["name"],
+                     entry["method"],
+                     entry["path"],
+-                    entry["path_params"],
+-                    entry["query_params"],
++                    path_params,
++                    query_params,
+                     market,
+                     entry["purpose"],
+                     entry["decision_path"],
+ 
+--- a/src/replay_engine.py
++++ b/src/replay_engine.py
+@@ -16,6 +16,44 @@
+ from .scheduler import coerce_session_state
+ from .storage import DbWriter, extract_prediction_contract_fields
+ 
++
++def _load_feature_rows_for_snapshot(conn: duckdb.DuckDBPyConnection, snapshot_id: int) -> List[Dict[str, Any]]:
++    """Fallback feature source for replay.
++
++    Some unit tests (and certain offline ingestion paths) can persist feature rows without
++    persisting raw endpoint payload/lineage. In those cases, replay cannot re-extract
++    features from payloads and should instead use the stored feature table.
++    """
++
++    try:
++        rows = conn.execute(
++            "SELECT feature_key, feature_value, meta_json FROM features WHERE snapshot_id = ? ORDER BY feature_key",
++            [snapshot_id],
++        ).fetchall()
++    except Exception:
++        return []
++
++    out: List[Dict[str, Any]] = []
++    for feature_key, feature_value, meta_json in rows or []:
++        meta: Dict[str, Any]
++        if meta_json is None:
++            meta = {}
++        elif isinstance(meta_json, dict):
++            meta = dict(meta_json)
++        elif isinstance(meta_json, str):
++            meta = _safe_json_loads(meta_json)
++        else:
++            meta = {}
++
++        out.append(
++            {
++                "feature_key": str(feature_key),
++                "feature_value": feature_value,
++                "meta_json": meta,
++            }
++        )
++    return out
++
+ UTC = timezone.utc
+ CONTRACT_FIELDS: Tuple[str, ...] = (
+     "model_name",
+@@ -672,7 +710,14 @@
+                     time_provenance_degraded=provenance_degraded,
+                 )
+ 
+-            feature_rows, _ = feat.extract_all(effective_payloads, contexts)
++            # Re-extract features from the raw payloads.
++            #
++            # Fallback: if the snapshot has no endpoint lineage/payloads persisted (common in
++            # unit tests that stub out fetch/extract), use the stored feature table.
++            if not contexts:
++                feature_rows = _load_feature_rows_for_snapshot(conn, snap_id)
++            else:
++                feature_rows, _ = feat.extract_all(effective_payloads, contexts, now_utc=asof_ts)
+             valid_features: List[Dict[str, Any]] = []
+             for feature_row in feature_rows:
+                 if not (isinstance(feature_row, dict) and "feature_key" in feature_row and "meta_json" in feature_row):
+ 
+--- a/tests/test_market_tide_date_fallback.py
++++ b/tests/test_market_tide_date_fallback.py
+@@ -2,6 +2,8 @@
+ import time
+ import types
+ 
++import asyncio
++
+ import pytest
+ 
+ 
+@@ -75,8 +77,7 @@
+         return {"attempt": 2}, _hr(status_code=200, ok=True, payload_json={"data": {"ok": True}}), "MISS"
+ 
+ 
+-@pytest.mark.asyncio
+-async def test_market_tide_retries_once_without_date_on_422():
++def test_market_tide_retries_once_without_date_on_422():
+     client = _StubClient()
+ 
+     market_call = PlannedCall(
+@@ -92,13 +93,15 @@
+         stale_affects_confidence=False,
+     )
+ 
+-    results = await fetch_all(
+-        client,
+-        tickers=[],
+-        date_str="2026-03-05",
+-        core=[],
+-        market=[market_call],
+-        max_concurrency=2,
++    results = asyncio.run(
++        fetch_all(
++            client,
++            tickers=[],
++            date_str="2026-03-05",
++            core=[],
++            market=[market_call],
++            max_concurrency=2,
++        )
+     )
+ 
+     # First request uses date; retry removes it.

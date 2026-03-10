@@ -405,14 +405,33 @@ def assess_feature_freshness(
         )
 
     # Allow a small amount of provider-time forward drift to be normalized/clamped.
-    # Default behavior remains cadence-based; callers can widen this to tolerate clock skew.
+    #
+    # Why this exists: in live operation, host clocks can drift a few minutes behind the
+    # vendor server time (especially on non-NTP-synced desktops). Without an explicit
+    # tolerance, this manifests as FUTURE_TS_VIOLATION and collapses feature coverage.
+    #
+    # Contract:
+    # - INSTITUTIONAL_GRADE: do not implicitly widen the window (strict-by-default)
+    # - FORWARD_OBSERVATION: apply a pragmatic default floor when not explicitly configured
     allow_future_ts_seconds = cadence_seconds
     try:
         validation_cfg = cfg.get("validation") if isinstance(cfg, dict) else None
-        if isinstance(validation_cfg, dict) and validation_cfg.get("allow_future_ts_seconds") is not None:
-            allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
+        governance_mode = "FORWARD_OBSERVATION"
+        if isinstance(validation_cfg, dict):
+            gm = validation_cfg.get("governance_mode")
+            if gm is not None:
+                governance_mode = str(gm).upper().strip()
+
+            if validation_cfg.get("allow_future_ts_seconds") is not None:
+                allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
+            elif governance_mode != "INSTITUTIONAL_GRADE":
+                # Default floor for forward/paper observation: tolerate typical host clock skew.
+                allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
+        else:
+            # No validation config available; choose a conservative but usable default.
+            allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
     except Exception:
-        allow_future_ts_seconds = cadence_seconds
+        allow_future_ts_seconds = max(cadence_seconds, 600)
 
     normalized_future_ts = False
     future_drift_seconds: Optional[int] = None
@@ -420,13 +439,15 @@ def assess_feature_freshness(
     delta_seconds = int((asof_utc - eff_ts).total_seconds())
     if delta_seconds < 0:
         drift = abs(delta_seconds)
-        if drift < allow_future_ts_seconds:
+        if drift <= allow_future_ts_seconds:
             # Clamp to asof_utc so downstream join-skew/staleness calculations remain conservative.
             future_drift_seconds = drift
             future_ts_degraded = drift > cadence_seconds
             eff_ts = asof_utc
             delta_seconds = 0
             normalized_future_ts = True
+            if drift > 0:
+                time_provenance_degraded = True
         else:
             return FeaturePolicyAssessment(
                 feature_key=feature_key,
@@ -434,7 +455,7 @@ def assess_feature_freshness(
                 include_in_scoring=False,
                 degraded=False,
                 reason=FeatureDecisionReason.FUTURE_TS_VIOLATION,
-                reason_detail=f"ahead_by_{drift}s",
+                reason_detail=f"ahead_by_{drift}s_exceeds_allow_future={allow_future_ts_seconds}s",
                 dq_reason_code=f"{feature_key}_{FeatureDecisionReason.FUTURE_TS_VIOLATION.value}",
                 effective_ts=eff_ts,
                 delta_seconds=-drift,

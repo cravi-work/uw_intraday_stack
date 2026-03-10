@@ -4,8 +4,6 @@ ingestion:
   timezone: America/New_York
   watchlist:
   - INTC
-  - NFLX
-  - TSLA
   cadence_minutes: 5
   # Choose how the prediction snapshot time (as-of) is rounded.
   #

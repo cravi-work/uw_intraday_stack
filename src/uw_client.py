@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import hashlib
 import json
 import logging
@@ -31,6 +33,22 @@ except ModuleNotFoundError:  # pragma: no cover
 from .api_catalog_loader import ApiCatalogError, EndpointRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_http_date_to_utc_iso(date_value: str) -> Optional[str]:
+    """Parse an RFC 7231/1123 HTTP Date header into a UTC ISO-8601 string.
+
+    Returns None if parsing fails.
+    """
+    try:
+        dt = email.utils.parsedate_to_datetime(date_value)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 class UwClientError(RuntimeError):
@@ -131,6 +149,7 @@ class UwClient:
             half_open_max_calls=circuit_half_open_max_calls,
         )
         self._client: Optional[httpx.AsyncClient] = None
+        self._clock_skew_warned: bool = False
 
     def _auth_headers(self) -> Dict[str, str]:
         api_key = os.getenv(self.api_key_env, "").strip()
@@ -182,6 +201,7 @@ class UwClient:
             "x-revision",
             "x-version",
             "x-data-revision",
+            "date",
         }
         out: Dict[str, str] = {}
         for key, value in headers.items():
@@ -239,6 +259,35 @@ class UwClient:
                 received_at = time.time()
                 latency_ms = int((received_at - requested_at) * 1000)
                 response_headers = self._extract_response_headers(resp.headers)
+
+                # Optional observability: if the server provides an HTTP Date header, record
+                # it and compute an approximate client clock-skew estimate. This is useful
+                # when feature timestamps appear to be "in the future" due to local clock drift.
+                date_header = response_headers.get('date')
+                if date_header:
+                    server_iso = _parse_http_date_to_utc_iso(date_header)
+                    if server_iso:
+                        response_headers['server_date_utc'] = server_iso
+                        try:
+                            server_ts = datetime.datetime.fromisoformat(server_iso).timestamp()
+                            skew_sec = server_ts - received_at
+                            # Keep as a string to preserve the response_headers contract.
+                            response_headers['clock_skew_seconds'] = f'{skew_sec:.0f}'
+                            if (not self._clock_skew_warned) and abs(skew_sec) >= 120:
+                                self._clock_skew_warned = True
+                                try:
+                                    from .logging_config import structured_log  # local import to avoid cycles
+                                    structured_log(
+                                        'clock_skew_detected',
+                                        clock_skew_seconds=skew_sec,
+                                        server_date_utc=server_iso,
+                                        local_received_at_utc=datetime.datetime.fromtimestamp(received_at, tz=datetime.timezone.utc).isoformat(),
+                                        hint='System clock may be out of sync; enable OS time sync (NTP) to reduce future-timestamp violations.',
+                                    )
+                                except Exception:
+                                    logger.warning('clock_skew_detected', extra={'clock_skew_seconds': skew_sec, 'server_date_utc': server_iso})
+                        except Exception:
+                            pass
 
                 if 200 <= resp.status_code < 300:
                     try:

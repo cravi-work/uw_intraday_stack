@@ -93,22 +93,49 @@ def _infer_daily_snapshot_effective_ts_utc(payload: Any) -> Optional[datetime.da
             if top is not None:
                 return top
 
-        # 2) First row in common containers
+        # 2) Date on rows in common containers
         for container_key in ("data", "results", "result", "items"):
             rows = payload.get(container_key)
             if isinstance(rows, list) and rows:
-                first = rows[0]
-                if isinstance(first, dict):
-                    row_date = _coerce_date_only(first.get("date"))
-                    if row_date is not None:
-                        return row_date
+                # Some endpoints return newest-last; others return newest-first.
+                # Check a small, deterministic sample: first, last, then up to 3 more.
+                sample_rows = []
+                sample_rows.append(rows[0])
+                if len(rows) > 1:
+                    sample_rows.append(rows[-1])
+                    sample_rows.extend(rows[1:4])
+
+                best_row_date: Optional[dt.datetime] = None
+                for row in sample_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    for k in ("date", "as_of", "asof", "snapshot_date", "snapshotDate", "asOf"):
+                        row_date = _coerce_date_only(row.get(k))
+                        if row_date is not None:
+                            if best_row_date is None or row_date > best_row_date:
+                                best_row_date = row_date
+
+                if best_row_date is not None:
+                    return best_row_date
 
     elif isinstance(payload, list) and payload:
-        first = payload[0]
-        if isinstance(first, dict):
-            row_date = _coerce_date_only(first.get("date"))
-            if row_date is not None:
-                return row_date
+        sample_rows = [payload[0]]
+        if len(payload) > 1:
+            sample_rows.append(payload[-1])
+            sample_rows.extend(payload[1:4])
+
+        best_row_date: Optional[dt.datetime] = None
+        for row in sample_rows:
+            if not isinstance(row, dict):
+                continue
+            for k in ("date", "as_of", "asof", "snapshot_date", "snapshotDate", "asOf"):
+                row_date = _coerce_date_only(row.get(k))
+                if row_date is not None:
+                    if best_row_date is None or row_date > best_row_date:
+                        best_row_date = row_date
+
+        if best_row_date is not None:
+            return best_row_date
     return None
 
 class FeatureRow(TypedDict):
@@ -799,12 +826,13 @@ def _build_meta(
     }
 
 def _build_error_meta(
-    ctx: EndpointContext, 
-    extractor_name: str, 
-    lineage: Dict[str, Any], 
-    na_reason: str
+    ctx: EndpointContext,
+    extractor_name: str,
+    lineage: Dict[str, Any],
+    na_reason: str,
+    details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    meta = _build_meta(ctx, extractor_name, lineage)
+    meta = _build_meta(ctx, extractor_name, lineage, details=details)
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
     return meta
@@ -1673,6 +1701,51 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
     candidates: List[FeatureCandidate] = []
     l_rows: List[LevelRow] = []
 
+    def _safe_extract(
+        routing_key: str,
+        extractor_fn: Any,
+        payload: Any,
+        ctx: EndpointContext,
+        meta_bucket: str,
+        expected_features: List[str],
+    ) -> FeatureBundle:
+        """Contain any unexpected extractor exceptions so live ingest never hard-crashes.
+
+        If an extractor raises, we return a FeatureBundle with the expected feature keys set to None
+        and attach a structured NA meta payload so downstream gates can block safely."""
+        try:
+            return extractor_fn(payload, ctx)
+        except Exception as exc:
+            # Log with stack trace for diagnosis but keep the engine running.
+            logger.exception(
+                "Extractor exception contained",
+                extra={
+                    "event": "extractor_exception_contained",
+                    "routing_key": routing_key,
+                    "extractor": getattr(extractor_fn, "__name__", str(extractor_fn)),
+                    "endpoint_id": getattr(ctx, "endpoint_id", None),
+                    "path": getattr(ctx, "path", None),
+                    "exc_type": type(exc).__name__,
+                },
+            )
+
+            lineage = {
+                "metric_name": expected_features[0] if expected_features else routing_key,
+                "fields_used": [],
+            }
+            meta = _build_error_meta(
+                ctx,
+                getattr(extractor_fn, "__name__", routing_key),
+                lineage,
+                na_reason="extractor_exception",
+                details={"exc_type": type(exc).__name__, "exc_msg": str(exc)},
+            )
+            return FeatureBundle(
+                features={k: None for k in expected_features},
+                meta={meta_bucket: meta},
+            )
+
+
     for eid, ctx in contexts.items():
         payload = effective_payloads.get(eid)
         routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
@@ -1680,7 +1753,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
         safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
         
         if routing_key == "GEX":
-            f_bundle = extract_gex_sign(payload, ctx)
+            f_bundle = _safe_extract("GEX", extract_gex_sign, payload, ctx, meta_bucket="gex", expected_features=["net_gex_sign"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             
@@ -1692,22 +1765,22 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
                 
         elif routing_key == "FLOW":
-            f_bundle = extract_smart_whale_pressure(payload, ctx)
+            f_bundle = _safe_extract("FLOW", extract_smart_whale_pressure, payload, ctx, meta_bucket="flow", expected_features=["smart_whale_pressure"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("flow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "GREEKS":
-            f_bundle = extract_dealer_greeks(payload, ctx)
+            f_bundle = _safe_extract("GREEKS", extract_dealer_greeks, payload, ctx, meta_bucket="greeks", expected_features=["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("greeks", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "PRICE":
-            f_bundle = extract_price_features(payload, ctx)
+            f_bundle = _safe_extract("PRICE", extract_price_features, payload, ctx, meta_bucket="price", expected_features=["spot"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
         elif routing_key == "OI":
-            f_bundle = extract_oi_features(payload, ctx)
+            f_bundle = _safe_extract("OI", extract_oi_features, payload, ctx, meta_bucket="oi", expected_features=["oi_pressure"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1718,22 +1791,22 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
                 
         elif routing_key == "VOL":
-            f_bundle = extract_volatility_features(payload, ctx)
+            f_bundle = _safe_extract("VOL", extract_volatility_features, payload, ctx, meta_bucket="vol", expected_features=["iv_rank"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_TERM":
-            f_bundle = extract_vol_term_structure(payload, ctx)
+            f_bundle = _safe_extract("VOL_TERM", extract_vol_term_structure, payload, ctx, meta_bucket="vol_ts", expected_features=["vol_term_slope"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_SKEW":
-            f_bundle = extract_vol_skew(payload, ctx)
+            f_bundle = _safe_extract("VOL_SKEW", extract_vol_skew, payload, ctx, meta_bucket="skew", expected_features=["vol_skew"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "DARKPOOL":
-            f_bundle = extract_darkpool_pressure(payload, ctx)
+            f_bundle = _safe_extract("DARKPOOL", extract_darkpool_pressure, payload, ctx, meta_bucket="darkpool", expected_features=["darkpool_pressure"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1744,7 +1817,7 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
 
         elif routing_key == "LITFLOW":
-            f_bundle = extract_litflow_pressure(payload, ctx)
+            f_bundle = _safe_extract("LITFLOW", extract_litflow_pressure, payload, ctx, meta_bucket="litflow", expected_features=["litflow_pressure"])
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
                 
