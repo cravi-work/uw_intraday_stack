@@ -39,30 +39,35 @@ def grab_list(obj: Any) -> List[Dict[str, Any]]:
     """
     Robustly unwraps API lists.
     Guarantees output is List[Dict]. Filters out non-dict items.
+
+    Supports the common vendor wrapper shapes used in this repo without
+    attempting arbitrary schema flattening.
     """
-    if is_na(obj): return []
-    
-    # Helper to filter dicts only
+    if is_na(obj):
+        return []
+
     def _filter_dicts(lst: List[Any]) -> List[Dict[str, Any]]:
         return [x for x in lst if isinstance(x, dict)]
 
-    if isinstance(obj, list):
-        return _filter_dicts(obj)
-        
-    if isinstance(obj, dict):
-        # 1. 'data' wrapper
-        if "data" in obj and isinstance(obj["data"], list): 
-            return _filter_dicts(obj["data"])
-            
-        # 2. Common keys
-        for k in ["trades", "results", "history", "items"]:
-            val = obj.get(k)
-            if isinstance(val, list): 
-                return _filter_dicts(val)
-                
-        # 3. Fallback: scan values
-        for v in obj.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict): 
+    def _unwrap(candidate: Any, depth: int = 0) -> List[Dict[str, Any]]:
+        if depth > 4 or is_na(candidate):
+            return []
+        if isinstance(candidate, list):
+            return _filter_dicts(candidate)
+        if not isinstance(candidate, dict):
+            return []
+
+        for k in ["data", "trades", "results", "result", "history", "items"]:
+            if k not in candidate:
+                continue
+            out = _unwrap(candidate.get(k), depth + 1)
+            if out:
+                return out
+
+        for v in candidate.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
                 return _filter_dicts(v)
-                
-    return []
+
+        return []
+
+    return _unwrap(obj)

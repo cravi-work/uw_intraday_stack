@@ -832,7 +832,7 @@ def _build_error_meta(
     na_reason: str,
     details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    meta = _build_meta(ctx, extractor_name, lineage, details=details)
+    meta = _build_meta(ctx, extractor_name, lineage, details or {})
     meta["freshness_state"] = "ERROR"
     meta["na_reason"] = na_reason
     return meta
@@ -945,15 +945,15 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, prov)})
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
-    lineage = _with_output_domain({
+    lineage = {
         "metric_name": "smart_whale_pressure",
         "fields_used": ["premium", "dte", "side", "put_call", "option_symbol", "expiration", "multiplier", "deliverable"],
-        "units_expected": "Normalized Directional Pressure [-1, 1]",
+        "units_expected": "Net Premium Flow (USD)",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
-        "quality_policy": "None on filtered zeros to avoid false baseline certainty; suppress on contract normalization failure",
+        "quality_policy": "None on filtered zeros / unparseable rows to avoid false baseline certainty; neutral only for structurally empty valid payload; suppress on contract normalization failure",
         "criticality": "CRITICAL"
-    }, emitted_units="normalized_directional_pressure", raw_input_units="Net Premium Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
+    }
 
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency")})
@@ -963,15 +963,18 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         trades = flow_payload["data"]
 
     if trades and not all(isinstance(t, dict) for t in trades):
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=flow_payload,
+            feature_output_reason="schema_non_dict_rows",
+            parsed_row_count=0,
+            rows_discarded_before_extraction=0,
+            effective_timestamp_source="unknown",
+        )
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
+    # Only structurally empty payloads get a neutral output
     if not trades:
-        # Neutral (0.0) when the endpoint returns an empty set.
-        #
-        # Rationale: returning None here can hard-block LIVE predictions when flow endpoints
-        # intermittently return empty payloads (common near open or for quieter tickers).
-        # A neutral value preserves safety (no directional signal) while meta marks the
-        # confidence impact as degraded.
         meta = _build_meta(
             ctx,
             "extract_smart_whale_pressure",
@@ -989,6 +992,14 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
 
     norm_summary = normalize_option_rows(trades)
     if norm_summary.status == "INVALID":
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=flow_payload,
+            feature_output_reason="contract_normalization_invalid",
+            parsed_row_count=0,
+            rows_discarded_before_extraction=len(trades),
+            effective_timestamp_source="unknown",
+        )
         return _build_contract_normalization_failure_bundle(
             ctx,
             "extract_smart_whale_pressure",
@@ -998,20 +1009,28 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
             meta_key="flow",
             summary=norm_summary,
         )
+
     contract_map = normalized_contract_map(norm_summary)
 
-    whale_call, whale_put = 0.0, 0.0
-    valid_count, skip_missing_fields, skip_bad_type, skip_bad_side, skip_threshold = 0, 0, 0, 0, 0
+    whale_call = 0.0
+    whale_put = 0.0
+    valid_count = 0
+    skip_missing_fields = 0
+    skip_bad_type = 0
+    skip_bad_side = 0
+    skip_threshold = 0
 
     pc_map = {"C": "CALL", "CALL": "CALL", "CALLS": "CALL", "P": "PUT", "PUT": "PUT", "PUTS": "PUT"}
     side_map = {"ASK": "BULL", "BUY": "BULL", "BULLISH": "BULL", "BOT": "BULL", "BID": "BEAR", "SELL": "BEAR", "BEARISH": "BEAR", "SOLD": "BEAR"}
 
     for idx, t in enumerate(trades):
-        prem = safe_float(t.get("premium"))
-        dte = safe_float(t.get("dte"))
-        side_raw = t.get("side")
+        prem = safe_float(t.get("premium") or t.get("price") or t.get("notional"))
+        dte = safe_float(t.get("dte") or t.get("days_to_expiration"))
+        side_raw = t.get("side") or t.get("direction")
         identity = _normalized_identity_for_row(contract_map, idx)
-        pc_raw = identity.put_call if identity is not None else (t.get("put_call") or t.get("option_type") or t.get("type") or t.get("pc"))
+        pc_raw = identity.put_call if identity is not None else (
+            t.get("put_call") or t.get("option_type") or t.get("type") or t.get("pc")
+        )
 
         if prem is None or dte is None or is_na(side_raw) or is_na(pc_raw):
             skip_missing_fields += 1
@@ -1026,7 +1045,6 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         if not side_norm:
             skip_bad_side += 1
             continue
-
         if prem < min_premium or dte > max_dte:
             skip_threshold += 1
             continue
@@ -1043,25 +1061,50 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
             else:
                 whale_put -= prem
 
+    # filtered/unparseable/unknown-side => NA, not neutral
+    if valid_count == 0:
+        reason = "filtered_to_zero"
+        if skip_bad_side > 0 and skip_bad_type == 0 and skip_missing_fields == 0 and skip_threshold == 0:
+            reason = "unknown_side_labels"
+        elif skip_missing_fields > 0 and skip_bad_side == 0 and skip_bad_type == 0 and skip_threshold == 0:
+            reason = "unparseable_rows"
+
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=flow_payload,
+            feature_output_reason=reason,
+            parsed_row_count=0,
+            rows_discarded_before_extraction=len(trades),
+            effective_timestamp_source="unknown",
+        )
+        return FeatureBundle(
+            {"smart_whale_pressure": None},
+            {
+                "flow": _build_error_meta(
+                    ctx,
+                    "extract_smart_whale_pressure",
+                    lineage,
+                    reason,
+                    details={
+                        "n_trades": len(trades),
+                        "skip_missing_fields": skip_missing_fields,
+                        "skip_bad_type": skip_bad_type,
+                        "skip_bad_side": skip_bad_side,
+                        "skip_threshold": skip_threshold,
+                    },
+                )
+            },
+        )
+
+    net = whale_call - whale_put
     details = {
         **_extract_payload_provenance(flow_payload),
         "contract_normalization": norm_summary.as_dict(),
         "n_raw_trades": len(trades),
+        "n_valid": valid_count,
+        "net_prem": net,
+        "status": "ok",
     }
-
-    if valid_count == 0:
-        details.update({
-            "status": "computed_neutral_no_trades_met_thresholds",
-            "skipped_threshold": skip_threshold,
-            "confidence_impact": "DEGRADED",
-        })
-        meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, details)
-        meta["freshness_state"] = "EMPTY_VALID"
-        meta["na_reason"] = "no_trades_met_policy_thresholds"
-        return FeatureBundle({"smart_whale_pressure": 0.0}, {"flow": meta})
-
-    net = whale_call - whale_put
-    details.update({"net_prem": net, "n_valid": valid_count})
     meta = _build_meta(ctx, "extract_smart_whale_pressure", lineage, details)
     return FeatureBundle({"smart_whale_pressure": _normalize_signed(net, scale=norm_scale)}, {"flow": meta})
 
@@ -1146,111 +1189,93 @@ def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: 
     }, {"greeks": meta})
 
 def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
-    lineage = _with_output_domain({
+    lineage = {
         "metric_name": "net_gex_sign",
-        # UW payloads for spot exposures are not fully stable; different endpoints / versions
-        # have been observed to emit the aggregate gamma exposure under different keys.
-        "fields_used": ["gamma_exposure", "gex", "gamma", "total_gamma", "net_gamma", "net_gex"],
-        "units_expected": "Directional Sign [-1, 1]",
+        "fields_used": ["gamma_exposure"],
+        "units_expected": "Sign (+1.0, 0.0, -1.0)",
         "normalization": "Directional sign clamping",
         "session_applicability": "PREMARKET/RTH",
         "quality_policy": "None on missing exposure fields",
         "criticality": "CRITICAL"
-    }, emitted_units="directional_sign", raw_input_units="Gamma Exposure (provider aggregate units)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="discrete_sign", allowed_values=(-1.0, 0.0, 1.0))
-    
+    }
+
     if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency")})
 
     rows = grab_list(spot_exposures_payload)
-    if not rows and isinstance(spot_exposures_payload, dict):
-        # Some vendor responses return a single dict row (sometimes nested under wrapper keys).
-        for k in ("data", "result", "results", "item", "summary"):
-            v = spot_exposures_payload.get(k)
-            if isinstance(v, dict):
-                rows = [v]
-                break
-        if not rows:
-            rows = [spot_exposures_payload]
     if not rows:
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=spot_exposures_payload,
+            feature_output_reason="no_rows",
+            parsed_row_count=0,
+            rows_discarded_before_extraction=0,
+            effective_timestamp_source="unknown",
+        )
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "no_rows")})
 
-    # Keys we attempt (in priority order) for gamma exposure.
-    # Vendor responses vary across endpoints; we support both snake_case and camelCase.
     gex_aliases = (
-        # snake_case
-        "net_gamma_exposure",
-        "net_gamma_exposure_notional",
+        "gamma_exposure",
+        "gex",
+        "gamma",
         "net_gamma",
         "net_gex",
-        "net_gex_notional",
-        "gamma_exposure",
         "total_gamma",
-        "gamma",
-        "gex",
-        # camelCase variants
-        "netGammaExposure",
-        "netGammaExposureNotional",
-        "netGamma",
-        "netGex",
-        "netGexNotional",
-        "gammaExposure",
+        "net_gamma_exposure",
     )
 
-    def _extract_gex_value(row: Dict[str, Any]) -> Optional[float]:
-        lower_map = {str(k).lower(): k for k in row.keys()}
-        for alias in gex_aliases:
-            k = lower_map.get(alias.lower())
-            if k is None:
-                continue
-            v = row.get(k)
-            # Accept 0 values as valid.
-            if v is None:
-                continue
-            if isinstance(v, str) and v.strip() == "":
-                continue
-            f = safe_float(v)
-            if f is not None:
-                return f
-
-        # Heuristic fallback: a numeric field that looks like a net gamma exposure.
-        for k, v in row.items():
-            lk = str(k).lower()
-            if "net" in lk and ("gex" in lk or "gamma" in lk) and ("exposure" in lk or "notional" in lk):
-                f = safe_float(v)
-                if f is not None:
-                    return f
-        return None
-    
     tot_gamma = 0.0
     valid_rows = 0
+
     for r in rows:
-        g = _extract_gex_value(r)
+        if not isinstance(r, dict):
+            continue
+        g = None
+        for alias in gex_aliases:
+            g = safe_float(r.get(alias))
+            if g is not None:
+                break
         if g is not None:
             tot_gamma += g
             valid_rows += 1
-            
-    if valid_rows == 0:
-        # Keep the error reason stable for existing dashboards, but attach helpful diagnostics.
-        sample_keys = sorted({k for r in rows[:3] for k in (r or {}).keys()})
-        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(
-            ctx,
-            "extract_gex_sign",
-            lineage,
-            "missing_gamma_exposure_fields",
-            details={
-                "attempted_field_aliases": list(gex_aliases),
-                "sample_row_keys": sample_keys,
-                "sample_row_count": min(3, len(rows)),
-                "total_row_count": len(rows),
-            }
-        )})
-    
-    if abs(tot_gamma) <= 1e-9: 
-        sign = 0.0
-    else: 
-        sign = 1.0 if tot_gamma > 0 else -1.0
 
-    meta = _build_meta(ctx, "extract_gex_sign", lineage, {**_extract_payload_provenance(spot_exposures_payload), "total": tot_gamma, "n_strikes": valid_rows})
+    if valid_rows == 0:
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=spot_exposures_payload,
+            feature_output_reason="missing_gamma_exposure_fields",
+            parsed_row_count=0,
+            rows_discarded_before_extraction=len(rows),
+            effective_timestamp_source="unknown",
+        )
+        return FeatureBundle(
+            {"net_gex_sign": None},
+            {
+                "gex": _build_error_meta(
+                    ctx,
+                    "extract_gex_sign",
+                    lineage,
+                    "missing_gamma_exposure_fields",
+                    details={
+                        "attempted_aliases": list(gex_aliases),
+                        "row_count": len(rows),
+                        "sample_keys": sorted(list(rows[0].keys()))[:20] if rows and isinstance(rows[0], dict) else [],
+                    },
+                )
+            },
+        )
+
+    sign = 0.0 if abs(tot_gamma) <= 1e-9 else (1.0 if tot_gamma > 0 else -1.0)
+    meta = _build_meta(
+        ctx,
+        "extract_gex_sign",
+        lineage,
+        {
+            **_extract_payload_provenance(spot_exposures_payload),
+            "total": tot_gamma,
+            "n_strikes": valid_rows,
+        },
+    )
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
 def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
@@ -1526,6 +1551,44 @@ def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBun
 
     return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, prov)})
 
+def _emit_endpoint_payload_observability(
+    *,
+    ctx: EndpointContext,
+    payload: Any,
+    feature_output_reason: str,
+    parsed_row_count: int,
+    rows_discarded_before_extraction: int,
+    effective_timestamp_source: str,
+) -> None:
+    try:
+        payload_rows = grab_list(payload)
+        payload_row_count = len(payload_rows) if payload_rows else 0
+
+        sample_keys = []
+        if payload_rows and isinstance(payload_rows[0], dict):
+            sample_keys = sorted(list(payload_rows[0].keys()))[:20]
+        elif isinstance(payload, dict):
+            sample_keys = sorted(list(payload.keys()))[:20]
+
+        logger.info(
+            "endpoint_payload_observability",
+            extra={
+                "event": "endpoint_payload_observability",
+                "endpoint_id": getattr(ctx, "endpoint_id", None),
+                "endpoint_name": getattr(ctx, "name", None),
+                "path": getattr(ctx, "path", None),
+                "payload_row_count": payload_row_count,
+                "parsed_row_count": parsed_row_count,
+                "effective_timestamp_source": effective_timestamp_source,
+                "rows_discarded_before_extraction": rows_discarded_before_extraction,
+                "feature_output_reason": feature_output_reason,
+                "payload_shape": type(payload).__name__,
+                "payload_sample_keys": sample_keys,
+            },
+        )
+    except Exception:
+        logger.exception("failed to emit endpoint_payload_observability")
+
 def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "vol_skew",
@@ -1698,89 +1761,65 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
     def rank_freshness(fs: str) -> int:
         return {"FRESH": 1, "STALE_CARRY": 2, "EMPTY_VALID": 3, "ERROR": 4}.get(fs, 5)
 
+    def _all_none(feature_bundle: FeatureBundle) -> bool:
+        return all(v is None for v in feature_bundle.features.values())
+
+    def _emit_bundle_observability(meta_bucket: str, f_bundle: FeatureBundle, payload: Any, ctx: EndpointContext) -> None:
+        if not _all_none(f_bundle):
+            return
+        meta = f_bundle.meta.get(meta_bucket, {}) if isinstance(f_bundle.meta, dict) else {}
+        _emit_endpoint_payload_observability(
+            ctx=ctx,
+            payload=payload,
+            feature_output_reason=meta.get("na_reason", "unusable_payload"),
+            parsed_row_count=0,
+            rows_discarded_before_extraction=len(grab_list(payload) or []),
+            effective_timestamp_source=(meta.get("metric_lineage", {}) or {}).get("timestamp_source", "unknown"),
+        )
+
     candidates: List[FeatureCandidate] = []
     l_rows: List[LevelRow] = []
-
-    def _safe_extract(
-        routing_key: str,
-        extractor_fn: Any,
-        payload: Any,
-        ctx: EndpointContext,
-        meta_bucket: str,
-        expected_features: List[str],
-    ) -> FeatureBundle:
-        """Contain any unexpected extractor exceptions so live ingest never hard-crashes.
-
-        If an extractor raises, we return a FeatureBundle with the expected feature keys set to None
-        and attach a structured NA meta payload so downstream gates can block safely."""
-        try:
-            return extractor_fn(payload, ctx)
-        except Exception as exc:
-            # Log with stack trace for diagnosis but keep the engine running.
-            logger.exception(
-                "Extractor exception contained",
-                extra={
-                    "event": "extractor_exception_contained",
-                    "routing_key": routing_key,
-                    "extractor": getattr(extractor_fn, "__name__", str(extractor_fn)),
-                    "endpoint_id": getattr(ctx, "endpoint_id", None),
-                    "path": getattr(ctx, "path", None),
-                    "exc_type": type(exc).__name__,
-                },
-            )
-
-            lineage = {
-                "metric_name": expected_features[0] if expected_features else routing_key,
-                "fields_used": [],
-            }
-            meta = _build_error_meta(
-                ctx,
-                getattr(extractor_fn, "__name__", routing_key),
-                lineage,
-                na_reason="extractor_exception",
-                details={"exc_type": type(exc).__name__, "exc_msg": str(exc)},
-            )
-            return FeatureBundle(
-                features={k: None for k in expected_features},
-                meta={meta_bucket: meta},
-            )
-
 
     for eid, ctx in contexts.items():
         payload = effective_payloads.get(eid)
         routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
-        
+
         safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
-        
+
         if routing_key == "GEX":
-            f_bundle = _safe_extract("GEX", extract_gex_sign, payload, ctx, meta_bucket="gex", expected_features=["net_gex_sign"])
+            f_bundle = extract_gex_sign(payload, ctx)
+            _emit_bundle_observability("gex", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-            
+
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
                 levels = build_gex_levels(payload)
                 for l_type, price, mag, details in levels:
                     meta = _build_meta(ctx, "build_gex_levels", {"metric_name": "gex_levels", "fields_used": ["strike", "gamma_exposure"]}, details)
                     meta = _annotate_level_usage_contract(meta, l_type)
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
-                
+
         elif routing_key == "FLOW":
-            f_bundle = _safe_extract("FLOW", extract_smart_whale_pressure, payload, ctx, meta_bucket="flow", expected_features=["smart_whale_pressure"])
+            f_bundle = extract_smart_whale_pressure(payload, ctx)
+            _emit_bundle_observability("flow", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("flow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-                
+
         elif routing_key == "GREEKS":
-            f_bundle = _safe_extract("GREEKS", extract_dealer_greeks, payload, ctx, meta_bucket="greeks", expected_features=["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"])
+            f_bundle = extract_dealer_greeks(payload, ctx)
+            _emit_bundle_observability("greeks", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("greeks", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-                
+
         elif routing_key == "PRICE":
-            f_bundle = _safe_extract("PRICE", extract_price_features, payload, ctx, meta_bucket="price", expected_features=["spot"])
+            f_bundle = extract_price_features(payload, ctx)
+            _emit_bundle_observability("price", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-                
+
         elif routing_key == "OI":
-            f_bundle = _safe_extract("OI", extract_oi_features, payload, ctx, meta_bucket="oi", expected_features=["oi_pressure"])
+            f_bundle = extract_oi_features(payload, ctx)
+            _emit_bundle_observability("oi", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1789,24 +1828,28 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     meta = _build_meta(ctx, "build_oi_walls", {"metric_name": "oi_walls", "fields_used": ["strike", "open_interest"]}, details)
                     meta = _annotate_level_usage_contract(meta, l_type)
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
-                
+
         elif routing_key == "VOL":
-            f_bundle = _safe_extract("VOL", extract_volatility_features, payload, ctx, meta_bucket="vol", expected_features=["iv_rank"])
+            f_bundle = extract_volatility_features(payload, ctx)
+            _emit_bundle_observability("vol", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_TERM":
-            f_bundle = _safe_extract("VOL_TERM", extract_vol_term_structure, payload, ctx, meta_bucket="vol_ts", expected_features=["vol_term_slope"])
+            f_bundle = extract_vol_term_structure(payload, ctx)
+            _emit_bundle_observability("vol_ts", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "VOL_SKEW":
-            f_bundle = _safe_extract("VOL_SKEW", extract_vol_skew, payload, ctx, meta_bucket="skew", expected_features=["vol_skew"])
+            f_bundle = extract_vol_skew(payload, ctx)
+            _emit_bundle_observability("skew", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
         elif routing_key == "DARKPOOL":
-            f_bundle = _safe_extract("DARKPOOL", extract_darkpool_pressure, payload, ctx, meta_bucket="darkpool", expected_features=["darkpool_pressure"])
+            f_bundle = extract_darkpool_pressure(payload, ctx)
+            _emit_bundle_observability("darkpool", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
             if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
@@ -1817,46 +1860,47 @@ def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, En
                     l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
 
         elif routing_key == "LITFLOW":
-            f_bundle = _safe_extract("LITFLOW", extract_litflow_pressure, payload, ctx, meta_bucket="litflow", expected_features=["litflow_pressure"])
+            f_bundle = extract_litflow_pressure(payload, ctx)
+            _emit_bundle_observability("litflow", f_bundle, payload, ctx)
             for k, v in f_bundle.features.items():
                 candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-                
+
         elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
             raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")
 
     grouped: Dict[str, List[FeatureCandidate]] = {}
-    for c in candidates: 
+    for c in candidates:
         grouped.setdefault(c.feature_key, []).append(c)
 
     f_rows: List[FeatureRow] = []
     for f_key, group in grouped.items():
         group.sort(key=lambda x: (x.is_none, x.freshness_rank, x.stale_age, x.path_priority, x.endpoint_id))
         best = group[0]
-        
+
         for other in group[1:]:
-            if (other.is_none == best.is_none and other.freshness_rank == best.freshness_rank and 
+            if (other.is_none == best.is_none and other.freshness_rank == best.freshness_rank and
                 other.stale_age == best.stale_age and other.path_priority == best.path_priority):
                 if best.feature_value is not None and other.feature_value is not None:
                     if not math.isclose(best.feature_value, other.feature_value, abs_tol=1e-9):
                         raise RuntimeError(f"FEATURE_CONFLICT:{f_key} - Endpoint {best.endpoint_id} vs {other.endpoint_id} generated divergent values at equal rank.")
-                    
+
         meta = copy.deepcopy(best.meta_json)
         if len(group) > 1:
             meta.setdefault("details", {})["shadowed_candidates"] = [
                 {"endpoint_id": c.endpoint_id, "is_none": c.is_none, "freshness_rank": c.freshness_rank} for c in group[1:]
             ]
-            
+
         f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
-        
+
         metric_family = meta.get("metric_lineage", {}).get("metric_name", "unknown")
         if best.feature_value is not None and math.isfinite(best.feature_value):
             logger.info(
-                f"Feature emitted: {f_key}", 
+                f"Feature emitted: {f_key}",
                 extra={"counter": "features_emitted_by_family", "family": metric_family, "feature_key": f_key}
             )
         else:
             logger.warning(
-                f"Feature suppressed: {f_key}", 
+                f"Feature suppressed: {f_key}",
                 extra={"counter": "features_suppressed_by_family", "family": metric_family, "feature_key": f_key}
             )
 

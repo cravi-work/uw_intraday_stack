@@ -1,8 +1,7 @@
+import asyncio
 import sys
 import time
 import types
-
-import pytest
 
 
 # The project uses DuckDB for persistence, but unit tests that exercise pure ingest
@@ -59,7 +58,6 @@ class _StubClient:
         self._n = 0
 
     async def request(self, method, path, *, path_params=None, query_params=None):
-        # Record the request as seen by the ingest layer.
         self.calls.append(
             {
                 "method": method,
@@ -75,8 +73,7 @@ class _StubClient:
         return {"attempt": 2}, _hr(status_code=200, ok=True, payload_json={"data": {"ok": True}}), "MISS"
 
 
-@pytest.mark.asyncio
-async def test_market_tide_retries_once_without_date_on_422():
+def test_market_tide_retries_once_without_date_on_422():
     client = _StubClient()
 
     market_call = PlannedCall(
@@ -92,21 +89,21 @@ async def test_market_tide_retries_once_without_date_on_422():
         stale_affects_confidence=False,
     )
 
-    results = await fetch_all(
-        client,
-        tickers=[],
-        date_str="2026-03-05",
-        core=[],
-        market=[market_call],
-        max_concurrency=2,
+    results = asyncio.run(
+        fetch_all(
+            client,
+            tickers=[],
+            date_str="2026-03-05",
+            core=[],
+            market=[market_call],
+            max_concurrency=2,
+        )
     )
 
-    # First request uses date; retry removes it.
     assert len(client.calls) == 2
     assert client.calls[0]["query_params"].get("date") == "2026-03-05"
     assert "date" not in client.calls[1]["query_params"]
 
-    # Final stored result reflects the retry (status 200) and the date-less query params.
     assert len(results) == 1
     (_tkr, _call, _sig, qp_used, res, _cb) = results[0]
     assert "date" not in qp_used

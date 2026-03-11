@@ -437,6 +437,65 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[PlannedCall], List[PlannedCall]]:
+    date_capable_default_paths = {
+        "/api/stock/{ticker}/ohlc/{candle_size}",
+        "/api/stock/{ticker}/greek-exposure/strike",
+        "/api/stock/{ticker}/greek-exposure/expiry",
+        "/api/stock/{ticker}/spot-exposures/expiry-strike",
+        "/api/stock/{ticker}/flow-per-strike",
+        "/api/stock/{ticker}/historical-risk-reversal-skew",
+        "/api/stock/{ticker}/spot-exposures",
+        "/api/stock/{ticker}/spot-exposures/strike",
+        "/api/stock/{ticker}/greek-exposure",
+        "/api/stock/{ticker}/flow-per-strike-intraday",
+        "/api/stock/{ticker}/oi-per-strike",
+        "/api/stock/{ticker}/oi-change",
+        "/api/stock/{ticker}/volatility/term-structure",
+        "/api/stock/{ticker}/iv-rank",
+        "/api/darkpool/{ticker}",
+        "/api/lit-flow/{ticker}",
+    }
+    date_capable_market_paths = {
+        "/api/market/market-tide",
+        "/api/market/top-net-impact",
+    }
+
+    registry = None
+    try:
+        registry = load_api_catalog("api_catalog.generated.yaml")
+    except Exception:
+        registry = None
+
+    def _allowed_query_param_names(method: str, path: str) -> set[str]:
+        if registry is None:
+            return set()
+        try:
+            endpoint = registry.get(method, path)
+        except Exception:
+            return set()
+        return {
+            param.name
+            for param in getattr(endpoint, "parameters", ())
+            if getattr(param, "location", None) == "query"
+        }
+
+    def _normalize_query_params(method: str, path: str, query_params: Dict[str, Any], *, market: bool) -> Dict[str, Any]:
+        qp = dict(query_params or {})
+        allowed_query_names = _allowed_query_param_names(method, path)
+        needs_date = path in (date_capable_market_paths if market else date_capable_default_paths)
+
+        if needs_date and "date" in allowed_query_names and "date" not in qp:
+            qp["date"] = "{date}"
+
+        if path == "/api/market/market-tide" and "interval_5m" in allowed_query_names and "interval_5m" not in qp:
+            qp["interval_5m"] = 1
+
+        for key, value in list(qp.items()):
+            if type(value) is bool:
+                qp[key] = int(value)
+
+        return qp
+
     def _parse(entries, *, section_name: str, market: bool = False) -> List[PlannedCall]:
         planned: List[PlannedCall] = []
         for idx, raw_entry in enumerate(entries or []):
@@ -453,8 +512,8 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
                     entry["name"],
                     entry["method"],
                     entry["path"],
-                    entry["path_params"],
-                    entry["query_params"],
+                    dict(entry["path_params"] or {}),
+                    _normalize_query_params(entry["method"], entry["path"], entry["query_params"], market=market),
                     market,
                     entry["purpose"],
                     entry["decision_path"],
@@ -469,7 +528,11 @@ def build_plan(cfg: Dict[str, Any], plan_yaml: Dict[str, Any]) -> Tuple[List[Pla
     core = _parse(plan_yaml.get("plans", {}).get("default", []), section_name="default")
     market = []
     if cfg["ingestion"].get("enable_market_context"):
-        market = _parse(plan_yaml.get("plans", {}).get("market_context", []), section_name="market_context", market=True)
+        market = _parse(
+            plan_yaml.get("plans", {}).get("market_context", []),
+            section_name="market_context",
+            market=True,
+        )
     return core, market
 
 
@@ -516,10 +579,15 @@ def _expand(call: PlannedCall, ticker: str, date_str: str) -> Tuple[Dict[str, An
     def _sub(v):
         if isinstance(v, str):
             return v.replace("{ticker}", ticker).replace("{date}", date_str)
+        if type(v) is bool:
+            return int(v)
         return v
+
     path_params = {k: _sub(v) for k, v in call.path_params.items()}
+
     if "{ticker}" in call.path:
         path_params["ticker"] = ticker
+
     query_params = {k: _sub(v) for k, v in call.query_params.items() if v is not None}
     return path_params, query_params
 
@@ -545,21 +613,20 @@ def _market_tide_retry_query_params(initial: Optional[Dict[str, Any]]) -> list[O
     qp: Dict[str, Any] = dict(initial)
     retries: list[Optional[Dict[str, Any]]] = []
 
-    if 'interval_5m' in qp:
+    if "interval_5m" in qp:
         qp1 = dict(qp)
-        qp1.pop('interval_5m', None)
+        qp1.pop("interval_5m", None)
         retries.append(qp1 or None)
         qp = qp1
 
-    if 'date' in qp:
+    if "date" in qp:
         qp2 = dict(qp)
-        qp2.pop('date', None)
+        qp2.pop("date", None)
         retry = qp2 or None
         if not retries or retries[-1] != retry:
             retries.append(retry)
         qp = qp2
 
-    # Ensure we always end at "no query params" for a final attempt.
     if not retries or retries[-1] is not None:
         retries.append(None)
 
@@ -567,24 +634,21 @@ def _market_tide_retry_query_params(initial: Optional[Dict[str, Any]]) -> list[O
 
 
 async def fetch_all(
-    client: UwClient, 
-    tickers: List[str], 
-    date_str: str, 
-    core: List[PlannedCall], 
-    market: List[PlannedCall], 
-    *, 
-    max_concurrency: int
+    client: UwClient,
+    tickers: List[str],
+    date_str: str,
+    core: List[PlannedCall],
+    market: List[PlannedCall],
+    *,
+    max_concurrency: int,
 ):
     tasks = []
     sem = asyncio.Semaphore(max(1, int(max_concurrency)))
-    
+
     async def _one(tkr: str, c: PlannedCall, pp: Dict[str, Any], qp: Dict[str, Any]):
         async with sem:
             sig, res, cb = await client.request(c.method, c.path, path_params=pp, query_params=qp)
 
-            # Known live behavior: /api/market/market-tide can return HTTP 422 when the optional
-            # 'date' parameter is supplied (e.g., some accounts/dates do not support same-day).
-            # Since this endpoint is context-only, a single safe retry without 'date' is allowed.
             qp_used = qp
             try:
                 status_code = getattr(res, "status_code", None)
@@ -592,9 +656,21 @@ async def fetch_all(
                 status_code = None
 
             if c.name == "market_tide" and status_code in (400, 422) and isinstance(qp, dict) and qp:
-                for qp_retry in _market_tide_retry_query_params(qp):
-                    if qp_retry == qp:
+                retry_sequence = []
+
+                if status_code == 422 and "date" in qp:
+                    qp_no_date = dict(qp)
+                    qp_no_date.pop("date", None)
+                    retry_sequence.append(qp_no_date or None)
+
+                retry_sequence.extend(_market_tide_retry_query_params(qp))
+
+                seen_retry_params = []
+                for candidate in retry_sequence:
+                    if candidate == qp or candidate in seen_retry_params:
                         continue
+                    seen_retry_params.append(candidate)
+
                     logger.warning(
                         "market_tide client error; retrying with adjusted query params",
                         extra={
@@ -602,24 +678,26 @@ async def fetch_all(
                             "ticker": tkr,
                             "orig_status_code": status_code,
                             "orig_query_params": qp,
-                            "retry_query_params": qp_retry,
+                            "retry_query_params": candidate,
                         },
                     )
+
                     sig2, res2, cb2 = await client.request(
                         c.method,
                         c.path,
                         path_params=pp,
-                        query_params=(qp_retry or {}),
+                        query_params=(candidate or {}),
                     )
+
                     try:
                         status2 = getattr(res2, "status_code", None)
                     except Exception:
                         status2 = None
+
                     if status2 is not None and status2 < 400:
                         sig, res, cb = sig2, res2, cb2
-                        qp_used = (qp_retry or {})
+                        qp_used = (candidate or {})
                         break
-
 
             return (tkr, c, sig, qp_used, res, cb)
 
@@ -627,6 +705,7 @@ async def fetch_all(
         for c in core:
             pp, qp = _expand(c, tkr, date_str)
             tasks.append(_one(tkr, c, pp, qp))
+
     for c in market:
         pp, qp = _expand(c, "", date_str)
         tasks.append(_one("__MARKET__", c, pp, qp))

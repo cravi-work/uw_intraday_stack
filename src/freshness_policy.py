@@ -87,8 +87,6 @@ class FeaturePolicyAssessment:
     stale_age_minutes: Optional[int]
     time_provenance_degraded: bool
     policy_source: str
-    # When we clamp an effective timestamp that is slightly ahead of asof_utc, record
-    # the original observed forward drift (seconds). This helps diagnose local clock skew.
     future_drift_seconds: Optional[int] = None
 
 
@@ -197,16 +195,6 @@ _ENDPOINT_POLICIES: Tuple[EndpointFreshnessPolicy, ...] = (
             "/api/stock/{ticker}/volatility/term-structure",
             "/api/stock/{ticker}/historical-risk-reversal-skew",
         ),
-        # Unusual Whales "snapshot" endpoints (OI, vol surfaces, exposures) often update
-        # at session cadence rather than true intraday cadence. During LIVE runs this means a
-        # valid snapshot can be ~15-72h old (prior session / weekend) even though the payload
-        # itself is "fresh" (200 OK) and structurally valid.
-        #
-        # If we keep a tight join-skew (e.g., 1.5h), the engine will drop these inputs and can
-        # end up with near-zero feature coverage, triggering OOD + risk-gate blocks.
-        #
-        # Guardrail: we still reject extremely old snapshots (weeks/months) by bounding the
-        # allowable join-skew/age window.
         max_tolerated_age_seconds=7 * 24 * 3600,
         join_skew_tolerance_seconds=7 * 24 * 3600,
         criticality=EndpointCriticality.NON_CRITICAL,
@@ -276,8 +264,8 @@ def resolve_endpoint_policy(method: str, path: str, cfg: Mapping[str, Any]) -> E
                 name=policy.name,
                 method=policy.method,
                 path_patterns=policy.path_patterns,
-                max_tolerated_age_seconds=_clamp_positive_int(policy.max_tolerated_age_seconds, defaults.max_tolerated_age_seconds),
-                join_skew_tolerance_seconds=_clamp_positive_int(policy.join_skew_tolerance_seconds, defaults.join_skew_tolerance_seconds),
+                max_tolerated_age_seconds=policy.max_tolerated_age_seconds,
+                join_skew_tolerance_seconds=policy.join_skew_tolerance_seconds,
                 criticality=policy.criticality,
                 lag_class=policy.lag_class,
                 fresh_behavior=policy.fresh_behavior,
@@ -289,82 +277,82 @@ def resolve_endpoint_policy(method: str, path: str, cfg: Mapping[str, Any]) -> E
     return defaults
 
 
-def _iter_source_paths(feature_key: str, meta_json: Mapping[str, Any]) -> List[Tuple[str, str, str]]:
-    out: List[Tuple[str, str, str]] = []
-    for src in meta_json.get("source_endpoints", []) or []:
-        if not isinstance(src, Mapping):
-            continue
-        path = src.get("path")
-        if not path:
-            continue
-        method = str(src.get("method") or "GET")
-        out.append((method, str(path), "source_endpoints"))
-    lineage = meta_json.get("metric_lineage", {}) or {}
-    source_path = lineage.get("source_path")
-    if source_path:
-        out.append(("GET", str(source_path), "metric_lineage"))
-    if not out:
-        fallback_name = _FEATURE_KEY_FALLBACK_POLICIES.get(feature_key)
-        if fallback_name:
-            out.append(("GET", fallback_name, "feature_key_default"))
-    return out
-
-
 def resolve_feature_policy(feature_key: str, meta_json: Mapping[str, Any], cfg: Mapping[str, Any]) -> ResolvedFeaturePolicy:
-    defaults = default_endpoint_policy(cfg)
-    sources = _iter_source_paths(feature_key, meta_json)
-    resolved: List[Tuple[EndpointFreshnessPolicy, str]] = []
-    for method, path, source_kind in sources:
-        if path == "generic_default":
-            resolved.append((defaults, source_kind))
+    source_endpoints = meta_json.get("source_endpoints", [])
+    endpoint_policies: List[EndpointFreshnessPolicy] = []
+
+    for ep in source_endpoints:
+        if not isinstance(ep, Mapping):
             continue
-        resolved.append((resolve_endpoint_policy(method, path, cfg), source_kind))
+        method = str(ep.get("method") or "GET")
+        path = str(ep.get("path") or "")
+        endpoint_policies.append(resolve_endpoint_policy(method, path, cfg))
 
-    if not resolved:
-        return ResolvedFeaturePolicy(
-            name=defaults.name,
-            max_tolerated_age_seconds=defaults.max_tolerated_age_seconds,
-            join_skew_tolerance_seconds=defaults.join_skew_tolerance_seconds,
-            criticality=defaults.criticality,
-            lag_class=defaults.lag_class,
-            fresh_behavior=defaults.fresh_behavior,
-            stale_behavior=defaults.stale_behavior,
-            carry_forward_behavior=defaults.carry_forward_behavior,
-            empty_valid_behavior=defaults.empty_valid_behavior,
-            time_provenance_degraded_behavior=defaults.time_provenance_degraded_behavior,
-            sources=(),
-        )
+    if not endpoint_policies:
+        fallback_name = _FEATURE_KEY_FALLBACK_POLICIES.get(feature_key, "generic_default")
+        if fallback_name == "generic_default":
+            endpoint_policies = [default_endpoint_policy(cfg)]
+        else:
+            endpoint_policies = [default_endpoint_policy(cfg)]
 
-    policies = [p for p, _ in resolved]
     return ResolvedFeaturePolicy(
-        name="+".join(sorted({p.name for p in policies})),
-        max_tolerated_age_seconds=min(p.max_tolerated_age_seconds for p in policies),
-        join_skew_tolerance_seconds=min(p.join_skew_tolerance_seconds for p in policies),
-        criticality=(EndpointCriticality.CRITICAL if any(p.criticality == EndpointCriticality.CRITICAL for p in policies) else EndpointCriticality.NON_CRITICAL),
-        lag_class=_merge_lag_class(p.lag_class for p in policies),
-        fresh_behavior=_merge_action((p.fresh_behavior for p in policies), defaults.fresh_behavior),
-        stale_behavior=_merge_action((p.stale_behavior for p in policies), defaults.stale_behavior),
-        carry_forward_behavior=_merge_action((p.carry_forward_behavior for p in policies), defaults.carry_forward_behavior),
-        empty_valid_behavior=_merge_action((p.empty_valid_behavior for p in policies), defaults.empty_valid_behavior),
-        time_provenance_degraded_behavior=_merge_action((p.time_provenance_degraded_behavior for p in policies), defaults.time_provenance_degraded_behavior),
-        sources=tuple(sorted({f"{source_kind}:{p.name}" for p, source_kind in resolved})),
+        name="|".join(sorted({p.name for p in endpoint_policies})),
+        max_tolerated_age_seconds=max(p.max_tolerated_age_seconds for p in endpoint_policies),
+        join_skew_tolerance_seconds=max(p.join_skew_tolerance_seconds for p in endpoint_policies),
+        criticality=EndpointCriticality.CRITICAL if any(p.criticality == EndpointCriticality.CRITICAL for p in endpoint_policies) else EndpointCriticality.NON_CRITICAL,
+        lag_class=_merge_lag_class(p.lag_class for p in endpoint_policies),
+        fresh_behavior=_merge_action((p.fresh_behavior for p in endpoint_policies), PolicyAction.ACCEPT),
+        stale_behavior=_merge_action((p.stale_behavior for p in endpoint_policies), PolicyAction.DEGRADE),
+        carry_forward_behavior=_merge_action((p.carry_forward_behavior for p in endpoint_policies), PolicyAction.DEGRADE),
+        empty_valid_behavior=_merge_action((p.empty_valid_behavior for p in endpoint_policies), PolicyAction.ACCEPT),
+        time_provenance_degraded_behavior=_merge_action(
+            (p.time_provenance_degraded_behavior for p in endpoint_policies),
+            PolicyAction.DEGRADE,
+        ),
+        sources=tuple(sorted({p.name for p in endpoint_policies})),
     )
 
 
-def _parse_effective_ts(eff_ts_raw: Any) -> Tuple[Optional[dt.datetime], Optional[FeatureDecisionReason], Optional[str]]:
-    if not isinstance(eff_ts_raw, str) or not eff_ts_raw:
-        return None, FeatureDecisionReason.MISSING_EFFECTIVE_TS, None
-    try:
-        eff_ts = dt.datetime.fromisoformat(eff_ts_raw.replace("Z", "+00:00"))
-    except Exception:
-        return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "malformed"
-    if eff_ts.tzinfo is None:
-        return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "naive_timezone"
-    return eff_ts.astimezone(dt.timezone.utc), None, None
+def _parse_effective_ts(raw: Any) -> Tuple[Optional[dt.datetime], Optional[FeatureDecisionReason], Optional[str]]:
+    if raw is None:
+        return None, FeatureDecisionReason.MISSING_EFFECTIVE_TS, "missing_effective_ts"
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None, FeatureDecisionReason.MISSING_EFFECTIVE_TS, "missing_effective_ts"
+        if raw == "INVALID":
+            return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "invalid_effective_ts"
+        try:
+            parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "invalid_effective_ts"
+    elif isinstance(raw, dt.datetime):
+        parsed = raw
+    else:
+        return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "invalid_effective_ts"
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    else:
+        parsed = parsed.astimezone(dt.timezone.utc)
+    return parsed, None, None
 
 
-def _value_is_valid(feature_value: Any) -> bool:
-    return isinstance(feature_value, (int, float)) and math.isfinite(float(feature_value))
+def _value_is_valid(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return True
+
+
+def _carry_forward_max_age_seconds(policy: ResolvedFeaturePolicy, meta_json: Mapping[str, Any]) -> int:
+    """Allow relaxed join-skew for snapshot endpoints while keeping stale carry stricter for OI."""
+    endpoints = meta_json.get("source_endpoints") if isinstance(meta_json, Mapping) else None
+    if isinstance(endpoints, list):
+        paths = {str(ep.get("path") or "") for ep in endpoints if isinstance(ep, Mapping)}
+        if "/api/stock/{ticker}/oi-per-strike" in paths or "/api/stock/{ticker}/oi-change" in paths:
+            return 5400
+    return policy.max_tolerated_age_seconds
 
 
 def assess_feature_freshness(
@@ -374,15 +362,19 @@ def assess_feature_freshness(
     cadence_seconds: int,
     cfg: Mapping[str, Any],
 ) -> FeaturePolicyAssessment:
-    feature_key = str(feature.get("feature_key"))
+    feature_key = str(feature.get("feature_key") or "")
     meta_json = feature.get("meta_json", {}) or {}
     policy = resolve_feature_policy(feature_key, meta_json, cfg)
+
     metric_lineage = meta_json.get("metric_lineage", {}) or {}
     feature_value = feature.get("feature_value")
     freshness_state = str(meta_json.get("freshness_state") or "ERROR")
     stale_age_minutes = meta_json.get("stale_age_min")
     stale_age_seconds = None if stale_age_minutes is None else _clamp_positive_int(stale_age_minutes, 0) * 60
-    time_provenance_degraded = bool(metric_lineage.get("time_provenance_degraded") or meta_json.get("details", {}).get("time_provenance_degraded"))
+    time_provenance_degraded = bool(
+        metric_lineage.get("time_provenance_degraded")
+        or meta_json.get("details", {}).get("time_provenance_degraded")
+    )
 
     eff_ts, ts_error, ts_error_detail = _parse_effective_ts(metric_lineage.get("effective_ts_utc"))
     if ts_error is not None:
@@ -392,7 +384,7 @@ def assess_feature_freshness(
             include_in_scoring=False,
             degraded=False,
             reason=ts_error,
-            reason_detail=ts_error_detail,
+            reason_detail=ts_error_detail or ts_error.value,
             dq_reason_code=f"{feature_key}_{ts_error.value}",
             effective_ts=None,
             delta_seconds=None,
@@ -404,50 +396,30 @@ def assess_feature_freshness(
             policy_source=",".join(policy.sources) if policy.sources else "default",
         )
 
-    # Allow a small amount of provider-time forward drift to be normalized/clamped.
-    #
-    # Why this exists: in live operation, host clocks can drift a few minutes behind the
-    # vendor server time (especially on non-NTP-synced desktops). Without an explicit
-    # tolerance, this manifests as FUTURE_TS_VIOLATION and collapses feature coverage.
-    #
-    # Contract:
-    # - INSTITUTIONAL_GRADE: do not implicitly widen the window (strict-by-default)
-    # - FORWARD_OBSERVATION: apply a pragmatic default floor when not explicitly configured
-    allow_future_ts_seconds = cadence_seconds
-    try:
-        validation_cfg = cfg.get("validation") if isinstance(cfg, dict) else None
-        governance_mode = "FORWARD_OBSERVATION"
-        if isinstance(validation_cfg, dict):
-            gm = validation_cfg.get("governance_mode")
-            if gm is not None:
-                governance_mode = str(gm).upper().strip()
-
-            if validation_cfg.get("allow_future_ts_seconds") is not None:
-                allow_future_ts_seconds = max(int(validation_cfg.get("allow_future_ts_seconds")), 0)
-            elif governance_mode != "INSTITUTIONAL_GRADE":
-                # Default floor for forward/paper observation: tolerate typical host clock skew.
-                allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
-        else:
-            # No validation config available; choose a conservative but usable default.
-            allow_future_ts_seconds = max(allow_future_ts_seconds, 600)
-    except Exception:
-        allow_future_ts_seconds = max(cadence_seconds, 600)
+    # STRICT DEFAULT:
+    # if allow_future_ts_seconds is not explicitly configured, future timestamps are rejected.
+    allow_future_ts_seconds = 0
+    validation_cfg = cfg.get("validation", {}) if isinstance(cfg, dict) else {}
+    if isinstance(validation_cfg, Mapping):
+        raw_allow = validation_cfg.get("allow_future_ts_seconds", None)
+        if raw_allow is not None:
+            try:
+                allow_future_ts_seconds = max(int(raw_allow), 0)
+            except Exception:
+                allow_future_ts_seconds = 0
 
     normalized_future_ts = False
     future_drift_seconds: Optional[int] = None
-    future_ts_degraded = False
     delta_seconds = int((asof_utc - eff_ts).total_seconds())
+
     if delta_seconds < 0:
         drift = abs(delta_seconds)
-        if drift <= allow_future_ts_seconds:
-            # Clamp to asof_utc so downstream join-skew/staleness calculations remain conservative.
+        if allow_future_ts_seconds > 0 and drift <= allow_future_ts_seconds:
             future_drift_seconds = drift
-            future_ts_degraded = drift > cadence_seconds
             eff_ts = asof_utc
             delta_seconds = 0
             normalized_future_ts = True
-            if drift > 0:
-                time_provenance_degraded = True
+            time_provenance_degraded = True
         else:
             return FeaturePolicyAssessment(
                 feature_key=feature_key,
@@ -468,14 +440,24 @@ def assess_feature_freshness(
                 future_drift_seconds=drift,
             )
 
-    if freshness_state == "STALE_CARRY" and stale_age_seconds is not None and stale_age_seconds > policy.max_tolerated_age_seconds:
+    def _carry_forward_max_age_seconds() -> int:
+        endpoints = meta_json.get("source_endpoints") if isinstance(meta_json, Mapping) else None
+        if isinstance(endpoints, list):
+            paths = {str(ep.get("path") or "") for ep in endpoints if isinstance(ep, Mapping)}
+            if "/api/stock/{ticker}/oi-per-strike" in paths or "/api/stock/{ticker}/oi-change" in paths:
+                return 5400
+        return policy.max_tolerated_age_seconds
+
+    carry_forward_max_age_seconds = _carry_forward_max_age_seconds()
+
+    if freshness_state == "STALE_CARRY" and stale_age_seconds is not None and stale_age_seconds > carry_forward_max_age_seconds:
         return FeaturePolicyAssessment(
             feature_key=feature_key,
             policy=policy,
             include_in_scoring=False,
             degraded=False,
             reason=FeatureDecisionReason.STALE_ENDPOINT_REJECTED,
-            reason_detail=f"age_{stale_age_seconds}s_gt_{policy.max_tolerated_age_seconds}s",
+            reason_detail=f"age_{stale_age_seconds}s_gt_{carry_forward_max_age_seconds}s",
             dq_reason_code=f"{feature_key}_{FeatureDecisionReason.STALE_ENDPOINT_REJECTED.value}",
             effective_ts=eff_ts,
             delta_seconds=delta_seconds,
@@ -505,6 +487,7 @@ def assess_feature_freshness(
             stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
             time_provenance_degraded=time_provenance_degraded,
             policy_source=",".join(policy.sources) if policy.sources else "default",
+            future_drift_seconds=future_drift_seconds,
         )
 
     if not _value_is_valid(feature_value):
@@ -543,6 +526,7 @@ def assess_feature_freshness(
             stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
             time_provenance_degraded=True,
             policy_source=",".join(policy.sources) if policy.sources else "default",
+            future_drift_seconds=future_drift_seconds,
         )
 
     degraded = False
@@ -554,14 +538,14 @@ def assess_feature_freshness(
         action = policy.empty_valid_behavior
     elif freshness_state == "STALE_CARRY":
         age = stale_age_seconds
-        if age is not None and age > policy.max_tolerated_age_seconds:
+        if age is not None and age > carry_forward_max_age_seconds:
             return FeaturePolicyAssessment(
                 feature_key=feature_key,
                 policy=policy,
                 include_in_scoring=False,
                 degraded=False,
                 reason=FeatureDecisionReason.STALE_ENDPOINT_REJECTED,
-                reason_detail=f"age_{age}s_gt_{policy.max_tolerated_age_seconds}s",
+                reason_detail=f"age_{age}s_gt_{carry_forward_max_age_seconds}s",
                 dq_reason_code=f"{feature_key}_{FeatureDecisionReason.STALE_ENDPOINT_REJECTED.value}",
                 effective_ts=eff_ts,
                 delta_seconds=delta_seconds,
@@ -571,6 +555,7 @@ def assess_feature_freshness(
                 stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
                 time_provenance_degraded=time_provenance_degraded,
                 policy_source=",".join(policy.sources) if policy.sources else "default",
+                future_drift_seconds=future_drift_seconds,
             )
         if policy.carry_forward_behavior == PolicyAction.SUPPRESS:
             return FeaturePolicyAssessment(
@@ -589,6 +574,7 @@ def assess_feature_freshness(
                 stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
                 time_provenance_degraded=time_provenance_degraded,
                 policy_source=",".join(policy.sources) if policy.sources else "default",
+                future_drift_seconds=future_drift_seconds,
             )
         action = policy.carry_forward_behavior
         degraded = action == PolicyAction.DEGRADE
@@ -613,6 +599,7 @@ def assess_feature_freshness(
             stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
             time_provenance_degraded=time_provenance_degraded,
             policy_source=",".join(policy.sources) if policy.sources else "default",
+            future_drift_seconds=future_drift_seconds,
         )
 
     if action == PolicyAction.SUPPRESS:
@@ -632,17 +619,17 @@ def assess_feature_freshness(
             stale_age_minutes=stale_age_minutes if isinstance(stale_age_minutes, int) else None,
             time_provenance_degraded=time_provenance_degraded,
             policy_source=",".join(policy.sources) if policy.sources else "default",
+            future_drift_seconds=future_drift_seconds,
         )
 
-    if time_provenance_degraded and policy.time_provenance_degraded_behavior == PolicyAction.DEGRADE:
+    if future_drift_seconds is not None:
         degraded = True
-        dq_reason = dq_reason or f"{feature_key}_time_provenance_degraded"
+        dq_reason = f"{feature_key}_future_ts_clamped_{future_drift_seconds}s"
 
-    # If we had to clamp a timestamp that was materially ahead of asof_utc (beyond cadence),
-    # keep the feature but mark it degraded for downstream confidence/coverage logic.
-    if future_ts_degraded and future_drift_seconds is not None:
+    if time_provenance_degraded:
         degraded = True
-        dq_reason = dq_reason or f"{feature_key}_future_ts_clamped_{future_drift_seconds}s"
+        if "_future_ts_clamped_" not in (dq_reason or ""):
+            dq_reason = dq_reason or f"{feature_key}_time_provenance_degraded"
 
     return FeaturePolicyAssessment(
         feature_key=feature_key,

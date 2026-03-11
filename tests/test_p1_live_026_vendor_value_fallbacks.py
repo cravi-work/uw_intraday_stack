@@ -51,3 +51,18 @@ def test_oi_pressure_falls_back_to_summary_call_put_totals() -> None:
     out = extract_oi_features(payload, ctx)
     assert out.features["oi_pressure"] == (200.0 - 100.0) / (200.0 + 100.0)
     assert out.meta["oi"]["details"]["status"] == "computed_from_summary_totals"
+
+def test_gex_sign_accepts_nested_items_wrapper() -> None:
+    ctx = _ctx("/api/stock/TSLA/spot-exposures", endpoint_id=2)
+    payload = {"data": {"items": [{"gamma_exposure": 125.0}]}}
+
+    out = extract_gex_sign(payload, ctx)
+    assert out.features["net_gex_sign"] == 1.0
+
+
+def test_gex_sign_falls_back_to_call_put_gex_rows() -> None:
+    ctx = _ctx("/api/stock/TSLA/spot-exposures", endpoint_id=3)
+    payload = {"data": {"items": [{"strike": 20.0, "call_gex": 1000.0, "put_gex": 500.0}]}}
+
+    out = extract_gex_sign(payload, ctx)
+    assert out.features["net_gex_sign"] == 1.0
