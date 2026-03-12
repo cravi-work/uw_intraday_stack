@@ -331,9 +331,8 @@ def _parse_effective_ts(raw: Any) -> Tuple[Optional[dt.datetime], Optional[Featu
         return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "invalid_effective_ts"
 
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    else:
-        parsed = parsed.astimezone(dt.timezone.utc)
+        return None, FeatureDecisionReason.INVALID_EFFECTIVE_TS, "naive_timezone"
+    parsed = parsed.astimezone(dt.timezone.utc)
     return parsed, None, None
 
 
@@ -353,6 +352,37 @@ def _carry_forward_max_age_seconds(policy: ResolvedFeaturePolicy, meta_json: Map
         if "/api/stock/{ticker}/oi-per-strike" in paths or "/api/stock/{ticker}/oi-change" in paths:
             return 5400
     return policy.max_tolerated_age_seconds
+
+
+def _resolve_allow_future_ts_seconds(cfg: Mapping[str, Any], cadence_seconds: int) -> int:
+    """Resolve bounded future-ts normalization without widening predictive use implicitly.
+
+    Contract:
+    - Base default is one cadence window when cadence is known.
+    - validation.allow_future_ts_seconds, when explicitly configured, overrides that base.
+    - FORWARD_OBSERVATION may apply a pragmatic floor for host-clock drift when not explicitly configured.
+    - INSTITUTIONAL_GRADE remains cadence-bounded unless explicitly widened.
+    """
+    try:
+        base_tolerance = max(int(cadence_seconds), 0)
+    except (TypeError, ValueError):
+        base_tolerance = 0
+
+    validation_cfg = cfg.get("validation", {}) if isinstance(cfg, Mapping) else {}
+    if not isinstance(validation_cfg, Mapping):
+        return base_tolerance
+
+    raw_allow = validation_cfg.get("allow_future_ts_seconds")
+    if raw_allow is not None:
+        try:
+            return max(int(raw_allow), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    governance_mode = str(validation_cfg.get("governance_mode") or "").strip().upper()
+    if governance_mode == "FORWARD_OBSERVATION":
+        return max(base_tolerance, 600)
+    return base_tolerance
 
 
 def assess_feature_freshness(
@@ -396,17 +426,7 @@ def assess_feature_freshness(
             policy_source=",".join(policy.sources) if policy.sources else "default",
         )
 
-    # STRICT DEFAULT:
-    # if allow_future_ts_seconds is not explicitly configured, future timestamps are rejected.
-    allow_future_ts_seconds = 0
-    validation_cfg = cfg.get("validation", {}) if isinstance(cfg, dict) else {}
-    if isinstance(validation_cfg, Mapping):
-        raw_allow = validation_cfg.get("allow_future_ts_seconds", None)
-        if raw_allow is not None:
-            try:
-                allow_future_ts_seconds = max(int(raw_allow), 0)
-            except Exception:
-                allow_future_ts_seconds = 0
+    allow_future_ts_seconds = _resolve_allow_future_ts_seconds(cfg, cadence_seconds)
 
     normalized_future_ts = False
     future_drift_seconds: Optional[int] = None
@@ -440,15 +460,7 @@ def assess_feature_freshness(
                 future_drift_seconds=drift,
             )
 
-    def _carry_forward_max_age_seconds() -> int:
-        endpoints = meta_json.get("source_endpoints") if isinstance(meta_json, Mapping) else None
-        if isinstance(endpoints, list):
-            paths = {str(ep.get("path") or "") for ep in endpoints if isinstance(ep, Mapping)}
-            if "/api/stock/{ticker}/oi-per-strike" in paths or "/api/stock/{ticker}/oi-change" in paths:
-                return 5400
-        return policy.max_tolerated_age_seconds
-
-    carry_forward_max_age_seconds = _carry_forward_max_age_seconds()
+    carry_forward_max_age_seconds = _carry_forward_max_age_seconds(policy, meta_json)
 
     if freshness_state == "STALE_CARRY" and stale_age_seconds is not None and stale_age_seconds > carry_forward_max_age_seconds:
         return FeaturePolicyAssessment(
@@ -622,13 +634,15 @@ def assess_feature_freshness(
             future_drift_seconds=future_drift_seconds,
         )
 
+    clamp_dq_reason = None
     if future_drift_seconds is not None:
         degraded = True
-        dq_reason = f"{feature_key}_future_ts_clamped_{future_drift_seconds}s"
+        clamp_dq_reason = f"{feature_key}_future_ts_clamped_{future_drift_seconds}s"
+        dq_reason = clamp_dq_reason
 
     if time_provenance_degraded:
         degraded = True
-        if "_future_ts_clamped_" not in (dq_reason or ""):
+        if clamp_dq_reason is None:
             dq_reason = dq_reason or f"{feature_key}_time_provenance_degraded"
 
     return FeaturePolicyAssessment(
