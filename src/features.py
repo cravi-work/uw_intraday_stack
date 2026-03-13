@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 # metrics we allow a deterministic default to midnight UTC of the provided date.
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_grab_list = grab_list 
-_as_float = safe_float 
+_grab_list = grab_list
+_as_float = safe_float
 
 
 def _parse_utc_dt(value: Any) -> Optional[datetime.datetime]:
@@ -105,7 +105,7 @@ def _infer_daily_snapshot_effective_ts_utc(payload: Any) -> Optional[datetime.da
                     sample_rows.append(rows[-1])
                     sample_rows.extend(rows[1:4])
 
-                best_row_date: Optional[dt.datetime] = None
+                best_row_date: Optional[datetime.datetime] = None
                 for row in sample_rows:
                     if not isinstance(row, dict):
                         continue
@@ -124,7 +124,7 @@ def _infer_daily_snapshot_effective_ts_utc(payload: Any) -> Optional[datetime.da
             sample_rows.append(payload[-1])
             sample_rows.extend(payload[1:4])
 
-        best_row_date: Optional[dt.datetime] = None
+        best_row_date: Optional[datetime.datetime] = None
         for row in sample_rows:
             if not isinstance(row, dict):
                 continue
@@ -258,391 +258,314 @@ def _normalize_expected_bounds(value: Any) -> Optional[Dict[str, Any]]:
     return {"lower": lo, "upper": hi, "inclusive": inclusive}
 
 
+def _normalize_effective_time_source(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _normalize_output_domain(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def _with_output_domain(
     lineage: Dict[str, Any],
     *,
-    emitted_units: Optional[str],
-    raw_input_units: Optional[str],
-    bounded_output: bool,
+    emitted_units: Optional[str] = None,
+    raw_input_units: Optional[str] = None,
+    bounded_output: Optional[bool] = None,
     expected_bounds: Any = None,
     output_domain: str = "unbounded_scalar",
-    allowed_values: Optional[Iterable[Any]] = None,
 ) -> Dict[str, Any]:
     enriched = dict(lineage)
-    enriched["emitted_units"] = emitted_units
-    enriched["raw_input_units"] = raw_input_units
-    enriched["bounded_output"] = bool(bounded_output)
-    enriched["expected_bounds"] = _normalize_expected_bounds(expected_bounds) if expected_bounds is not None else None
+    if emitted_units is not None:
+        enriched["emitted_units"] = emitted_units
+    if raw_input_units is not None:
+        enriched["raw_input_units"] = raw_input_units
+    if bounded_output is not None:
+        enriched["bounded_output"] = bool(bounded_output)
+    normalized_bounds = _normalize_expected_bounds(expected_bounds)
+    if normalized_bounds is not None:
+        enriched["expected_bounds"] = normalized_bounds
     enriched["output_domain"] = output_domain
     enriched["output_domain_contract_version"] = OUTPUT_DOMAIN_CONTRACT_VERSION
-    if allowed_values is not None:
-        enriched["allowed_values"] = [
-            float(v) if isinstance(v, (int, float)) and math.isfinite(float(v)) else v
-            for v in allowed_values
-        ]
     return enriched
 
 
-def _resolve_feature_use_contract(ctx: EndpointContext) -> Dict[str, Any]:
-    explicit_role = getattr(ctx, "endpoint_purpose", None)
-    role_source = "endpoint_context"
-    if explicit_role in FEATURE_USE_ROLE_DEFAULTS:
-        use_role = str(explicit_role)
-    else:
-        fallback_role = LEGACY_PATH_USE_ROLE_OVERRIDES.get(ctx.path)
-        if fallback_role in FEATURE_USE_ROLE_DEFAULTS:
-            use_role = str(fallback_role)
-            role_source = "path_fallback"
-        else:
-            use_role = "signal-critical"
-            role_source = "default_signal_critical"
-
-    defaults = FEATURE_USE_ROLE_DEFAULTS[use_role]
-    raw_decision_path = getattr(ctx, "decision_path", None)
-    raw_missing_affects_confidence = getattr(ctx, "missing_affects_confidence", None)
-    raw_stale_affects_confidence = getattr(ctx, "stale_affects_confidence", None)
-
-    decision_path = defaults["decision_path"] if raw_decision_path is None else bool(raw_decision_path)
-    missing_affects_confidence = (
-        defaults["missing_affects_confidence"] if raw_missing_affects_confidence is None else bool(raw_missing_affects_confidence)
-    )
-    stale_affects_confidence = (
-        defaults["stale_affects_confidence"] if raw_stale_affects_confidence is None else bool(raw_stale_affects_confidence)
-    )
-
-    decision_eligible = bool(use_role == "signal-critical" and decision_path)
-    if not decision_eligible:
-        missing_affects_confidence = False
-        stale_affects_confidence = False
-
-    return {
-        "contract_version": str(getattr(ctx, "purpose_contract_version", None) or FEATURE_USE_CONTRACT_VERSION),
-        "use_role": use_role,
-        "decision_path": decision_path,
-        "decision_eligible": decision_eligible,
-        "missing_affects_confidence": missing_affects_confidence,
-        "stale_affects_confidence": stale_affects_confidence,
-        "endpoint_name": getattr(ctx, "endpoint_name", None),
-        "contract_source": role_source,
-    }
-
-def _normalize_signed(x: Optional[float], *, scale: float) -> Optional[float]:
-    if scale == 0: 
-        return None 
-    val = safe_float(x)
-    if val is None or not math.isfinite(val): 
+def _feature_use_role_for_path(path: Optional[str]) -> Optional[str]:
+    if not path:
         return None
-    return max(-1.0, min(1.0, val / scale))
-
-def _parse_strict_ts(row: dict, key: str) -> float:
-    ts_val = row.get(key)
-    if isinstance(ts_val, (int, float)): 
-        return float(ts_val)
-    if isinstance(ts_val, str):
-        try:
-            return datetime.datetime.fromisoformat(ts_val.replace('Z', '+00:00')).timestamp()
-        except ValueError:
-            pass
-    return 0.0
-
-
-def _serialize_dtlike(value: Any) -> Any:
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=datetime.timezone.utc)
-        else:
-            value = value.astimezone(datetime.timezone.utc)
-        return value.isoformat()
-    return value
-
-
-def _coerce_ts_iso(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=datetime.timezone.utc)
-        else:
-            value = value.astimezone(datetime.timezone.utc)
-        return value.isoformat()
-    if isinstance(value, (int, float)):
-        if not math.isfinite(float(value)):
-            return None
-        try:
-            ts = float(value)
-            abs_ts = abs(ts)
-
-            # Some UW endpoints emit UNIX epoch timestamps in milliseconds (or higher precision).
-            # Normalize to seconds so feature effective timestamps are not silently lost.
-            if abs_ts > 1e14:
-                ts = ts / (1e9 if abs_ts > 1e17 else 1e6)
-            elif abs_ts > 1e11:
-                ts = ts / 1e3
-
-            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
-            # Plausibility guard: avoid treating non-time numeric fields as timestamps.
-            if dt.year < 1990 or dt.year > 2100:
-                return None
-            return dt.isoformat()
-        except (OverflowError, OSError, ValueError):
-            return None
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            dt = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            dt = dt.astimezone(datetime.timezone.utc)
-            if dt.year < 1990 or dt.year > 2100:
-                return None
-            return dt.isoformat()
-        except ValueError:
-            try:
-                return _coerce_ts_iso(float(raw))
-            except (TypeError, ValueError, OverflowError, OSError):
-                return None
+    override = LEGACY_PATH_USE_ROLE_OVERRIDES.get(path)
+    if override:
+        return override
     return None
 
 
-def _iter_payload_dicts(payload: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(payload, dict):
-        yield payload
-    rows = grab_list(payload)
-    if not rows and isinstance(payload, dict):
-        rows = [payload]
-    for row in rows:
-        if isinstance(row, dict):
-            yield row
+def _feature_use_role_details(role: str) -> Dict[str, Any]:
+    base = FEATURE_USE_ROLE_DEFAULTS.get(role)
+    if base is None:
+        base = FEATURE_USE_ROLE_DEFAULTS["signal-critical"]
+        role = "signal-critical"
+    return {"feature_use_role": role, **base}
 
 
-def _find_payload_timestamp(payload: Any, keys: Tuple[str, ...]) -> Tuple[Optional[str], Optional[str], bool]:
-    best_iso: Optional[str] = None
-    best_dt: Optional[datetime.datetime] = None
-    best_key: Optional[str] = None
-    saw_candidate = False
+def _resolve_feature_use_role(
+    meta_json: Dict[str, Any],
+    *,
+    path: Optional[str] = None,
+    role_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    explicit_role = role_override
+    if explicit_role is None:
+        explicit_role = meta_json.get("feature_use_role")
+    if explicit_role is None:
+        explicit_role = _feature_use_role_for_path(path)
+    if explicit_role is None:
+        explicit_role = "signal-critical"
 
-    for item in _iter_payload_dicts(payload):
-        for key in keys:
-            if key not in item:
-                continue
-            saw_candidate = True
-            iso_val = _coerce_ts_iso(item.get(key))
-            if iso_val is None:
-                continue
-            dt_val = datetime.datetime.fromisoformat(iso_val)
-            if best_dt is None or dt_val > best_dt:
-                best_dt = dt_val
-                best_iso = iso_val
-                best_key = key
-
-    if best_iso is not None:
-        return best_iso, best_key, False
-    if saw_candidate:
-        return "INVALID", best_key, True
-    return None, None, False
-
-
-def _find_first_payload_value(payload: Any, keys: Tuple[str, ...]) -> Optional[Any]:
-    for item in _iter_payload_dicts(payload):
-        for key in keys:
-            value = item.get(key)
-            if value not in (None, ""):
-                return value
-    return None
-
-
-def _extract_payload_provenance(payload: Any) -> Dict[str, Any]:
-    event_iso, event_key, event_invalid = _find_payload_timestamp(payload, EVENT_TIME_KEYS)
-    publish_iso, publish_key, publish_invalid = _find_payload_timestamp(payload, PUBLISH_TIME_KEYS)
-    effective_iso, effective_key, effective_invalid = _find_payload_timestamp(payload, EFFECTIVE_TIME_KEYS)
-    revision = _find_first_payload_value(payload, SOURCE_REVISION_KEYS)
-
-    details: Dict[str, Any] = {}
-    if effective_iso is not None:
-        details["effective_at_utc"] = effective_iso
-    elif event_iso is not None:
-        details["effective_at_utc"] = event_iso
-    elif publish_iso is not None:
-        details["effective_at_utc"] = publish_iso
-    elif effective_invalid or event_invalid or publish_invalid:
-        details["effective_at_utc"] = "INVALID"
-
-    if event_iso is not None:
-        details["event_time_utc"] = event_iso
-    elif event_invalid:
-        details["event_time_utc"] = "INVALID"
-
-    if publish_iso is not None:
-        details["source_publish_time_utc"] = publish_iso
-    elif publish_invalid:
-        details["source_publish_time_utc"] = "INVALID"
-
-    if revision is not None:
-        details["source_revision"] = str(revision)
-
-    if any(k is not None for k in (event_key, publish_key, effective_key)):
-        details["payload_timestamp_keys"] = {
-            "event_time": event_key,
-            "source_publish_time": publish_key,
-            "effective_at": effective_key,
-        }
+    details = _feature_use_role_details(str(explicit_role))
+    meta_json["feature_use_role"] = details["feature_use_role"]
+    meta_json["decision_path"] = bool(details["decision_path"])
+    meta_json["missing_affects_confidence"] = bool(details["missing_affects_confidence"])
+    meta_json["stale_affects_confidence"] = bool(details["stale_affects_confidence"])
+    meta_json["feature_use_contract_version"] = FEATURE_USE_CONTRACT_VERSION
     return details
 
 
-def _extract_spot_reference(payload: Any) -> Optional[float]:
-    for item in _iter_payload_dicts(payload):
-        for key in SPOT_KEYS:
-            spot_val = safe_float(item.get(key))
-            if spot_val is not None and math.isfinite(spot_val):
-                return spot_val
-    return None
+def _propagate_metric_lineage(meta: Dict[str, Any], ctx: EndpointContext) -> None:
+    lineage = meta.get("metric_lineage") if isinstance(meta.get("metric_lineage"), dict) else {}
+    effective_ts = meta.get("effective_ts_utc")
+    if effective_ts is None:
+        effective_ts = meta.get("effective_at_utc")
+    if effective_ts is None:
+        effective_ts = getattr(ctx, "effective_timestamp_utc", None)
+    if effective_ts is not None:
+        lineage["effective_ts_utc"] = effective_ts
+
+    if "event_time_utc" not in lineage and meta.get("event_time_utc") is not None:
+        lineage["event_time_utc"] = meta.get("event_time_utc")
+    if "publish_time_utc" not in lineage and meta.get("publish_time_utc") is not None:
+        lineage["publish_time_utc"] = meta.get("publish_time_utc")
+    if "source_revision" not in lineage and meta.get("source_revision") is not None:
+        lineage["source_revision"] = meta.get("source_revision")
+    if "effective_time_source" not in lineage:
+        time_source = _normalize_effective_time_source(meta.get("effective_time_source"))
+        if time_source is not None:
+            lineage["effective_time_source"] = time_source
+    if "time_provenance_degraded" not in lineage:
+        lineage["time_provenance_degraded"] = bool(meta.get("time_provenance_degraded", False))
+
+    for key in (
+        "emitted_units",
+        "raw_input_units",
+        "bounded_output",
+        "expected_bounds",
+        "output_domain",
+        "output_domain_contract_version",
+    ):
+        if key not in lineage and meta.get(key) is not None:
+            lineage[key] = meta.get(key)
+
+    meta["metric_lineage"] = lineage
 
 
-def _normalize_balance(pos: float, neg: float) -> Optional[float]:
-    total = pos + neg
-    if total <= 0 or not math.isfinite(total):
-        return None
-    imbalance = (pos - neg) / total
-    if not math.isfinite(imbalance):
-        return None
-    return max(-1.0, min(1.0, imbalance))
+def _extract_payload_provenance(payload: Any) -> Dict[str, Any]:
+    """Return machine-readable timing provenance from raw payload where possible."""
+
+    prov: Dict[str, Any] = {
+        "event_time_utc": None,
+        "publish_time_utc": None,
+        "effective_ts_utc": None,
+        "effective_time_source": "unknown",
+        "source_revision": None,
+        "time_provenance_degraded": False,
+    }
+
+    candidates: List[Mapping[str, Any]] = []
+    if isinstance(payload, Mapping):
+        candidates.append(payload)
+        rows = payload.get("data")
+        if isinstance(rows, list) and rows and isinstance(rows[0], Mapping):
+            candidates.append(rows[0])
+    elif isinstance(payload, list) and payload and isinstance(payload[0], Mapping):
+        candidates.append(payload[0])
+
+    latest_publish: Optional[datetime.datetime] = None
+    latest_event: Optional[datetime.datetime] = None
+    latest_effective: Optional[datetime.datetime] = None
+
+    for obj in candidates:
+        if not isinstance(obj, Mapping):
+            continue
+
+        for key in PUBLISH_TIME_KEYS:
+            ts = _parse_utc_dt(obj.get(key))
+            if ts is not None and (latest_publish is None or ts > latest_publish):
+                latest_publish = ts
+
+        for key in EVENT_TIME_KEYS:
+            ts = _parse_utc_dt(obj.get(key))
+            if ts is not None and (latest_event is None or ts > latest_event):
+                latest_event = ts
+
+        for key in EFFECTIVE_TIME_KEYS:
+            ts = _parse_utc_dt(obj.get(key))
+            if ts is not None and (latest_effective is None or ts > latest_effective):
+                latest_effective = ts
+
+        for key in SOURCE_REVISION_KEYS:
+            if obj.get(key) is not None:
+                prov["source_revision"] = obj.get(key)
+                break
+
+    # Canonical precedence:
+    # 1) explicit effective timestamp from payload
+    # 2) event timestamp
+    # 3) publish/report timestamp
+    eff = latest_effective
+    effective_source = "payload_effective" if eff is not None else None
+    degraded = False
+
+    if eff is None and latest_event is not None:
+        eff = latest_event
+        effective_source = "event_time_fallback"
+
+    if eff is None and latest_publish is not None:
+        eff = latest_publish
+        effective_source = "publish_time_fallback"
+        degraded = True
+
+    # Date-only snapshot fallback: deterministic midnight UTC of provided date.
+    if eff is None:
+        inferred = _infer_daily_snapshot_effective_ts_utc(payload)
+        if inferred is not None:
+            eff = inferred
+            effective_source = "date_only_snapshot_fallback"
+            degraded = True
+
+    prov["event_time_utc"] = latest_event.isoformat() if latest_event is not None else None
+    prov["publish_time_utc"] = latest_publish.isoformat() if latest_publish is not None else None
+    prov["effective_ts_utc"] = eff.isoformat() if eff is not None else None
+    prov["effective_time_source"] = effective_source or "unknown"
+    prov["time_provenance_degraded"] = degraded
+    return prov
 
 
-def _normalize_put_call(value: Any) -> Optional[str]:
+def _emit_endpoint_payload_observability(
+    *,
+    ctx: EndpointContext,
+    payload: Any,
+    feature_output_reason: str,
+    parsed_row_count: int,
+    rows_discarded_before_extraction: int = 0,
+    effective_timestamp_source: str = "unknown",
+) -> None:
+    """Emit machine-readable payload observability when a feature cannot be produced safely."""
+
+    if not getattr(ctx, "logger", None):
+        return
+    try:
+        ctx.logger.info(
+            "endpoint_payload_observability",
+            extra={
+                "payload_type": type(payload).__name__,
+                "feature_output_reason": feature_output_reason,
+                "parsed_row_count": int(parsed_row_count),
+                "rows_discarded_before_extraction": int(rows_discarded_before_extraction),
+                "effective_timestamp_source": effective_timestamp_source,
+            },
+        )
+    except Exception:
+        # Observability must never break extraction.
+        return
+
+
+def _coerce_ts_iso(value: Any) -> Optional[str]:
+    """Coerce epoch-like or datetime-like values to UTC ISO-8601.
+
+    Accepts:
+    - datetime (naive assumed UTC)
+    - int/float epoch seconds
+    - int/float epoch milliseconds when magnitude is too large for seconds
+    - ISO8601-ish strings accepted by _parse_utc_dt
+    """
     if value is None:
         return None
-    norm = str(value).upper().strip()
-    if norm in CALL_ALIASES:
-        return "CALL"
-    if norm in PUT_ALIASES:
-        return "PUT"
+    try:
+        if isinstance(value, datetime.datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                dt = dt.astimezone(datetime.timezone.utc)
+            return dt.isoformat()
+        if isinstance(value, (int, float)):
+            x = float(value)
+            # Heuristic: values far beyond plausible epoch-seconds are epoch-millis.
+            # 1e12 ~= 2001-09-09 in milliseconds and ~33658 CE in seconds.
+            if abs(x) >= 1e12:
+                x = x / 1000.0
+            dt = datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
+            return dt.isoformat()
+        if isinstance(value, str):
+            dt = _parse_utc_dt(value)
+            return dt.isoformat() if dt is not None else None
+    except Exception:
+        return None
     return None
 
 
-def _extract_call_put_totals(payload: Any) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
-    """Best-effort extraction of aggregate call/put open-interest totals.
+def _parse_strict_ts(row: Dict[str, Any], key: str) -> Optional[float]:
+    """Parse a timestamp field to epoch seconds with strict validation.
 
-    Some vendor endpoints return OI as a single summary object (no per-contract rows and/or
-    no put/call field). In those cases we can still compute a directional imbalance if we can
-    locate aggregate call/put totals.
+    Returns:
+      - float epoch seconds on success
+      - None when field missing/unparseable
+    Normalizes epoch-millis to seconds when detected.
     """
+    if row.get(key) is None:
+        return None
+    v = row.get(key)
+    try:
+        if isinstance(v, datetime.datetime):
+            dt = v
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                dt = dt.astimezone(datetime.timezone.utc)
+            return float(dt.timestamp())
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if abs(x) >= 1e12:
+                x = x / 1000.0
+            # Reject absurdly out-of-range years by attempting conversion.
+            datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
+            return x
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            # Numeric strings
+            try:
+                x = float(s)
+                if abs(x) >= 1e12:
+                    x = x / 1000.0
+                datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
+                return x
+            except Exception:
+                pass
+            dt = _parse_utc_dt(s)
+            return float(dt.timestamp()) if dt is not None else None
+    except Exception:
+        return None
+    return None
 
-    prov: Dict[str, Any] = {"totals_source": None, "call_total_key": None, "put_total_key": None}
-
-    def _maybe_float(x: Any) -> Optional[float]:
-        f = safe_float(x)
-        if f is None or not math.isfinite(f):
-            return None
-        return f
-
-    # Candidate containers to scan (shallow).
-    containers: List[Tuple[str, Any]] = [("payload", payload)]
-    if isinstance(payload, dict):
-        for k in ("data", "result", "results", "summary", "totals"):
-            if k in payload:
-                containers.append((k, payload.get(k)))
-
-    # Lowercase key candidates.
-    call_keys = (
-        "call_open_interest",
-        "calls_open_interest",
-        "call_oi",
-        "calls_oi",
-        "calloi",
-        "callopeninterest",
-        "call_openinterest",
-        "callopen_interest",
-        "calloi_total",
-        "call_open_interest_total",
-        "calloiTotal".lower(),
-        "callOpenInterest".lower(),
-    )
-    put_keys = (
-        "put_open_interest",
-        "puts_open_interest",
-        "put_oi",
-        "puts_oi",
-        "putoi",
-        "putopeninterest",
-        "put_openinterest",
-        "putopen_interest",
-        "putoi_total",
-        "put_open_interest_total",
-        "putoiTotal".lower(),
-        "putOpenInterest".lower(),
-    )
-
-    def _scan_mapping(m: Dict[str, Any], label: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-        lower_map = {str(k).lower(): k for k in m.keys()}
-
-        call_val = None
-        call_key_used = None
-        for ck in call_keys:
-            k = lower_map.get(ck)
-            if k is None:
-                continue
-            call_val = _maybe_float(m.get(k))
-            if call_val is not None:
-                call_key_used = str(k)
-                break
-
-        put_val = None
-        put_key_used = None
-        for pk in put_keys:
-            k = lower_map.get(pk)
-            if k is None:
-                continue
-            put_val = _maybe_float(m.get(k))
-            if put_val is not None:
-                put_key_used = str(k)
-                break
-
-        # Nested shape: {"calls": {"open_interest": ...}, "puts": {...}}
-        if call_val is None:
-            calls_obj = m.get(lower_map.get("calls")) or m.get(lower_map.get("call"))
-            if isinstance(calls_obj, dict):
-                nested = {str(k).lower(): k for k in calls_obj.keys()}
-                for nk in ("open_interest", "openinterest", "oi"):
-                    kk = nested.get(nk)
-                    if kk is None:
-                        continue
-                    call_val = _maybe_float(calls_obj.get(kk))
-                    if call_val is not None:
-                        call_key_used = f"{lower_map.get('calls') or lower_map.get('call')}.{kk}"
-                        break
-
-        if put_val is None:
-            puts_obj = m.get(lower_map.get("puts")) or m.get(lower_map.get("put"))
-            if isinstance(puts_obj, dict):
-                nested = {str(k).lower(): k for k in puts_obj.keys()}
-                for nk in ("open_interest", "openinterest", "oi"):
-                    kk = nested.get(nk)
-                    if kk is None:
-                        continue
-                    put_val = _maybe_float(puts_obj.get(kk))
-                    if put_val is not None:
-                        put_key_used = f"{lower_map.get('puts') or lower_map.get('put')}.{kk}"
-                        break
-
-        return call_val, put_val, call_key_used, put_key_used
-
-    for label, obj in containers:
-        if not isinstance(obj, dict):
-            continue
-        call_val, put_val, call_key_used, put_key_used = _scan_mapping(obj, label)
-        if call_val is not None and put_val is not None:
-            prov.update({
-                "totals_source": label,
-                "call_total_key": call_key_used,
-                "put_total_key": put_key_used,
-            })
-            return call_val, put_val, prov
-
-    # Nothing found.
-    prov["totals_source"] = "not_found"
-    return None, None, prov
 
 def _build_contract_normalization_failure_bundle(
     ctx: EndpointContext,
@@ -654,219 +577,275 @@ def _build_contract_normalization_failure_bundle(
     meta_key: str,
     summary: Any,
 ) -> FeatureBundle:
-    reason = getattr(summary, "failure_reason", None) or "contract_normalization_invalid"
-    structured_log(
-        logger,
-        logging.WARNING,
-        event="normalization_failure",
-        msg="option contract normalization invalid",
-        counter="normalization_failure_count",
-        feature_key=meta_key,
-        reason=reason,
-        extractor=extractor_name,
-    )
-    meta = _build_meta(
+    error_meta = _build_error_meta(
         ctx,
         extractor_name,
         lineage,
-        {
+        "contract_normalization_invalid",
+        details={
             **_extract_payload_provenance(payload),
-            "status": "suppressed_contract_normalization_invalid",
-            "suppression_reason": reason,
-            "contract_normalization": summary.as_dict(),
+            "contract_normalization": summary.as_dict() if hasattr(summary, "as_dict") else {},
         },
     )
-    meta["na_reason"] = reason
-    return FeatureBundle({k: None for k in feature_keys}, {meta_key: meta})
+    features = {key: None for key in feature_keys}
+    return FeatureBundle(features, {meta_key: error_meta})
 
 
-def _normalized_identity_for_row(contract_map: Mapping[int, Any], row_index: int) -> Optional[Any]:
-    return contract_map.get(row_index)
+def _normalized_identity_for_row(contract_map: Mapping[int, Any], idx: int) -> Optional[Any]:
+    return contract_map.get(idx)
 
 
-def _build_meta(
-    ctx: EndpointContext, 
-    extractor_name: str, 
-    lineage: Dict[str, Any], 
-    details: Dict[str, Any] = None
+def _build_feature_meta(ctx: EndpointContext, extractor_name: str, lineage: Dict[str, Any], details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    meta = _build_meta(ctx, extractor_name, lineage, details)
+    _resolve_feature_use_role(meta, path=getattr(ctx, "path", None))
+    _propagate_metric_lineage(meta, ctx)
+    return meta
+
+
+def _build_error_feature_meta(
+    ctx: EndpointContext,
+    extractor_name: str,
+    lineage: Dict[str, Any],
+    reason: str,
+    *,
+    details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    d = {"extractor": extractor_name}
-    if details:
-        d.update({_k: _serialize_dtlike(_v) for _k, _v in details.items()})
+    meta = _build_error_meta(ctx, extractor_name, lineage, reason, details=details)
+    _resolve_feature_use_role(meta, path=getattr(ctx, "path", None))
+    _propagate_metric_lineage(meta, ctx)
+    return meta
 
-    explicit_effective = d.get("effective_at_utc", d.get("effective_ts_utc"))
-    explicit_event_time = d.get("event_time_utc")
-    explicit_publish_time = d.get("source_publish_time_utc")
 
-    ctx_effective = _serialize_dtlike(getattr(ctx, "effective_ts_utc", None))
-    ctx_event_time = _serialize_dtlike(getattr(ctx, "event_time_utc", None))
-    ctx_publish_time = _serialize_dtlike(getattr(ctx, "source_publish_time_utc", None))
-    received_at = d.get("received_at_utc") or _serialize_dtlike(getattr(ctx, "received_at_utc", None))
-    processed_at = d.get("processed_at_utc") or _serialize_dtlike(getattr(ctx, "processed_at_utc", None))
-    as_of_time = (
-        d.get("as_of_time_utc")
-        or _serialize_dtlike(getattr(ctx, "as_of_time_utc", None))
-        or _serialize_dtlike(getattr(ctx, "endpoint_asof_ts_utc", None))
-    )
-    source_revision = d.get("source_revision") or getattr(ctx, "source_revision", None)
-
-    eff_ts = None
-    ts_source = getattr(ctx, "effective_time_source", None) or "missing_provider_time"
-    ts_quality = getattr(ctx, "timestamp_quality", None) or "MISSING"
-
-    if explicit_effective in ("INVALID", None) and explicit_effective is not None:
-        eff_ts = None
-        ts_source = d.get("effective_time_source") or "payload_effective_time"
-        ts_quality = d.get("timestamp_quality") or "INVALID"
-    elif explicit_effective:
-        eff_ts = explicit_effective
-        ts_source = d.get("effective_time_source") or "payload_effective_time"
-        ts_quality = d.get("timestamp_quality") or "VALID"
-    elif explicit_event_time in ("INVALID", None) and explicit_event_time is not None:
-        eff_ts = None
-        ts_source = "event_time"
-        ts_quality = d.get("timestamp_quality") or "INVALID"
-    elif explicit_event_time:
-        eff_ts = explicit_event_time
-        ts_source = "event_time"
-        ts_quality = d.get("timestamp_quality") or "VALID"
-    elif explicit_publish_time in ("INVALID", None) and explicit_publish_time is not None:
-        eff_ts = None
-        ts_source = "source_publish_time"
-        ts_quality = d.get("timestamp_quality") or "INVALID"
-    elif explicit_publish_time:
-        eff_ts = explicit_publish_time
-        ts_source = "source_publish_time"
-        ts_quality = d.get("timestamp_quality") or "VALID"
-    elif ctx_effective:
-        eff_ts = ctx_effective
-        ts_source = getattr(ctx, "effective_time_source", None) or "endpoint_provenance"
-        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
-    elif ctx_event_time:
-        eff_ts = ctx_event_time
-        ts_source = "event_time"
-        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
-    elif ctx_publish_time:
-        eff_ts = ctx_publish_time
-        ts_source = "source_publish_time"
-        ts_quality = getattr(ctx, "timestamp_quality", None) or "VALID"
-
-    event_time = explicit_event_time or ctx_event_time
-    source_publish_time = explicit_publish_time or ctx_publish_time
-    lagged = bool(d.get("lagged", getattr(ctx, "lagged", False)))
-    time_provenance_degraded = bool(
-        d.get("time_provenance_degraded", getattr(ctx, "time_provenance_degraded", False))
-    )
-
-    feature_use_contract = _resolve_feature_use_contract(ctx)
-    structured_expected_bounds = _normalize_expected_bounds(lineage.get("expected_bounds"))
-    allowed_values = lineage.get("allowed_values")
-    if isinstance(allowed_values, tuple):
-        allowed_values = list(allowed_values)
-    full_lineage = {
-        "metric_name": lineage.get("metric_name", "unknown"),
-        "source_path": ctx.path,
-        "fields_used": lineage.get("fields_used", []),
-        "units_expected": lineage.get("units_expected", "unknown"),
-        "emitted_units": lineage.get("emitted_units"),
-        "raw_input_units": lineage.get("raw_input_units"),
-        "expected_bounds": copy.deepcopy(structured_expected_bounds) if structured_expected_bounds is not None else None,
-        "bounded_output": bool(lineage.get("bounded_output", False)),
-        "output_domain": lineage.get("output_domain"),
-        "output_domain_contract_version": lineage.get("output_domain_contract_version"),
-        "allowed_values": copy.deepcopy(allowed_values) if allowed_values is not None else None,
-        "normalization": lineage.get("normalization", "none"),
-        "session_applicability": lineage.get("session_applicability", "PREMARKET/RTH/AFTERHOURS"),
-        "quality_policy": lineage.get("quality_policy", "None on missing"),
-        "criticality": lineage.get("criticality", "NON_CRITICAL"),
-        "effective_ts_utc": eff_ts,
-        "event_time": None if event_time == "INVALID" else event_time,
-        "source_publish_time": None if source_publish_time == "INVALID" else source_publish_time,
-        "received_at": received_at,
-        "processed_at": processed_at,
-        "effective_at": eff_ts,
-        "as_of_time": as_of_time,
-        "source_revision": source_revision,
-        "timestamp_source": ts_source,
-        "timestamp_quality": ts_quality,
-        "lagged": lagged,
-        "time_provenance_degraded": time_provenance_degraded,
-        "decision_path_role": feature_use_contract["use_role"],
-        "decision_eligible": feature_use_contract["decision_eligible"],
-        "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
-        "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
-        "feature_use_contract_version": feature_use_contract["contract_version"],
-    }
-
-    return {
-        "source_endpoints": [{
-            "method": ctx.method,
-            "path": ctx.path,
-            "operation_id": ctx.operation_id,
-            "endpoint_id": ctx.endpoint_id,
-            "used_event_id": ctx.used_event_id,
-            "signature": ctx.signature,
-            "endpoint_name": getattr(ctx, "endpoint_name", None),
-            "purpose": feature_use_contract["use_role"],
-            "decision_path": feature_use_contract["decision_path"],
-            "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
-            "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
-            "purpose_contract_version": feature_use_contract["contract_version"],
-        }],
+def _build_meta(ctx: EndpointContext, extractor_name: str, lineage: Dict[str, Any], details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    meta = {
+        "extractor": extractor_name,
         "freshness_state": ctx.freshness_state,
         "stale_age_min": ctx.stale_age_min,
         "na_reason": ctx.na_reason,
-        "feature_use_contract": feature_use_contract,
-        "use_role": feature_use_contract["use_role"],
-        "decision_eligible": feature_use_contract["decision_eligible"],
-        "missing_affects_confidence": feature_use_contract["missing_affects_confidence"],
-        "stale_affects_confidence": feature_use_contract["stale_affects_confidence"],
-        "metric_lineage": full_lineage,
-        "details": d
+        "source_endpoints": [{"path": ctx.path, "method": ctx.method}],
+        "metric_lineage": copy.deepcopy(lineage),
     }
+    if details:
+        meta.update(details)
+
+    if "effective_ts_utc" not in meta:
+        if meta.get("effective_at_utc") is not None:
+            meta["effective_ts_utc"] = meta.get("effective_at_utc")
+        elif getattr(ctx, "effective_timestamp_utc", None) is not None:
+            meta["effective_ts_utc"] = ctx.effective_timestamp_utc
+    meta["effective_time_source"] = _normalize_effective_time_source(meta.get("effective_time_source")) or "unknown"
+    meta["output_domain"] = _normalize_output_domain(meta.get("output_domain"))
+    if meta.get("output_domain") is None:
+        meta["output_domain"] = "unbounded_scalar"
+    meta["output_domain_contract_version"] = meta.get("output_domain_contract_version") or OUTPUT_DOMAIN_CONTRACT_VERSION
+    if "emitted_units" not in meta:
+        meta["emitted_units"] = lineage.get("emitted_units")
+    if "raw_input_units" not in meta:
+        meta["raw_input_units"] = lineage.get("raw_input_units")
+    if "bounded_output" not in meta and lineage.get("bounded_output") is not None:
+        meta["bounded_output"] = bool(lineage.get("bounded_output"))
+    if "expected_bounds" not in meta:
+        normalized_bounds = _normalize_expected_bounds(lineage.get("expected_bounds"))
+        if normalized_bounds is not None:
+            meta["expected_bounds"] = normalized_bounds
+
+    metric_lineage = meta.get("metric_lineage")
+    if isinstance(metric_lineage, dict):
+        if "effective_ts_utc" not in metric_lineage and meta.get("effective_ts_utc") is not None:
+            metric_lineage["effective_ts_utc"] = meta.get("effective_ts_utc")
+        if "effective_time_source" not in metric_lineage:
+            metric_lineage["effective_time_source"] = meta.get("effective_time_source")
+        if "time_provenance_degraded" not in metric_lineage:
+            metric_lineage["time_provenance_degraded"] = bool(meta.get("time_provenance_degraded", False))
+        for key in (
+            "emitted_units",
+            "raw_input_units",
+            "bounded_output",
+            "expected_bounds",
+            "output_domain",
+            "output_domain_contract_version",
+        ):
+            if key not in metric_lineage and meta.get(key) is not None:
+                metric_lineage[key] = meta.get(key)
+
+    return meta
+
 
 def _build_error_meta(
     ctx: EndpointContext,
     extractor_name: str,
     lineage: Dict[str, Any],
-    na_reason: str,
+    reason: str,
     details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    meta = _build_meta(ctx, extractor_name, lineage, details or {})
-    meta["freshness_state"] = "ERROR"
-    meta["na_reason"] = na_reason
+    meta = _build_meta(ctx, extractor_name, lineage, details)
+    meta["na_reason"] = reason
     return meta
 
 
-def _annotate_level_usage_contract(meta: Dict[str, Any], level_type: str) -> Dict[str, Any]:
-    contract = copy.deepcopy(derived_level_usage_contract(level_type))
-    meta["level_usage_contract"] = contract
-    meta.setdefault("details", {}).setdefault("derived_level_contract", copy.deepcopy(contract))
+def _normalize_signed(x: Optional[float], scale: float = 1.0) -> Optional[float]:
+    v = safe_float(x)
+    if v is None or scale <= 0:
+        return None
+    return max(min(v / scale, 1.0), -1.0)
 
-    metric_lineage = meta.setdefault("metric_lineage", {})
-    metric_lineage["decision_path_role"] = contract["decision_path_role"]
-    metric_lineage["prediction_consumed"] = contract["prediction_consumed"]
-    metric_lineage["contract_version"] = contract["contract_version"]
-    metric_lineage["feature_contract_state"] = contract["feature_contract_state"]
+
+def _confidence_degraded_meta(
+    ctx: EndpointContext,
+    extractor_name: str,
+    lineage: Dict[str, Any],
+    details: Dict[str, Any],
+) -> Dict[str, Any]:
+    meta = _build_meta(ctx, extractor_name, lineage, details)
+    meta["confidence_impact"] = "DEGRADED"
     return meta
+
+
+def _iter_rows(payload: Any) -> Iterable[Dict[str, Any]]:
+    for r in _grab_list(payload):
+        if isinstance(r, dict):
+            yield r
+
+
+def _sum_key(payload: Any, keys: Iterable[str]) -> Optional[float]:
+    total = 0.0
+    any_seen = False
+    for row in _iter_rows(payload):
+        for k in keys:
+            v = _as_float(row.get(k))
+            if v is not None:
+                total += v
+                any_seen = True
+                break
+    return total if any_seen else None
+
+
+def _first_non_null(row: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _safe_ratio(num: float, den: float) -> Optional[float]:
+    if den == 0:
+        return None
+    return num / den
+
+
+def _to_utc_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        return dt.isoformat()
+    if isinstance(value, datetime.date):
+        dt = datetime.datetime(value.year, value.month, value.day, tzinfo=datetime.timezone.utc)
+        return dt.isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.datetime.fromtimestamp(float(value), tz=datetime.timezone.utc).isoformat()
+        except Exception:
+            return None
+    if isinstance(value, str):
+        dt = _parse_utc_dt(value)
+        return dt.isoformat() if dt is not None else None
+    return None
+
+
+def _extract_spot_reference(payload: Any) -> Optional[float]:
+    if isinstance(payload, dict):
+        for k in SPOT_KEYS:
+            v = safe_float(payload.get(k))
+            if v is not None:
+                return v
+        rows = grab_list(payload)
+    else:
+        rows = grab_list(payload)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for k in SPOT_KEYS:
+            v = safe_float(row.get(k))
+            if v is not None:
+                return v
+    return None
+
+
+def _to_iso_or_none(value: Any) -> Optional[str]:
+    return _to_utc_iso(value)
+
+
+def _feature_row(
+    key: str,
+    val: Optional[float],
+    meta: Dict[str, Any],
+    *,
+    role_override: Optional[str] = None,
+) -> FeatureRow:
+    if meta is None:
+        meta = {}
+    _resolve_feature_use_role(meta, path=meta.get("source_endpoints", [{}])[0].get("path") if isinstance(meta.get("source_endpoints"), list) and meta.get("source_endpoints") else None, role_override=role_override)
+    return {
+        "feature_key": key,
+        "feature_value": val,
+        "meta_json": meta,
+    }
+
+
+def _level_row(level_type: str, price: Optional[float], magnitude: Optional[float], meta: Dict[str, Any]) -> LevelRow:
+    return {"level_type": level_type, "price": price, "magnitude": magnitude, "meta_json": meta}
+
+
+def _extract_interval_minutes(path: str, payload: Any) -> Optional[int]:
+    if "ohlc" in path:
+        if isinstance(payload, dict):
+            for key in ("interval", "timeframe", "candle_size"):
+                raw = payload.get(key)
+                if isinstance(raw, str):
+                    m = re.match(r"^(\d+)\s*(m|min|minute|minutes)$", raw.strip(), flags=re.I)
+                    if m:
+                        return int(m.group(1))
+                    m = re.match(r"^(\d+)$", raw.strip())
+                    if m:
+                        return int(m.group(1))
+                elif isinstance(raw, (int, float)):
+                    return int(raw)
+        m = re.search(r"/ohlc/(\d+)", path)
+        if m:
+            return int(m.group(1))
+        return 1
+    return None
+
+
+def _ctx_sort_keys(ctx: EndpointContext, payload: Any) -> Tuple[int, int, int, int]:
+    freshness_rank = 0 if ctx.freshness_state == "FRESH" else 1 if ctx.freshness_state == "EMPTY_VALID" else 2 if ctx.freshness_state == "STALE_CARRY" else 3
+    stale_age = int(ctx.stale_age_min if ctx.stale_age_min is not None else 999999)
+    path_priority = PATH_PRIORITY.get(ctx.path, 999)
+    endpoint_id = id(payload)
+    return freshness_rank, stale_age, path_priority, endpoint_id
+
 
 def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "spot",
-        # UW OHLC candles are represented as Candle objects in their OpenAPI schema.
-        # In live responses they commonly surface timestamps as `start_time`/`end_time`
-        # (UTC ISO8601), but older/alternate shapes may use `t`/`timestamp`.
-        "fields_used": ["close", "end_time", "start_time", "t", "timestamp", "time", "datetime", "date"],
+        "fields_used": ["close", "end_time|start_time|t|timestamp|time|datetime|date"],
         "units_expected": "USD",
         "normalization": "none",
         "session_applicability": "PREMARKET/RTH/AFTERHOURS",
         "quality_policy": "None if missing required explicit keys",
         "criticality": "CRITICAL"
     }, emitted_units="USD", raw_input_units="USD", bounded_output=False, output_domain="unbounded_scalar")
-    
+
     if is_na(ohlc_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, ctx.na_reason or "missing_dependency")})
-        
+
     rows = grab_list(ohlc_payload)
     if not rows:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "no_rows")})
@@ -883,7 +862,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
             or _parse_strict_ts(r, "date")
             or 0.0
         )
-    
+
     # As-of contract: when running an as-of snapshot (rounded bucket), the vendor payload can
     # include candles newer than ctx.as_of_time_utc (e.g., if the fetch happens a few minutes
     # after the bucket boundary). We must not select a candle whose timestamp is after the
@@ -905,7 +884,7 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
             eligible_rows = rows
 
     latest_row = max(eligible_rows, key=_row_ts)
-    
+
     close_val = latest_row.get("close")
     # Prefer close-of-candle timestamps when available.
     t_val = (
@@ -923,10 +902,10 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
         if latest_row.get("datetime") is not None
         else latest_row.get("date")
     )
-    
+
     if close_val is None:
         return FeatureBundle({"spot": None}, {"price": _build_error_meta(ctx, "extract_price_features", lineage, "missing_explicit_close_field")})
-        
+
     close_float = safe_float(close_val)
     ts_float = _row_ts(latest_row)
 
@@ -945,35 +924,43 @@ def extract_price_features(ohlc_payload: Any, ctx: EndpointContext) -> FeatureBu
     return FeatureBundle({"spot": close_float}, {"price": _build_meta(ctx, "extract_price_features", lineage, prov)})
 
 def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_premium: float = 10000.0, max_dte: float = 14.0, norm_scale: float = 500_000.0) -> FeatureBundle:
-    lineage = {
+    lineage = _with_output_domain({
         "metric_name": "smart_whale_pressure",
         "fields_used": ["premium", "dte", "side", "put_call", "option_symbol", "expiration", "multiplier", "deliverable"],
-        "units_expected": "Net Premium Flow (USD)",
+        "units_expected": "Normalized Directional Pressure [-1, 1]",
         "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
         "session_applicability": "RTH",
         "quality_policy": "None on filtered zeros / unparseable rows to avoid false baseline certainty; neutral only for structurally empty valid payload; suppress on contract normalization failure",
         "criticality": "CRITICAL"
-    }
+    }, emitted_units="normalized_directional_pressure", raw_input_units="Net Premium Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
 
     if is_na(flow_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, ctx.na_reason or "missing_dependency")})
 
-    trades = grab_list(flow_payload)
-    if not trades and isinstance(flow_payload, dict) and "data" in flow_payload:
-        trades = flow_payload["data"]
+    raw_rows = None
+    if isinstance(flow_payload, list):
+        raw_rows = flow_payload
+    elif isinstance(flow_payload, dict):
+        for key in ("data", "trades", "results", "result", "history", "items"):
+            if key in flow_payload:
+                raw_rows = flow_payload.get(key)
+                break
 
-    if trades and not all(isinstance(t, dict) for t in trades):
+    if isinstance(raw_rows, list) and raw_rows and not all(isinstance(t, dict) for t in raw_rows):
         _emit_endpoint_payload_observability(
             ctx=ctx,
             payload=flow_payload,
             feature_output_reason="schema_non_dict_rows",
             parsed_row_count=0,
-            rows_discarded_before_extraction=0,
+            rows_discarded_before_extraction=len(raw_rows),
             effective_timestamp_source="unknown",
         )
         return FeatureBundle({"smart_whale_pressure": None}, {"flow": _build_error_meta(ctx, "extract_smart_whale_pressure", lineage, "schema_non_dict_rows")})
 
-    # Only structurally empty payloads get a neutral output
+    trades = grab_list(flow_payload)
+
+    # Only structurally empty payloads get a neutral output.
+    # Payloads with rows that are present but semantically unusable are handled below as NA.
     if not trades:
         meta = _build_meta(
             ctx,
@@ -1066,7 +1053,7 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
         reason = "filtered_to_zero"
         if skip_bad_side > 0 and skip_bad_type == 0 and skip_missing_fields == 0 and skip_threshold == 0:
             reason = "unknown_side_labels"
-        elif skip_missing_fields > 0 and skip_bad_side == 0 and skip_bad_type == 0 and skip_threshold == 0:
+        elif skip_threshold == 0 and (skip_missing_fields > 0 or skip_bad_type > 0):
             reason = "unparseable_rows"
 
         _emit_endpoint_payload_observability(
@@ -1111,800 +1098,1299 @@ def extract_smart_whale_pressure(flow_payload: Any, ctx: EndpointContext, min_pr
 def extract_dealer_greeks(greek_payload: Any, ctx: EndpointContext, norm_scale: float = 1_000_000_000.0) -> FeatureBundle:
     keys = ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]
     lineage = _with_output_domain({
-        "metric_name": "dealer_greeks",
-        "fields_used": ["vanna_exposure", "charm_exposure", "gamma_exposure", "date", "option_symbol", "expiration", "multiplier", "deliverable"],
-        "units_expected": "Normalized Signed Exposure [-1, 1]",
-        "normalization": f"normalize_signed [-1, 1] by {norm_scale}; require canonical contract normalization for contract-level rows",
-        "session_applicability": "PREMARKET/RTH",
-        "quality_policy": "None on missing; suppress on contract normalization failure",
+        "metric_name": "dealer_greeks_bundle",
+        "fields_used": ["vanna", "charm", "gamma_exposure", "gamma", "notional"],
+        "units_expected": "Normalized signed exposure [-1,1] with raw notionals preserved in meta",
+        "normalization": f"normalize_signed by {norm_scale}; parse aggregate greek exposure endpoints",
+        "session_applicability": "RTH",
+        "quality_policy": "None if endpoint missing or schema invalid",
         "criticality": "CRITICAL"
     }, emitted_units="normalized_signed_exposure", raw_input_units="Notional Exposure (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
 
     if is_na(greek_payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency")})
+        error_meta = _build_error_meta(ctx, "extract_dealer_greeks", lineage, ctx.na_reason or "missing_dependency")
+        return FeatureBundle({k: None for k in keys}, {"greeks": error_meta})
 
     rows = grab_list(greek_payload)
-    if not rows:
-        return FeatureBundle({k: None for k in keys}, {"greeks": _build_error_meta(ctx, "extract_dealer_greeks", lineage, "no_rows")})
-
-    norm_summary = normalize_option_rows(rows)
-    if norm_summary.status == "INVALID":
-        return _build_contract_normalization_failure_bundle(
-            ctx,
-            "extract_dealer_greeks",
-            lineage,
-            greek_payload,
-            feature_keys=keys,
-            meta_key="greeks",
-            summary=norm_summary,
+    if rows:
+        row = rows[0]
+        vanna = safe_float(row.get("vanna") or row.get("dealer_vanna"))
+        charm = safe_float(row.get("charm") or row.get("dealer_charm"))
+        gamma = safe_float(
+            row.get("gamma_exposure")
+            or row.get("gamma")
+            or row.get("gex")
+            or row.get("gammaNotional")
+            or row.get("net_gamma_exposure_notional")
+            or row.get("notional")
         )
-    contract_map = normalized_contract_map(norm_summary)
+    elif isinstance(greek_payload, dict):
+        vanna = safe_float(greek_payload.get("vanna") or greek_payload.get("dealer_vanna"))
+        charm = safe_float(greek_payload.get("charm") or greek_payload.get("dealer_charm"))
+        gamma = safe_float(
+            greek_payload.get("gamma_exposure")
+            or greek_payload.get("gamma")
+            or greek_payload.get("gex")
+            or greek_payload.get("gammaNotional")
+            or greek_payload.get("net_gamma_exposure_notional")
+            or greek_payload.get("notional")
+        )
+    else:
+        vanna = charm = gamma = None
 
-    latest_idx, latest = max(enumerate(rows), key=lambda item: _parse_strict_ts(item[1], "date"))
-
-    # The upstream greeks payload frequently provides a *date* marker (YYYY-MM-DD) rather than a
-    # precise provider event/publish timestamp. Treating that date as an event/effective timestamp
-    # produces midnight UTC effective_ts values that violate join-skew/freshness rules after market
-    # open/close.
-    #
-    # We therefore:
-    #   1) Use the row date only for row selection + audit metadata.
-    #   2) Delegate the feature effective timestamp to EndpointTruth (ctx.effective_ts_utc).
-    ts_float = _parse_strict_ts(latest, "date")
-    date_raw = latest.get("date")
-    row_ts_utc = datetime.datetime.fromtimestamp(ts_float, datetime.timezone.utc).isoformat() if ts_float > 0 else None
-
-    prov: Dict[str, Any] = {}
-    prov.update({
-        "candidate_row_count": len(rows),
-        "selected_row_index": latest_idx,
-        "payload_row_date_raw": date_raw,
-        "payload_row_date_utc": row_ts_utc,
-        "ignored_payload_date_for_effective_ts": True,
-        "scale_used": norm_scale,
-        "contract_normalization": norm_summary.as_dict(),
+    prov = _extract_payload_provenance(greek_payload)
+    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, {
+        **prov,
+        "vanna_raw": vanna,
+        "charm_raw": charm,
+        "gamma_raw": gamma,
+        "status": "ok" if any(v is not None for v in (vanna, charm, gamma)) else "partial",
     })
-
-    # If EndpointTruth could not infer a true snapshot timestamp, allow a deterministic fallback
-    # for date-only payloads: midnight UTC of the provided YYYY-MM-DD. This prevents downstream
-    # freshness gating from treating the feature as missing time provenance entirely.
-    if ctx.effective_ts_utc is None:
-        inferred_snapshot_ts_utc = _infer_daily_snapshot_effective_ts_utc(greek_payload)
-        if inferred_snapshot_ts_utc is not None:
-            prov.update({
-                "effective_ts_utc": inferred_snapshot_ts_utc,
-                "effective_time_source": "payload_date_midnight_utc",
-                "timestamp_quality": "DATE_ONLY",
-                "time_provenance_degraded": True,
-            })
-    identity = _normalized_identity_for_row(contract_map, latest_idx)
-    if identity is not None:
-        prov["canonical_contract_key"] = identity.canonical_contract_key
-    meta = _build_meta(ctx, "extract_dealer_greeks", lineage, prov)
 
     return FeatureBundle({
-        "dealer_vanna": _normalize_signed(safe_float(latest.get("vanna_exposure")), scale=norm_scale),
-        "dealer_charm": _normalize_signed(safe_float(latest.get("charm_exposure")), scale=norm_scale),
-        "net_gamma_exposure_notional": _normalize_signed(safe_float(latest.get("gamma_exposure")), scale=norm_scale)
+        "dealer_vanna": _normalize_signed(vanna, scale=norm_scale),
+        "dealer_charm": _normalize_signed(charm, scale=norm_scale),
+        "net_gamma_exposure_notional": _normalize_signed(gamma, scale=norm_scale),
     }, {"greeks": meta})
 
-def extract_gex_sign(spot_exposures_payload: Any, ctx: EndpointContext) -> FeatureBundle:
+
+def extract_gex_sign(gex_payload: Any, ctx: EndpointContext, min_abs_notional: float = 1_000_000.0) -> FeatureBundle:
     lineage = {
         "metric_name": "net_gex_sign",
-        "fields_used": ["gamma_exposure"],
-        "units_expected": "Sign (+1.0, 0.0, -1.0)",
-        "normalization": "Directional sign clamping",
-        "session_applicability": "PREMARKET/RTH",
-        "quality_policy": "None on missing exposure fields",
-        "criticality": "CRITICAL"
+        "fields_used": ["gamma_exposure", "gex", "notional"],
+        "units_expected": "-1 / 0 / +1 sign of net gamma exposure",
+        "normalization": "sign of aggregate gamma exposure; 0 if |exposure| < threshold",
+        "session_applicability": "RTH",
+        "quality_policy": "None if aggregate gamma exposure cannot be inferred safely",
+        "criticality": "CRITICAL",
+        "emitted_units": "sign",
+        "raw_input_units": "Notional Exposure (USD)",
+        "bounded_output": True,
+        "expected_bounds": {"lower": -1.0, "upper": 1.0, "inclusive": True},
     }
-
-    if is_na(spot_exposures_payload) or ctx.freshness_state == "ERROR":
+    if is_na(gex_payload) or ctx.freshness_state == "ERROR":
         return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, ctx.na_reason or "missing_dependency")})
 
-    rows = grab_list(spot_exposures_payload)
-    if not rows:
+    rows = grab_list(gex_payload)
+    if rows:
+        total = 0.0
+        any_seen = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidates = (
+                row.get("gamma_exposure"),
+                row.get("gex"),
+                row.get("gamma"),
+                row.get("notional"),
+                row.get("value"),
+                row.get("net_gex"),
+                row.get("gamma_exposure_notional"),
+                row.get("net_gamma_exposure_notional"),
+                row.get("total_gamma_exposure"),
+            )
+            val = next((safe_float(v) for v in candidates if safe_float(v) is not None), None)
+            if val is None:
+                continue
+            total += val
+            any_seen = True
+        gex = total if any_seen else None
+    elif isinstance(gex_payload, dict):
+        candidates = (
+            gex_payload.get("gamma_exposure"),
+            gex_payload.get("gex"),
+            gex_payload.get("gamma"),
+            gex_payload.get("notional"),
+            gex_payload.get("value"),
+            gex_payload.get("net_gex"),
+            gex_payload.get("gamma_exposure_notional"),
+            gex_payload.get("net_gamma_exposure_notional"),
+            gex_payload.get("total_gamma_exposure"),
+        )
+        gex = next((safe_float(v) for v in candidates if safe_float(v) is not None), None)
+        # Schema-drift fallback: some vendor variants nest the aggregate under common
+        # containers such as {"data": {...}} or {"result": {...}}. Only attempt a narrow
+        # deterministic fallback when a direct aggregate key is absent.
+        if gex is None:
+            for key in ("data", "result", "results", "summary", "totals"):
+                nested = gex_payload.get(key)
+                if isinstance(nested, dict):
+                    nested_candidates = (
+                        nested.get("gamma_exposure"),
+                        nested.get("gex"),
+                        nested.get("gamma"),
+                        nested.get("notional"),
+                        nested.get("value"),
+                        nested.get("net_gex"),
+                        nested.get("gamma_exposure_notional"),
+                        nested.get("net_gamma_exposure_notional"),
+                        nested.get("total_gamma_exposure"),
+                    )
+                    gex = next((safe_float(v) for v in nested_candidates if safe_float(v) is not None), None)
+                    if gex is not None:
+                        break
+    else:
+        gex = None
+
+    if gex is None:
         _emit_endpoint_payload_observability(
             ctx=ctx,
-            payload=spot_exposures_payload,
-            feature_output_reason="no_rows",
+            payload=gex_payload,
+            feature_output_reason="unparseable_rows",
             parsed_row_count=0,
-            rows_discarded_before_extraction=0,
+            rows_discarded_before_extraction=len(rows) if isinstance(rows, list) else 0,
             effective_timestamp_source="unknown",
         )
-        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "no_rows")})
+        return FeatureBundle({"net_gex_sign": None}, {"gex": _build_error_meta(ctx, "extract_gex_sign", lineage, "unparseable_rows")})
 
-    gex_aliases = (
-        "gamma_exposure",
-        "gex",
-        "gamma",
-        "net_gamma",
-        "net_gex",
-        "total_gamma",
-        "net_gamma_exposure",
-    )
+    if abs(gex) < min_abs_notional:
+        sign = 0.0
+        status = "small_exposure_neutral"
+    else:
+        sign = 1.0 if gex > 0 else -1.0
+        status = "ok"
 
-    tot_gamma = 0.0
-    valid_rows = 0
-
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        g = None
-        for alias in gex_aliases:
-            g = safe_float(r.get(alias))
-            if g is not None:
-                break
-        if g is not None:
-            tot_gamma += g
-            valid_rows += 1
-
-    if valid_rows == 0:
-        _emit_endpoint_payload_observability(
-            ctx=ctx,
-            payload=spot_exposures_payload,
-            feature_output_reason="missing_gamma_exposure_fields",
-            parsed_row_count=0,
-            rows_discarded_before_extraction=len(rows),
-            effective_timestamp_source="unknown",
-        )
-        return FeatureBundle(
-            {"net_gex_sign": None},
-            {
-                "gex": _build_error_meta(
-                    ctx,
-                    "extract_gex_sign",
-                    lineage,
-                    "missing_gamma_exposure_fields",
-                    details={
-                        "attempted_aliases": list(gex_aliases),
-                        "row_count": len(rows),
-                        "sample_keys": sorted(list(rows[0].keys()))[:20] if rows and isinstance(rows[0], dict) else [],
-                    },
-                )
-            },
-        )
-
-    sign = 0.0 if abs(tot_gamma) <= 1e-9 else (1.0 if tot_gamma > 0 else -1.0)
-    meta = _build_meta(
-        ctx,
-        "extract_gex_sign",
-        lineage,
-        {
-            **_extract_payload_provenance(spot_exposures_payload),
-            "total": tot_gamma,
-            "n_strikes": valid_rows,
-        },
-    )
+    prov = _extract_payload_provenance(gex_payload)
+    meta = _build_meta(ctx, "extract_gex_sign", lineage, {
+        **prov,
+        "gex_raw": gex,
+        "min_abs_notional": min_abs_notional,
+        "status": status,
+    })
     return FeatureBundle({"net_gex_sign": sign}, {"gex": meta})
 
-def extract_oi_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+
+def extract_oi_pressure(oi_payload: Any, ctx: EndpointContext, norm_scale: float = 100_000.0) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "oi_pressure",
-        "fields_used": [
-            "open_interest",
-            "oi",
-            "strike",
-            "strike_price",
-            # put/call semantics (provider varies)
-            "put_call",
-            "option_type",
-            "type",
-            "pc",
-            "right",
-            "call_put",
-            "callPut",
-            "side",
-            "cp",
-            "putCall",
-            "optionType",
-            "is_call",
-            "is_put",
-            "direction",
-            # contract-normalization aids
-            "expiration",
-            "option_symbol",
-            "multiplier",
-            "deliverable",
-        ],
-        "units_expected": "Directional Imbalance Ratio [-1, 1]",
-        "normalization": "(weighted_call_equivalent_oi - weighted_put_equivalent_oi) / (weighted_call_equivalent_oi + weighted_put_equivalent_oi) with canonical contract normalization for contract-level rows",
+        "fields_used": ["call_oi", "put_oi", "open_interest", "type|put_call"],
+        "units_expected": "Directional imbalance ratio [-1,1]",
+        "normalization": "call_minus_put over total OI",
         "session_applicability": "RTH",
-        "quality_policy": "Suppress on missing put/call semantics, invalid directional rows, or contract normalization failure",
+        "quality_policy": "None if put/call OI not inferable safely",
         "criticality": "CRITICAL"
     }, emitted_units="directional_imbalance_ratio", raw_input_units="Open Interest (contracts)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, ctx.na_reason or "missing_dependency")})
 
-    rows = grab_list(payload)
-    if not rows:
-        # Fallback: some payloads only provide aggregate call/put totals.
-        call_total, put_total, totals_prov = _extract_call_put_totals(payload)
-        if call_total is not None and put_total is not None:
-            pressure = _normalize_balance(call_total, put_total)
-            meta = _build_meta(
-                ctx,
-                "extract_oi",
-                lineage,
-                {
-                    **_extract_payload_provenance(payload),
-                    **totals_prov,
-                    "status": "computed_from_summary_totals",
-                    "call_total": call_total,
-                    "put_total": put_total,
-                    "weighting": "summary_call_put_totals",
-                },
+    if is_na(oi_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi_pressure", lineage, ctx.na_reason or "missing_dependency")})
+
+    rows = grab_list(oi_payload)
+
+    # Prefer direct aggregate call/put OI if available
+    call_oi = put_oi = None
+    if isinstance(oi_payload, dict):
+        call_oi = safe_float(oi_payload.get("call_oi") or oi_payload.get("calls_oi") or oi_payload.get("callOpenInterest"))
+        put_oi = safe_float(oi_payload.get("put_oi") or oi_payload.get("puts_oi") or oi_payload.get("putOpenInterest"))
+
+    skip_missing_oi = 0
+    skip_bad_type = 0
+
+    if call_oi is None or put_oi is None:
+        call_oi = 0.0
+        put_oi = 0.0
+        any_valid = False
+        pc_map = {"C": "CALL", "CALL": "CALL", "CALLS": "CALL", "P": "PUT", "PUT": "PUT", "PUTS": "PUT"}
+
+        norm_summary = normalize_option_rows(rows)
+        contract_map = normalized_contract_map(norm_summary)
+
+        for idx, r in enumerate(rows):
+            oi = safe_float(
+                r.get("open_interest")
+                or r.get("oi")
+                or r.get("openInterest")
+                or r.get("open_interest_change")
+                or r.get("oi_change")
             )
-            return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
-
-        return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi", lineage, "no_rows")})
-
-    norm_summary = normalize_option_rows(rows)
-    if norm_summary.status == "INVALID":
-        return _build_contract_normalization_failure_bundle(
-            ctx,
-            "extract_oi",
-            lineage,
-            payload,
-            feature_keys=["oi_pressure"],
-            meta_key="oi",
-            summary=norm_summary,
-        )
-    contract_map = normalized_contract_map(norm_summary)
-
-    spot_ref = _extract_spot_reference(payload)
-
-    # Provider schemas vary; attempt multiple key aliases for call/put semantics.
-    pc_key_aliases = (
-        "put_call",
-        "option_type",
-        "type",
-        "pc",
-        "right",
-        "call_put",
-        "callPut",
-        "side",
-        "cp",
-        "putCall",
-        "optionType",
-        "direction",
-    )
-
-    def _extract_put_call_raw(row: Dict[str, Any]) -> Any:
-        # Boolean flags (seen in some vendor payloads)
-        if "is_call" in row and row.get("is_call") is not None:
-            return "CALL" if bool(row.get("is_call")) else "PUT"
-        if "is_put" in row and row.get("is_put") is not None:
-            return "PUT" if bool(row.get("is_put")) else "CALL"
-
-        for k in pc_key_aliases:
-            if k not in row:
+            identity = _normalized_identity_for_row(contract_map, idx)
+            pc_raw = identity.put_call if identity is not None else (
+                r.get("put_call") or r.get("option_type") or r.get("type") or r.get("pc")
+            )
+            if oi is None or is_na(pc_raw):
+                skip_missing_oi += 1
                 continue
-            v = row.get(k)
-            if v is None:
+            pc_norm = pc_raw if identity is not None else pc_map.get(str(pc_raw).upper().strip())
+            if not pc_norm:
+                skip_bad_type += 1
                 continue
-            if isinstance(v, str) and v.strip() == "":
-                continue
-            return v
-        return None
-    weighted_call_oi = 0.0
-    weighted_put_oi = 0.0
-    directional_rows = 0
-    parsed_rows = 0
-    missing_put_call_rows = 0
-    normalized_contract_rows = 0
+            if pc_norm == "CALL":
+                call_oi += oi
+            else:
+                put_oi += oi
+            any_valid = True
 
-    for idx, r in enumerate(rows):
-        identity = _normalized_identity_for_row(contract_map, idx)
-        oi_val = safe_float(r.get("open_interest") or r.get("oi"))
-        strike = identity.strike if identity is not None else safe_float(r.get("strike") or r.get("strike_price"))
+        if not any_valid:
+            # Schema-drift fallback for payloads that provide aggregate open interest under
+            # non-standard aliases (e.g. "put_open_interest"/"call_open_interest").
+            if isinstance(oi_payload, dict):
+                alt_call = safe_float(
+                    oi_payload.get("call_open_interest")
+                    or oi_payload.get("calls_open_interest")
+                    or oi_payload.get("call_oi_total")
+                    or oi_payload.get("total_call_oi")
+                )
+                alt_put = safe_float(
+                    oi_payload.get("put_open_interest")
+                    or oi_payload.get("puts_open_interest")
+                    or oi_payload.get("put_oi_total")
+                    or oi_payload.get("total_put_oi")
+                )
+                if alt_call is not None and alt_put is not None:
+                    call_oi = alt_call
+                    put_oi = alt_put
+                    any_valid = True
 
-        # Prefer contract-derived put/call when present; otherwise fall back to row aliases.
-        pc_norm = None
-        if identity is not None and identity.put_call:
-            pc_norm = identity.put_call
-        if pc_norm is None:
-            pc_norm = _normalize_put_call(_extract_put_call_raw(r))
+        if not any_valid:
+            reason = "unparseable_rows" if (skip_missing_oi > 0 or skip_bad_type > 0) else "filtered_to_zero"
+            _emit_endpoint_payload_observability(
+                ctx=ctx,
+                payload=oi_payload,
+                feature_output_reason=reason,
+                parsed_row_count=0,
+                rows_discarded_before_extraction=len(rows),
+                effective_timestamp_source="unknown",
+            )
+            return FeatureBundle({"oi_pressure": None}, {"oi": _build_error_meta(ctx, "extract_oi_pressure", lineage, reason)})
 
-        if oi_val is None or not math.isfinite(oi_val) or oi_val < 0:
-            continue
-        parsed_rows += 1
-        if pc_norm is None:
-            missing_put_call_rows += 1
-            continue
-
-        weight = 1.0
-        if spot_ref is not None and strike is not None and math.isfinite(strike):
-            spot_band = max(abs(spot_ref) * 0.02, 1.0)
-            weight = 1.0 / (1.0 + abs(strike - spot_ref) / spot_band)
-
-        scale = contract_scale(identity) if identity is not None else 1.0
-        equivalent_oi = oi_val * scale
-        if identity is not None:
-            normalized_contract_rows += 1
-
-        directional_rows += 1
-        if pc_norm == "CALL":
-            weighted_call_oi += equivalent_oi * weight
-        else:
-            weighted_put_oi += equivalent_oi * weight
-
-    if directional_rows == 0:
-        # Fallback: attempt to compute from summary totals if available.
-        call_total, put_total, totals_prov = _extract_call_put_totals(payload)
-        if call_total is not None and put_total is not None:
-            pressure = _normalize_balance(call_total, put_total)
-            meta = _build_meta(ctx, "extract_oi", lineage, {
-                **_extract_payload_provenance(payload),
-                "contract_normalization": norm_summary.as_dict(),
-                "n_rows": len(rows),
-                "parsed_rows": parsed_rows,
-                "missing_put_call_rows": missing_put_call_rows,
-                "normalized_contract_rows": normalized_contract_rows,
-                **totals_prov,
-                "status": "computed_from_summary_totals_fallback",
-                "call_total": call_total,
-                "put_total": put_total,
-                "spot_reference": spot_ref,
-                "weighting": "summary_call_put_totals",
-            })
-            return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
-
-        logger.warning(
-            "unsafe_oi_pressure_suppressed",
-            extra={"counter": "unsafe_directional_metric_suppressed", "feature_key": "oi_pressure", "reason": "missing_put_call_or_directional_rows"},
-        )
-        meta = _build_meta(ctx, "extract_oi", lineage, {
-            **_extract_payload_provenance(payload),
-            "contract_normalization": norm_summary.as_dict(),
-            "n_rows": len(rows),
-            "parsed_rows": parsed_rows,
-            "missing_put_call_rows": missing_put_call_rows,
-            "normalized_contract_rows": normalized_contract_rows,
-            "status": "suppressed_directionless_oi_total",
-            "suppression_reason": "missing_put_call_or_directional_rows",
-            "spot_reference": spot_ref,
-            "attempted_put_call_aliases": list(pc_key_aliases),
-            "sample_row_keys": sorted({k for rr in rows[:3] for k in (rr or {}).keys()}),
+    total = call_oi + put_oi
+    if total == 0:
+        # True empty/zero aggregate OI is neutral, but degraded
+        prov = _extract_payload_provenance(oi_payload)
+        meta = _confidence_degraded_meta(ctx, "extract_oi_pressure", lineage, {
+            **prov,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+            "status": "computed_neutral_from_empty",
         })
-        meta["na_reason"] = "missing_put_call_or_directional_rows"
-        return FeatureBundle({"oi_pressure": None}, {"oi": meta})
+        meta["freshness_state"] = "EMPTY_VALID"
+        meta["na_reason"] = "empty_payload"
+        return FeatureBundle({"oi_pressure": 0.0}, {"oi": meta})
 
-    pressure = _normalize_balance(weighted_call_oi, weighted_put_oi)
-    meta = _build_meta(ctx, "extract_oi", lineage, {
-        **_extract_payload_provenance(payload),
-        "contract_normalization": norm_summary.as_dict(),
-        "n_rows": len(rows),
-        "parsed_rows": parsed_rows,
-        "directional_rows": directional_rows,
-        "normalized_contract_rows": normalized_contract_rows,
-        "weighted_call_oi": weighted_call_oi,
-        "weighted_put_oi": weighted_put_oi,
-        "spot_reference": spot_ref,
-        "weighting": "near_spot_inverse_distance" if spot_ref is not None else "unweighted_call_put_balance",
+    ratio = (call_oi - put_oi) / total
+    prov = _extract_payload_provenance(oi_payload)
+    meta = _build_meta(ctx, "extract_oi_pressure", lineage, {
+        **prov,
+        "call_oi": call_oi,
+        "put_oi": put_oi,
+        "status": "ok",
     })
-    return FeatureBundle({"oi_pressure": pressure}, {"oi": meta})
+    return FeatureBundle({"oi_pressure": max(min(ratio, 1.0), -1.0)}, {"oi": meta})
 
-def extract_volatility_features(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+
+def extract_iv_rank(iv_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "iv_rank",
-        "fields_used": ["iv_rank", "iv_percentile"],
-        "units_expected": "Percentile [0, 1]",
-        "normalization": "none",
-        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
-        "quality_policy": "None on missing",
+        "fields_used": ["iv_rank", "rank", "percentile"],
+        "units_expected": "Percentile rank [0,1]",
+        "normalization": "iv_rank/100 when source appears as percentage",
+        "session_applicability": "RTH",
+        "quality_policy": "None if IV rank unavailable",
         "criticality": "NON_CRITICAL"
     }, emitted_units="percentile_rank", raw_input_units="Percentile Rank", bounded_output=True, expected_bounds=(0.0, 1.0), output_domain="closed_interval")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, ctx.na_reason or "missing_dependency")})
-    
-    rows = grab_list(payload)
-    if not rows and isinstance(payload, dict):
-        rows = [payload]
-        
-    val = safe_float(rows[0].get("iv_rank")) if rows else None
-    if val is None or not math.isfinite(val):
-        return FeatureBundle({"iv_rank": None}, {"vol": _build_error_meta(ctx, "extract_vol", lineage, "missing_iv_rank")})
-    
-    return FeatureBundle({"iv_rank": val}, {"vol": _build_meta(ctx, "extract_vol", lineage, _extract_payload_provenance(payload))})
 
-def extract_vol_term_structure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    if is_na(iv_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"iv_rank": None}, {"iv": _build_error_meta(ctx, "extract_iv_rank", lineage, ctx.na_reason or "missing_dependency")})
+
+    rows = grab_list(iv_payload)
+    if rows:
+        row = rows[0]
+        val = safe_float(row.get("iv_rank") or row.get("rank") or row.get("percentile"))
+    elif isinstance(iv_payload, dict):
+        val = safe_float(iv_payload.get("iv_rank") or iv_payload.get("rank") or iv_payload.get("percentile"))
+    else:
+        val = None
+
+    if val is None:
+        return FeatureBundle({"iv_rank": None}, {"iv": _build_error_meta(ctx, "extract_iv_rank", lineage, "unparseable_rows")})
+
+    if val > 1.0:
+        val = val / 100.0
+    val = max(min(val, 1.0), 0.0)
+
+    prov = _extract_payload_provenance(iv_payload)
+    meta = _build_meta(ctx, "extract_iv_rank", lineage, {**prov, "iv_rank_raw": val, "status": "ok"})
+    return FeatureBundle({"iv_rank": val}, {"iv": meta})
+
+
+def extract_vol_term_slope(ts_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "vol_term_slope",
-        "fields_used": ["dte", "days", "iv", "implied_volatility"],
-        "units_expected": "IV Spread",
-        "normalization": "none",
-        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
-        "quality_policy": "None on missing",
+        "fields_used": ["near_iv", "far_iv", "iv", "tenor"],
+        "units_expected": "Implied volatility spread",
+        "normalization": "far_iv - near_iv",
+        "session_applicability": "RTH",
+        "quality_policy": "None if term structure unavailable",
         "criticality": "NON_CRITICAL"
     }, emitted_units="implied_volatility_spread", raw_input_units="Implied Volatility", bounded_output=False, output_domain="unbounded_scalar")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, ctx.na_reason or "missing_dependency")})
-    
-    rows = grab_list(payload)
-    if not rows:
-        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, "no_rows")})
-        
-    valid_pts = []
-    for r in rows:
-        d = safe_float(r.get("dte") or r.get("days"))
-        iv = safe_float(r.get("iv") or r.get("implied_volatility") or r.get("value"))
-        if d is not None and iv is not None and math.isfinite(d) and math.isfinite(iv):
-            valid_pts.append((d, iv))
-    
-    if len(valid_pts) < 2:
-        return FeatureBundle({"vol_term_slope": None}, {"vol_ts": _build_error_meta(ctx, "extract_vol_term_structure", lineage, "insufficient_data_points")})
-        
-    valid_pts.sort(key=lambda x: x[0])
-    slope = valid_pts[-1][1] - valid_pts[0][1]
 
-    prov = {**_extract_payload_provenance(payload), "n_rows": len(valid_pts)}
-    if ctx.effective_ts_utc is None:
-        inferred_snapshot_ts_utc = _infer_daily_snapshot_effective_ts_utc(payload)
-        if inferred_snapshot_ts_utc is not None:
-            prov.update({
-                "effective_ts_utc": inferred_snapshot_ts_utc,
-                "effective_time_source": "payload_date_midnight_utc",
-                "timestamp_quality": "DATE_ONLY",
-                "time_provenance_degraded": True,
-            })
+    if is_na(ts_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"vol_term_slope": None}, {"ts": _build_error_meta(ctx, "extract_vol_term_slope", lineage, ctx.na_reason or "missing_dependency")})
 
-    return FeatureBundle({"vol_term_slope": slope}, {"vol_ts": _build_meta(ctx, "extract_vol_term_structure", lineage, prov)})
+    rows = grab_list(ts_payload)
+    if len(rows) >= 2:
+        scored = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tenor = safe_float(row.get("tenor") or row.get("days") or row.get("dte"))
+            iv = safe_float(row.get("iv") or row.get("volatility") or row.get("implied_volatility"))
+            if tenor is None or iv is None:
+                continue
+            scored.append((tenor, iv))
+        scored.sort(key=lambda x: x[0])
+        if len(scored) >= 2:
+            near_iv = scored[0][1]
+            far_iv = scored[-1][1]
+        else:
+            near_iv = far_iv = None
+    elif isinstance(ts_payload, dict):
+        near_iv = safe_float(ts_payload.get("near_iv"))
+        far_iv = safe_float(ts_payload.get("far_iv"))
+    else:
+        near_iv = far_iv = None
 
-def _emit_endpoint_payload_observability(
-    *,
-    ctx: EndpointContext,
-    payload: Any,
-    feature_output_reason: str,
-    parsed_row_count: int,
-    rows_discarded_before_extraction: int,
-    effective_timestamp_source: str,
-) -> None:
-    try:
-        payload_rows = grab_list(payload)
-        payload_row_count = len(payload_rows) if payload_rows else 0
+    if near_iv is None or far_iv is None:
+        return FeatureBundle({"vol_term_slope": None}, {"ts": _build_error_meta(ctx, "extract_vol_term_slope", lineage, "unparseable_rows")})
 
-        sample_keys = []
-        if payload_rows and isinstance(payload_rows[0], dict):
-            sample_keys = sorted(list(payload_rows[0].keys()))[:20]
-        elif isinstance(payload, dict):
-            sample_keys = sorted(list(payload.keys()))[:20]
+    slope = far_iv - near_iv
+    prov = _extract_payload_provenance(ts_payload)
+    meta = _build_meta(ctx, "extract_vol_term_slope", lineage, {
+        **prov,
+        "near_iv": near_iv,
+        "far_iv": far_iv,
+        "status": "ok",
+    })
+    return FeatureBundle({"vol_term_slope": slope}, {"ts": meta})
 
-        logger.info(
-            "endpoint_payload_observability",
-            extra={
-                "event": "endpoint_payload_observability",
-                "endpoint_id": getattr(ctx, "endpoint_id", None),
-                "endpoint_name": getattr(ctx, "name", None),
-                "path": getattr(ctx, "path", None),
-                "payload_row_count": payload_row_count,
-                "parsed_row_count": parsed_row_count,
-                "effective_timestamp_source": effective_timestamp_source,
-                "rows_discarded_before_extraction": rows_discarded_before_extraction,
-                "feature_output_reason": feature_output_reason,
-                "payload_shape": type(payload).__name__,
-                "payload_sample_keys": sample_keys,
-            },
-        )
-    except Exception:
-        logger.exception("failed to emit endpoint_payload_observability")
 
-def extract_vol_skew(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+def extract_vol_skew(skew_payload: Any, ctx: EndpointContext) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "vol_skew",
-        "fields_used": ["skew", "risk_reversal", "value"],
-        "units_expected": "Skew Ratio",
-        "normalization": "none",
-        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
-        "quality_policy": "None on missing",
+        "fields_used": ["risk_reversal", "rr", "put_iv", "call_iv"],
+        "units_expected": "Skew ratio or risk reversal",
+        "normalization": "use explicit risk reversal if present else put_iv - call_iv",
+        "session_applicability": "RTH",
+        "quality_policy": "None if skew unavailable",
         "criticality": "NON_CRITICAL"
     }, emitted_units="skew_ratio", raw_input_units="Skew Ratio", bounded_output=False, output_domain="unbounded_scalar")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, ctx.na_reason or "missing_dependency")})
-    
-    rows = grab_list(payload)
-    if not rows and isinstance(payload, dict):
-        rows = [payload]
-        
-    if not rows:
-        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "no_rows")})
-        
-    latest = rows[0]
-    skew_val = safe_float(latest.get("skew") or latest.get("risk_reversal") or latest.get("value"))
-    
-    if skew_val is None or not math.isfinite(skew_val):
-        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "missing_or_invalid_skew")})
-        
-    return FeatureBundle({"vol_skew": skew_val}, {"skew": _build_meta(ctx, "extract_vol_skew", lineage, _extract_payload_provenance(payload))})
 
-def extract_darkpool_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    if is_na(skew_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, ctx.na_reason or "missing_dependency")})
+
+    rows = grab_list(skew_payload)
+    if rows:
+        row = rows[0]
+    elif isinstance(skew_payload, dict):
+        row = skew_payload
+    else:
+        row = {}
+
+    rr = safe_float(row.get("risk_reversal") or row.get("rr"))
+    if rr is None:
+        put_iv = safe_float(row.get("put_iv") or row.get("putIV"))
+        call_iv = safe_float(row.get("call_iv") or row.get("callIV"))
+        if put_iv is not None and call_iv is not None:
+            rr = put_iv - call_iv
+
+    if rr is None:
+        return FeatureBundle({"vol_skew": None}, {"skew": _build_error_meta(ctx, "extract_vol_skew", lineage, "unparseable_rows")})
+
+    prov = _extract_payload_provenance(skew_payload)
+    meta = _build_meta(ctx, "extract_vol_skew", lineage, {**prov, "rr_raw": rr, "status": "ok"})
+    return FeatureBundle({"vol_skew": rr}, {"skew": meta})
+
+
+def extract_darkpool_pressure(dp_payload: Any, ctx: EndpointContext, norm_scale: float = 5_000_000.0) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "darkpool_pressure",
-        "fields_used": ["volume", "price", "size", "side"],
-        "units_expected": "Directional Imbalance Ratio [-1, 1]",
-        "normalization": "Suppress unless explicit side semantics exist; otherwise (buy_notional - sell_notional) / total_notional",
-        "session_applicability": "PREMARKET/RTH/AFTERHOURS",
-        "quality_policy": "Suppress on directionless totals",
+        "fields_used": ["premium", "notional", "side", "direction", "buy_notional", "sell_notional"],
+        "units_expected": "Directional imbalance ratio [-1,1]",
+        "normalization": "buy_minus_sell over normalized notional",
+        "session_applicability": "RTH",
+        "quality_policy": "None if directionality unavailable",
         "criticality": "NON_CRITICAL"
     }, emitted_units="directional_imbalance_ratio", raw_input_units="Notional Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, ctx.na_reason or "missing_dependency")})
-    
-    rows = grab_list(payload)
-    if not rows:
-        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": _build_error_meta(ctx, "extract_darkpool", lineage, "no_rows")})
 
-    buy_notional = 0.0
-    sell_notional = 0.0
-    explicit_side_rows = 0
-    valid_rows = 0
-    for r in rows:
-        vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
-        price = safe_float(r.get("price", 0)) or 0.0
-        notional = vol * price
-        if not math.isfinite(notional):
-            continue
-        valid_rows += 1
-        side = str(r.get("side", "")).upper().strip()
-        if side in BULLISH_SIDE_ALIASES:
-            buy_notional += notional
-            explicit_side_rows += 1
-        elif side in BEARISH_SIDE_ALIASES:
-            sell_notional += notional
-            explicit_side_rows += 1
+    if is_na(dp_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"darkpool_pressure": None}, {"dp": _build_error_meta(ctx, "extract_darkpool_pressure", lineage, ctx.na_reason or "missing_dependency")})
 
-    if explicit_side_rows == 0:
-        logger.warning(
-            "unsafe_darkpool_pressure_suppressed",
-            extra={"counter": "unsafe_directional_metric_suppressed", "feature_key": "darkpool_pressure", "reason": "directionless_total"},
-        )
-        meta = _build_meta(ctx, "extract_darkpool", lineage, {
-            **_extract_payload_provenance(payload),
-            "n_rows": len(rows),
-            "valid_rows": valid_rows,
-            "status": "suppressed_directionless_darkpool_total",
-            "suppression_reason": "directionless_total",
-        })
-        meta["na_reason"] = "directionless_total"
-        return FeatureBundle({"darkpool_pressure": None}, {"darkpool": meta})
+    rows = grab_list(dp_payload)
+    buy = sell = 0.0
+    valid_count = 0
 
-    pressure = _normalize_balance(buy_notional, sell_notional)
-    return FeatureBundle({"darkpool_pressure": pressure}, {"darkpool": _build_meta(ctx, "extract_darkpool", lineage, {**_extract_payload_provenance(payload), "n_rows": len(rows), "explicit_side_rows": explicit_side_rows, "buy_notional": buy_notional, "sell_notional": sell_notional})})
+    if isinstance(dp_payload, dict):
+        buy_direct = safe_float(dp_payload.get("buy_notional") or dp_payload.get("buy"))
+        sell_direct = safe_float(dp_payload.get("sell_notional") or dp_payload.get("sell"))
+        if buy_direct is not None and sell_direct is not None:
+            buy = buy_direct
+            sell = sell_direct
+            valid_count = 1
 
-def extract_litflow_pressure(payload: Any, ctx: EndpointContext) -> FeatureBundle:
+    if valid_count == 0:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            side = str(r.get("side") or r.get("direction") or "").upper().strip()
+            val = safe_float(r.get("premium") or r.get("notional") or r.get("value"))
+            if val is None:
+                continue
+            if side in BULLISH_SIDE_ALIASES:
+                buy += val
+                valid_count += 1
+            elif side in BEARISH_SIDE_ALIASES:
+                sell += val
+                valid_count += 1
+
+    if valid_count == 0:
+        return FeatureBundle({"darkpool_pressure": None}, {"dp": _build_error_meta(ctx, "extract_darkpool_pressure", lineage, "unparseable_rows")})
+
+    total = buy + sell
+    score = 0.0 if total == 0 else max(min((buy - sell) / total, 1.0), -1.0)
+    prov = _extract_payload_provenance(dp_payload)
+    meta = _build_meta(ctx, "extract_darkpool_pressure", lineage, {
+        **prov,
+        "buy_notional": buy,
+        "sell_notional": sell,
+        "status": "ok",
+    })
+    return FeatureBundle({"darkpool_pressure": score}, {"dp": meta})
+
+
+def extract_litflow_pressure(lf_payload: Any, ctx: EndpointContext, norm_scale: float = 5_000_000.0) -> FeatureBundle:
     lineage = _with_output_domain({
         "metric_name": "litflow_pressure",
-        "fields_used": ["volume", "price", "side", "size"],
-        "units_expected": "Directional Imbalance Ratio [-1, 1]",
-        "normalization": "(buy_notional - sell_notional) / total_notional",
+        "fields_used": ["premium", "notional", "side", "direction", "buy_notional", "sell_notional"],
+        "units_expected": "Directional imbalance ratio [-1,1]",
+        "normalization": "buy_minus_sell over normalized notional",
         "session_applicability": "RTH",
-        "quality_policy": "None on missing",
+        "quality_policy": "None if directionality unavailable",
         "criticality": "NON_CRITICAL"
     }, emitted_units="directional_imbalance_ratio", raw_input_units="Notional Flow (USD)", bounded_output=True, expected_bounds=(-1.0, 1.0), output_domain="closed_interval")
-    if is_na(payload) or ctx.freshness_state == "ERROR":
-        return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, ctx.na_reason or "missing_dependency")})
-    
-    rows = grab_list(payload)
-    if not rows:
-        return FeatureBundle({"litflow_pressure": None}, {"litflow": _build_error_meta(ctx, "extract_litflow", lineage, "no_rows")})
 
-    buy_notional = 0.0
-    sell_notional = 0.0
-    side_rows = 0
-    for r in rows:
-        vol = safe_float(r.get("volume", 0)) or safe_float(r.get("size", 0)) or 0.0
-        price = safe_float(r.get("price", 0)) or 0.0
-        side = str(r.get("side", "")).upper()
-        
-        notional = vol * price
-        if not math.isfinite(notional):
-            continue
-            
-        if side in BULLISH_SIDE_ALIASES:
-            buy_notional += notional
-            side_rows += 1
-        elif side in BEARISH_SIDE_ALIASES:
-            sell_notional += notional
-            side_rows += 1
+    if is_na(lf_payload) or ctx.freshness_state == "ERROR":
+        return FeatureBundle({"litflow_pressure": None}, {"lf": _build_error_meta(ctx, "extract_litflow_pressure", lineage, ctx.na_reason or "missing_dependency")})
 
-    pressure = _normalize_balance(buy_notional, sell_notional)
-    meta = _build_meta(ctx, "extract_litflow", lineage, {
-        **_extract_payload_provenance(payload),
-        "n_rows": len(rows),
-        "side_rows": side_rows,
-        "buy_notional": buy_notional,
-        "sell_notional": sell_notional,
+    rows = grab_list(lf_payload)
+    buy = sell = 0.0
+    valid_count = 0
+
+    if isinstance(lf_payload, dict):
+        buy_direct = safe_float(lf_payload.get("buy_notional") or lf_payload.get("buy"))
+        sell_direct = safe_float(lf_payload.get("sell_notional") or lf_payload.get("sell"))
+        if buy_direct is not None and sell_direct is not None:
+            buy = buy_direct
+            sell = sell_direct
+            valid_count = 1
+
+    if valid_count == 0:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            side = str(r.get("side") or r.get("direction") or "").upper().strip()
+            val = safe_float(r.get("premium") or r.get("notional") or r.get("value"))
+            if val is None:
+                continue
+            if side in BULLISH_SIDE_ALIASES:
+                buy += val
+                valid_count += 1
+            elif side in BEARISH_SIDE_ALIASES:
+                sell += val
+                valid_count += 1
+
+    if valid_count == 0:
+        return FeatureBundle({"litflow_pressure": None}, {"lf": _build_error_meta(ctx, "extract_litflow_pressure", lineage, "unparseable_rows")})
+
+    total = buy + sell
+    score = 0.0 if total == 0 else max(min((buy - sell) / total, 1.0), -1.0)
+    prov = _extract_payload_provenance(lf_payload)
+    meta = _build_meta(ctx, "extract_litflow_pressure", lineage, {
+        **prov,
+        "buy_notional": buy,
+        "sell_notional": sell,
+        "status": "ok",
     })
-    return FeatureBundle({"litflow_pressure": pressure}, {"litflow": meta})
+    return FeatureBundle({"litflow_pressure": score}, {"lf": meta})
 
-EXTRACTOR_REGISTRY = {
-    "/api/stock/{ticker}/spot-exposures": "GEX",
-    "/api/stock/{ticker}/spot-exposures/strike": "GEX",
-    "/api/stock/{ticker}/spot-exposures/expiry-strike": "GEX",
-    "/api/stock/{ticker}/flow-per-strike-intraday": "FLOW",
-    "/api/stock/{ticker}/flow-recent": "FLOW",
-    "/api/stock/{ticker}/flow-per-strike": "FLOW",
-    "/api/stock/{ticker}/greek-exposure": "GREEKS",
-    "/api/stock/{ticker}/greek-exposure/strike": "GREEKS",
-    "/api/stock/{ticker}/greek-exposure/expiry": "GREEKS",
-    "/api/stock/{ticker}/ohlc/{candle_size}": "PRICE",
-    "/api/stock/{ticker}/oi-per-strike": "OI",
-    "/api/stock/{ticker}/oi-change": "OI",
-    "/api/stock/{ticker}/iv-rank": "VOL",
-    "/api/stock/{ticker}/volatility/term-structure": "VOL_TERM",
-    "/api/stock/{ticker}/historical-risk-reversal-skew": "VOL_SKEW",
-    "/api/darkpool/{ticker}": "DARKPOOL",
-    "/api/lit-flow/{ticker}": "LITFLOW"
-}
 
-PRESENCE_ONLY_ENDPOINTS = {
-    "/api/stock/{ticker}/option/volume-oi-expiry",
-    "/api/stock/{ticker}/option-chains",
-    "/api/stock/{ticker}/option-contracts",
-    "/api/market/sectors",
-    "/api/market/indices",
-    "/api/market/market-context",
-    "/api/market/economic-calendar",
-    "/api/market/top-net-impact",
-    "/api/market/total-options-volume",
-    "/api/stock/{ticker}/interpolated-iv",
-    "/api/stock/{ticker}/volatility/realized",
-    "/api/stock/{ticker}/option/stock-price-levels",
-    "/api/stock/{ticker}/max-pain",
-    "/api/market/market-tide",
-    "/api/stock/{ticker}/flow-alerts",
-    "/api/stock/{ticker}/net-prem-ticks",
-    "/api/stock/{ticker}/stock-volume-price-levels"
-}
+def build_derived_levels(feature_rows: List[FeatureRow], raw_payloads: Dict[str, Any]) -> List[LevelRow]:
+    levels: List[LevelRow] = []
 
-def extract_all(effective_payloads: Mapping[int, Any], contexts: Mapping[int, EndpointContext]) -> Tuple[List[FeatureRow], List[LevelRow]]:
-    def rank_freshness(fs: str) -> int:
-        return {"FRESH": 1, "STALE_CARRY": 2, "EMPTY_VALID": 3, "ERROR": 4}.get(fs, 5)
+    spot = next((fr["feature_value"] for fr in feature_rows if fr["feature_key"] == "spot"), None)
+    if spot is None:
+        return levels
 
-    def _all_none(feature_bundle: FeatureBundle) -> bool:
-        return all(v is None for v in feature_bundle.features.values())
-
-    def _emit_bundle_observability(meta_bucket: str, f_bundle: FeatureBundle, payload: Any, ctx: EndpointContext) -> None:
-        if not _all_none(f_bundle):
-            return
-        meta = f_bundle.meta.get(meta_bucket, {}) if isinstance(f_bundle.meta, dict) else {}
-        _emit_endpoint_payload_observability(
-            ctx=ctx,
-            payload=payload,
-            feature_output_reason=meta.get("na_reason", "unusable_payload"),
-            parsed_row_count=0,
-            rows_discarded_before_extraction=len(grab_list(payload) or []),
-            effective_timestamp_source=(meta.get("metric_lineage", {}) or {}).get("timestamp_source", "unknown"),
+    if raw_payloads.get("/api/stock/{ticker}/spot-exposures") is not None or raw_payloads.get("/api/stock/{ticker}/spot-exposures/strike") is not None:
+        gex_levels = build_gex_levels(
+            raw_payloads.get("/api/stock/{ticker}/spot-exposures")
+            or raw_payloads.get("/api/stock/{ticker}/spot-exposures/strike"),
+            spot=spot,
         )
+        for row in gex_levels:
+            meta = dict(row.get("meta_json") or {})
+            contract = derived_level_usage_contract("gex")
+            meta.update(contract)
+            levels.append(_level_row(row["level_type"], safe_float(row.get("price")), safe_float(row.get("magnitude")), meta))
 
-    candidates: List[FeatureCandidate] = []
-    l_rows: List[LevelRow] = []
+    if raw_payloads.get("/api/stock/{ticker}/oi-per-strike") is not None:
+        oi_levels = build_oi_walls(raw_payloads.get("/api/stock/{ticker}/oi-per-strike"), spot=spot)
+        for row in oi_levels:
+            meta = dict(row.get("meta_json") or {})
+            contract = derived_level_usage_contract("oi")
+            meta.update(contract)
+            levels.append(_level_row(row["level_type"], safe_float(row.get("price")), safe_float(row.get("magnitude")), meta))
 
-    for eid, ctx in contexts.items():
-        payload = effective_payloads.get(eid)
-        routing_key = EXTRACTOR_REGISTRY.get(ctx.path)
+    if raw_payloads.get("/api/darkpool/{ticker}") is not None:
+        dp_levels = build_darkpool_levels(raw_payloads.get("/api/darkpool/{ticker}"), spot=spot)
+        for row in dp_levels:
+            meta = dict(row.get("meta_json") or {})
+            contract = derived_level_usage_contract("darkpool")
+            meta.update(contract)
+            levels.append(_level_row(row["level_type"], safe_float(row.get("price")), safe_float(row.get("magnitude")), meta))
 
-        safe_stale_age = ctx.stale_age_min if ctx.stale_age_min is not None else 999999
+    return levels
 
-        if routing_key == "GEX":
-            f_bundle = extract_gex_sign(payload, ctx)
-            _emit_bundle_observability("gex", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("gex", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
-            if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
-                levels = build_gex_levels(payload)
-                for l_type, price, mag, details in levels:
-                    meta = _build_meta(ctx, "build_gex_levels", {"metric_name": "gex_levels", "fields_used": ["strike", "gamma_exposure"]}, details)
-                    meta = _annotate_level_usage_contract(meta, l_type)
-                    l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
+def _merge_meta_for_feature(path: str, ctx: EndpointContext, meta: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(meta)
+    _resolve_feature_use_role(merged, path=path)
+    _propagate_metric_lineage(merged, ctx)
+    return merged
 
-        elif routing_key == "FLOW":
-            f_bundle = extract_smart_whale_pressure(payload, ctx)
-            _emit_bundle_observability("flow", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("flow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
 
-        elif routing_key == "GREEKS":
-            f_bundle = extract_dealer_greeks(payload, ctx)
-            _emit_bundle_observability("greeks", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("greeks", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+def _bundle_to_feature_rows(
+    bundle: FeatureBundle,
+    path: str,
+    ctx: EndpointContext,
+    feature_order: Optional[List[str]] = None,
+) -> List[FeatureRow]:
+    rows: List[FeatureRow] = []
+    ordered_keys = feature_order or list(bundle.features.keys())
+    for key in ordered_keys:
+        val = bundle.features.get(key)
+        # Best-effort meta selection: first meta blob in bundle
+        meta_blob = next(iter(bundle.meta.values())) if bundle.meta else {}
+        meta = _merge_meta_for_feature(path, ctx, copy.deepcopy(meta_blob))
+        rows.append(_feature_row(key, val, meta))
+    return rows
 
-        elif routing_key == "PRICE":
+
+def _candidate_from_row(fr: FeatureRow, path: str, payload: Any, ctx: EndpointContext) -> FeatureCandidate:
+    freshness_rank, stale_age, path_priority, endpoint_id = _ctx_sort_keys(ctx, payload)
+    return FeatureCandidate(
+        feature_key=fr["feature_key"],
+        feature_value=fr["feature_value"],
+        meta_json=fr["meta_json"],
+        freshness_rank=freshness_rank,
+        stale_age=stale_age,
+        path_priority=path_priority,
+        endpoint_id=endpoint_id,
+        is_none=fr["feature_value"] is None,
+    )
+
+
+def _choose_best_feature_row(candidates: List[FeatureCandidate]) -> Optional[FeatureRow]:
+    if not candidates:
+        return None
+
+    def sort_key(c: FeatureCandidate) -> Tuple[int, int, int, int]:
+        return (c.freshness_rank, c.stale_age, c.path_priority, c.endpoint_id)
+
+    best = min(candidates, key=sort_key)
+    return {
+        "feature_key": best.feature_key,
+        "feature_value": best.feature_value,
+        "meta_json": best.meta_json,
+    }
+
+
+def _best_feature_rows(rows: List[FeatureRow], raw_payloads: Dict[str, Any], ctx_map: Dict[str, EndpointContext]) -> List[FeatureRow]:
+    by_key: Dict[str, List[FeatureCandidate]] = {}
+
+    for path, payload in raw_payloads.items():
+        ctx = ctx_map.get(path)
+        if ctx is None:
+            continue
+        for fr in rows:
+            if not isinstance(fr, dict):
+                continue
+            by_key.setdefault(fr["feature_key"], []).append(_candidate_from_row(fr, path, payload, ctx))
+
+    selected: List[FeatureRow] = []
+    for key, cands in by_key.items():
+        chosen = _choose_best_feature_row(cands)
+        if chosen is not None:
+            selected.append(chosen)
+    return selected
+
+
+def _ctx_map_for_payloads(payloads: Dict[str, Tuple[Any, EndpointContext]]) -> Dict[str, EndpointContext]:
+    return {path: ctx for path, (_, ctx) in payloads.items()}
+
+
+def extract_features_from_payloads(payloads: Dict[str, Tuple[Any, EndpointContext]]) -> Tuple[List[FeatureRow], List[LevelRow]]:
+    rows: List[FeatureRow] = []
+    raw_payloads: Dict[str, Any] = {}
+
+    for path, (payload, ctx) in payloads.items():
+        raw_payloads[path] = payload
+        if "ohlc" in path:
             f_bundle = extract_price_features(payload, ctx)
-            _emit_bundle_observability("price", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("price", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-
-        elif routing_key == "OI":
-            f_bundle = extract_oi_features(payload, ctx)
-            _emit_bundle_observability("oi", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("oi", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-            if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
-                levels = build_oi_walls(payload)
-                for l_type, price, mag, details in levels:
-                    meta = _build_meta(ctx, "build_oi_walls", {"metric_name": "oi_walls", "fields_used": ["strike", "open_interest"]}, details)
-                    meta = _annotate_level_usage_contract(meta, l_type)
-                    l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
-
-        elif routing_key == "VOL":
-            f_bundle = extract_volatility_features(payload, ctx)
-            _emit_bundle_observability("vol", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-
-        elif routing_key == "VOL_TERM":
-            f_bundle = extract_vol_term_structure(payload, ctx)
-            _emit_bundle_observability("vol_ts", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("vol_ts", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-
-        elif routing_key == "VOL_SKEW":
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["spot"]))
+        elif "flow" in path and "strike" not in path:
+            f_bundle = extract_smart_whale_pressure(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["smart_whale_pressure"]))
+        elif "greek-exposure" in path and "strike" not in path and "expiry" not in path:
+            f_bundle = extract_dealer_greeks(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]))
+            gex_bundle = extract_gex_sign(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(gex_bundle, path, ctx, ["net_gex_sign"]))
+        elif "oi-per-strike" in path or "oi-change" in path:
+            f_bundle = extract_oi_pressure(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["oi_pressure"]))
+        elif "iv-rank" in path:
+            f_bundle = extract_iv_rank(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["iv_rank"]))
+        elif "term-structure" in path:
+            f_bundle = extract_vol_term_slope(payload, ctx)
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["vol_term_slope"]))
+        elif "risk-reversal-skew" in path:
             f_bundle = extract_vol_skew(payload, ctx)
-            _emit_bundle_observability("skew", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("skew", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-
-        elif routing_key == "DARKPOOL":
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["vol_skew"]))
+        elif "/api/darkpool/" in path:
             f_bundle = extract_darkpool_pressure(payload, ctx)
-            _emit_bundle_observability("darkpool", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("darkpool", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
-            if ctx.freshness_state not in ("ERROR", "EMPTY_VALID") and payload and grab_list(payload):
-                levels = build_darkpool_levels(payload)
-                for l_type, price, mag, details in levels:
-                    meta = _build_meta(ctx, "build_darkpool_levels", {"metric_name": "darkpool_levels", "fields_used": ["price", "volume"]}, details)
-                    meta = _annotate_level_usage_contract(meta, l_type)
-                    l_rows.append({"level_type": l_type, "price": price, "magnitude": mag, "meta_json": meta})
-
-        elif routing_key == "LITFLOW":
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["darkpool_pressure"]))
+        elif "/api/lit-flow/" in path:
             f_bundle = extract_litflow_pressure(payload, ctx)
-            _emit_bundle_observability("litflow", f_bundle, payload, ctx)
-            for k, v in f_bundle.features.items():
-                candidates.append(FeatureCandidate(k, v, copy.deepcopy(f_bundle.meta.get("litflow", {})), rank_freshness(ctx.freshness_state), safe_stale_age, PATH_PRIORITY.get(ctx.path, 99), eid, v is None))
+            rows.extend(_bundle_to_feature_rows(f_bundle, path, ctx, ["litflow_pressure"]))
 
-        elif ctx.path not in PRESENCE_ONLY_ENDPOINTS:
-            raise RuntimeError(f"CRITICAL EXTRACTOR COVERAGE GAP: Endpoint path '{ctx.path}' is not mapped in EXTRACTOR_REGISTRY and not whitelisted in PRESENCE_ONLY_ENDPOINTS.")
+    selected_rows = _best_feature_rows(rows, raw_payloads, _ctx_map_for_payloads(payloads))
+    levels = build_derived_levels(selected_rows, raw_payloads)
+    return selected_rows, levels
 
-    grouped: Dict[str, List[FeatureCandidate]] = {}
-    for c in candidates:
-        grouped.setdefault(c.feature_key, []).append(c)
 
-    f_rows: List[FeatureRow] = []
-    for f_key, group in grouped.items():
-        group.sort(key=lambda x: (x.is_none, x.freshness_rank, x.stale_age, x.path_priority, x.endpoint_id))
-        best = group[0]
+def summarize_feature_quality(feature_rows: List[FeatureRow]) -> Dict[str, Any]:
+    missing = 0
+    degraded = 0
+    decision_relevant_missing = 0
+    decision_relevant_stale = 0
 
-        for other in group[1:]:
-            if (other.is_none == best.is_none and other.freshness_rank == best.freshness_rank and
-                other.stale_age == best.stale_age and other.path_priority == best.path_priority):
-                if best.feature_value is not None and other.feature_value is not None:
-                    if not math.isclose(best.feature_value, other.feature_value, abs_tol=1e-9):
-                        raise RuntimeError(f"FEATURE_CONFLICT:{f_key} - Endpoint {best.endpoint_id} vs {other.endpoint_id} generated divergent values at equal rank.")
+    for fr in feature_rows:
+        meta = fr.get("meta_json") or {}
+        feature_value = fr.get("feature_value")
+        role = str(meta.get("feature_use_role") or "signal-critical")
+        decision_path = bool(meta.get("decision_path", role == "signal-critical"))
+        missing_affects_confidence = bool(meta.get("missing_affects_confidence", decision_path))
+        stale_affects_confidence = bool(meta.get("stale_affects_confidence", decision_path))
+        freshness_state = str(meta.get("freshness_state") or "")
 
-        meta = copy.deepcopy(best.meta_json)
-        if len(group) > 1:
-            meta.setdefault("details", {})["shadowed_candidates"] = [
-                {"endpoint_id": c.endpoint_id, "is_none": c.is_none, "freshness_rank": c.freshness_rank} for c in group[1:]
-            ]
+        if feature_value is None:
+            missing += 1
+            if decision_path and missing_affects_confidence:
+                decision_relevant_missing += 1
 
-        f_rows.append({"feature_key": best.feature_key, "feature_value": best.feature_value, "meta_json": meta})
+        confidence_impact = str(meta.get("confidence_impact") or "").upper()
+        if confidence_impact == "DEGRADED":
+            degraded += 1
+            if freshness_state == "STALE_CARRY" and decision_path and stale_affects_confidence:
+                decision_relevant_stale += 1
+        elif freshness_state == "STALE_CARRY":
+            degraded += 1
+            if decision_path and stale_affects_confidence:
+                decision_relevant_stale += 1
 
-        metric_family = meta.get("metric_lineage", {}).get("metric_name", "unknown")
-        if best.feature_value is not None and math.isfinite(best.feature_value):
-            logger.info(
-                f"Feature emitted: {f_key}",
-                extra={"counter": "features_emitted_by_family", "family": metric_family, "feature_key": f_key}
-            )
-        else:
-            logger.warning(
-                f"Feature suppressed: {f_key}",
-                extra={"counter": "features_suppressed_by_family", "family": metric_family, "feature_key": f_key}
-            )
+    return {
+        "missing_feature_count": missing,
+        "degraded_feature_count": degraded,
+        "decision_relevant_missing_feature_count": decision_relevant_missing,
+        "decision_relevant_stale_feature_count": decision_relevant_stale,
+    }
 
-    return f_rows, l_rows
 
-# Fixed: Changed "module" to "module_name" to prevent LogRecord KeyErrors
-logger.info("Features module initialized successfully", extra={"event": "module_init", "module_name": "features"})
+def feature_keys(feature_rows: List[FeatureRow]) -> List[str]:
+    return [fr["feature_key"] for fr in feature_rows]
+
+
+def feature_map(feature_rows: List[FeatureRow]) -> Dict[str, Optional[float]]:
+    return {fr["feature_key"]: fr["feature_value"] for fr in feature_rows}
+
+
+def meta_map(feature_rows: List[FeatureRow]) -> Dict[str, Dict[str, Any]]:
+    return {fr["feature_key"]: fr["meta_json"] for fr in feature_rows}
+
+
+def serialize_feature_rows(feature_rows: List[FeatureRow]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for fr in feature_rows:
+        meta = copy.deepcopy(fr["meta_json"])
+        rows.append({
+            "feature_key": fr["feature_key"],
+            "feature_value": fr["feature_value"],
+            "meta_json": meta,
+        })
+    return rows
+
+
+def serialize_level_rows(level_rows: List[LevelRow]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for lr in level_rows:
+        meta = copy.deepcopy(lr["meta_json"])
+        rows.append({
+            "level_type": lr["level_type"],
+            "price": lr["price"],
+            "magnitude": lr["magnitude"],
+            "meta_json": meta,
+        })
+    return rows
+
+
+def deserialize_feature_rows(payload: List[Dict[str, Any]]) -> List[FeatureRow]:
+    return [
+        {
+            "feature_key": str(item["feature_key"]),
+            "feature_value": safe_float(item.get("feature_value")) if item.get("feature_value") is not None else None,
+            "meta_json": dict(item.get("meta_json") or {}),
+        }
+        for item in payload
+    ]
+
+
+def deserialize_level_rows(payload: List[Dict[str, Any]]) -> List[LevelRow]:
+    return [
+        {
+            "level_type": str(item["level_type"]),
+            "price": safe_float(item.get("price")) if item.get("price") is not None else None,
+            "magnitude": safe_float(item.get("magnitude")) if item.get("magnitude") is not None else None,
+            "meta_json": dict(item.get("meta_json") or {}),
+        }
+        for item in payload
+    ]
+
+
+def feature_summary(feature_rows: List[FeatureRow]) -> Dict[str, Any]:
+    fmap = feature_map(feature_rows)
+    q = summarize_feature_quality(feature_rows)
+    return {
+        "n_features": len(feature_rows),
+        "feature_keys": list(fmap.keys()),
+        "missing_feature_count": q["missing_feature_count"],
+        "degraded_feature_count": q["degraded_feature_count"],
+    }
+
+
+def level_summary(level_rows: List[LevelRow]) -> Dict[str, Any]:
+    return {
+        "n_levels": len(level_rows),
+        "level_types": [lr["level_type"] for lr in level_rows],
+    }
+
+
+def extract_feature_bundles(payloads: Dict[str, Tuple[Any, EndpointContext]]) -> Dict[str, FeatureBundle]:
+    bundles: Dict[str, FeatureBundle] = {}
+    for path, (payload, ctx) in payloads.items():
+        if "ohlc" in path:
+            bundles[path] = extract_price_features(payload, ctx)
+        elif "flow" in path and "strike" not in path:
+            bundles[path] = extract_smart_whale_pressure(payload, ctx)
+        elif "greek-exposure" in path and "strike" not in path and "expiry" not in path:
+            bundles[path] = extract_dealer_greeks(payload, ctx)
+        elif "oi-per-strike" in path or "oi-change" in path:
+            bundles[path] = extract_oi_pressure(payload, ctx)
+        elif "iv-rank" in path:
+            bundles[path] = extract_iv_rank(payload, ctx)
+        elif "term-structure" in path:
+            bundles[path] = extract_vol_term_slope(payload, ctx)
+        elif "risk-reversal-skew" in path:
+            bundles[path] = extract_vol_skew(payload, ctx)
+        elif "/api/darkpool/" in path:
+            bundles[path] = extract_darkpool_pressure(payload, ctx)
+        elif "/api/lit-flow/" in path:
+            bundles[path] = extract_litflow_pressure(payload, ctx)
+    return bundles
+
+
+def merge_feature_bundles(bundles: Dict[str, FeatureBundle], ctx_map: Dict[str, EndpointContext]) -> Tuple[List[FeatureRow], List[LevelRow]]:
+    feature_rows: List[FeatureRow] = []
+    raw_payloads: Dict[str, Any] = {}
+
+    for path, bundle in bundles.items():
+        ctx = ctx_map[path]
+        raw_payloads[path] = None
+        if "ohlc" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["spot"]))
+        elif "flow" in path and "strike" not in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["smart_whale_pressure"]))
+        elif "greek-exposure" in path and "strike" not in path and "expiry" not in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["dealer_vanna", "dealer_charm", "net_gamma_exposure_notional"]))
+        elif "oi-per-strike" in path or "oi-change" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["oi_pressure"]))
+        elif "iv-rank" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["iv_rank"]))
+        elif "term-structure" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["vol_term_slope"]))
+        elif "risk-reversal-skew" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["vol_skew"]))
+        elif "/api/darkpool/" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["darkpool_pressure"]))
+        elif "/api/lit-flow/" in path:
+            feature_rows.extend(_bundle_to_feature_rows(bundle, path, ctx, ["litflow_pressure"]))
+
+    selected_rows = _best_feature_rows(feature_rows, raw_payloads, ctx_map)
+    levels = build_derived_levels(selected_rows, raw_payloads)
+    return selected_rows, levels
+
+
+def _rows_to_feature_candidates(rows: List[FeatureRow], payloads: Dict[str, Any], ctx_map: Dict[str, EndpointContext]) -> List[FeatureCandidate]:
+    candidates: List[FeatureCandidate] = []
+    for path, payload in payloads.items():
+        ctx = ctx_map[path]
+        for fr in rows:
+            candidates.append(_candidate_from_row(fr, path, payload, ctx))
+    return candidates
+
+
+def _score_feature_candidate(fc: FeatureCandidate) -> Tuple[int, int, int, int]:
+    return (fc.freshness_rank, fc.stale_age, fc.path_priority, fc.endpoint_id)
+
+
+def select_best_features(rows: List[FeatureRow], payloads: Dict[str, Any], ctx_map: Dict[str, EndpointContext]) -> List[FeatureRow]:
+    by_key: Dict[str, List[FeatureCandidate]] = {}
+    for path, payload in payloads.items():
+        ctx = ctx_map[path]
+        for fr in rows:
+            by_key.setdefault(fr["feature_key"], []).append(_candidate_from_row(fr, path, payload, ctx))
+
+    out: List[FeatureRow] = []
+    for _, cands in by_key.items():
+        cands.sort(key=_score_feature_candidate)
+        if cands:
+            best = cands[0]
+            out.append({
+                "feature_key": best.feature_key,
+                "feature_value": best.feature_value,
+                "meta_json": best.meta_json,
+            })
+    return out
+
+
+def feature_value_or_none(feature_rows: List[FeatureRow], key: str) -> Optional[float]:
+    for fr in feature_rows:
+        if fr["feature_key"] == key:
+            return fr["feature_value"]
+    return None
+
+
+def feature_meta_or_empty(feature_rows: List[FeatureRow], key: str) -> Dict[str, Any]:
+    for fr in feature_rows:
+        if fr["feature_key"] == key:
+            return fr["meta_json"]
+    return {}
+
+
+def _is_stale_meta(meta: Dict[str, Any]) -> bool:
+    freshness_state = str(meta.get("freshness_state") or "")
+    return freshness_state == "STALE_CARRY"
+
+
+def _is_missing_feature_row(fr: FeatureRow) -> bool:
+    return fr.get("feature_value") is None
+
+
+def _feature_decision_relevant(fr: FeatureRow) -> bool:
+    meta = fr.get("meta_json") or {}
+    return bool(meta.get("decision_path", True))
+
+
+def decision_relevant_missing(feature_rows: List[FeatureRow]) -> List[str]:
+    keys: List[str] = []
+    for fr in feature_rows:
+        meta = fr.get("meta_json") or {}
+        if fr.get("feature_value") is None and bool(meta.get("decision_path", True)) and bool(meta.get("missing_affects_confidence", True)):
+            keys.append(fr["feature_key"])
+    return keys
+
+
+def decision_relevant_stale(feature_rows: List[FeatureRow]) -> List[str]:
+    keys: List[str] = []
+    for fr in feature_rows:
+        meta = fr.get("meta_json") or {}
+        freshness_state = str(meta.get("freshness_state") or "")
+        confidence_impact = str(meta.get("confidence_impact") or "").upper()
+        if freshness_state == "STALE_CARRY" and bool(meta.get("decision_path", True)) and bool(meta.get("stale_affects_confidence", True)):
+            keys.append(fr["feature_key"])
+        elif confidence_impact == "DEGRADED" and freshness_state == "STALE_CARRY" and bool(meta.get("decision_path", True)) and bool(meta.get("stale_affects_confidence", True)):
+            keys.append(fr["feature_key"])
+    return keys
+
+
+def _copy_rows(rows: List[FeatureRow]) -> List[FeatureRow]:
+    return [
+        {
+            "feature_key": fr["feature_key"],
+            "feature_value": fr["feature_value"],
+            "meta_json": copy.deepcopy(fr["meta_json"]),
+        }
+        for fr in rows
+    ]
+
+
+def _copy_levels(levels: List[LevelRow]) -> List[LevelRow]:
+    return [
+        {
+            "level_type": lr["level_type"],
+            "price": lr["price"],
+            "magnitude": lr["magnitude"],
+            "meta_json": copy.deepcopy(lr["meta_json"]),
+        }
+        for lr in levels
+    ]
+
+
+def filter_feature_rows(feature_rows: List[FeatureRow], keys: Iterable[str]) -> List[FeatureRow]:
+    keyset = set(keys)
+    return [fr for fr in feature_rows if fr["feature_key"] in keyset]
+
+
+def filter_level_rows(level_rows: List[LevelRow], level_types: Iterable[str]) -> List[LevelRow]:
+    lset = set(level_types)
+    return [lr for lr in level_rows if lr["level_type"] in lset]
+
+
+def sort_feature_rows(feature_rows: List[FeatureRow]) -> List[FeatureRow]:
+    return sorted(feature_rows, key=lambda r: r["feature_key"])
+
+
+def sort_level_rows(level_rows: List[LevelRow]) -> List[LevelRow]:
+    return sorted(level_rows, key=lambda r: (r["level_type"], r["price"] if r["price"] is not None else 0.0))
+
+
+def has_feature(feature_rows: List[FeatureRow], key: str) -> bool:
+    return any(fr["feature_key"] == key for fr in feature_rows)
+
+
+def has_level(level_rows: List[LevelRow], level_type: str) -> bool:
+    return any(lr["level_type"] == level_type for lr in level_rows)
+
+
+def missing_feature_keys(feature_rows: List[FeatureRow], required_keys: Iterable[str]) -> List[str]:
+    present = set(feature_keys(feature_rows))
+    return [k for k in required_keys if k not in present]
+
+
+def count_missing_values(feature_rows: List[FeatureRow]) -> int:
+    return sum(1 for fr in feature_rows if fr["feature_value"] is None)
+
+
+def count_degraded(feature_rows: List[FeatureRow]) -> int:
+    count = 0
+    for fr in feature_rows:
+        meta = fr.get("meta_json") or {}
+        if str(meta.get("confidence_impact") or "").upper() == "DEGRADED":
+            count += 1
+        elif str(meta.get("freshness_state") or "") == "STALE_CARRY":
+            count += 1
+    return count
+
+
+def flatten_feature_meta(feature_rows: List[FeatureRow]) -> Dict[str, Dict[str, Any]]:
+    return {fr["feature_key"]: copy.deepcopy(fr["meta_json"]) for fr in feature_rows}
+
+
+def flatten_level_meta(level_rows: List[LevelRow]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for lr in level_rows:
+        out.setdefault(lr["level_type"], []).append(copy.deepcopy(lr["meta_json"]))
+    return out
+
+
+def build_feature_index(feature_rows: List[FeatureRow]) -> Dict[str, FeatureRow]:
+    return {fr["feature_key"]: fr for fr in feature_rows}
+
+
+def build_level_index(level_rows: List[LevelRow]) -> Dict[str, List[LevelRow]]:
+    idx: Dict[str, List[LevelRow]] = {}
+    for lr in level_rows:
+        idx.setdefault(lr["level_type"], []).append(lr)
+    return idx
+
+
+def validate_feature_rows(feature_rows: List[FeatureRow]) -> List[str]:
+    errors: List[str] = []
+    for fr in feature_rows:
+        if "feature_key" not in fr:
+            errors.append("missing_feature_key")
+            continue
+        if "meta_json" not in fr:
+            errors.append(f"{fr.get('feature_key', 'unknown')}:missing_meta_json")
+            continue
+        meta = fr["meta_json"]
+        if not isinstance(meta, dict):
+            errors.append(f"{fr['feature_key']}:meta_not_dict")
+            continue
+        if "feature_use_role" not in meta:
+            errors.append(f"{fr['feature_key']}:missing_feature_use_role")
+        if "feature_use_contract_version" not in meta:
+            errors.append(f"{fr['feature_key']}:missing_feature_use_contract_version")
+    return errors
+
+
+def validate_level_rows(level_rows: List[LevelRow]) -> List[str]:
+    errors: List[str] = []
+    for lr in level_rows:
+        if "level_type" not in lr:
+            errors.append("missing_level_type")
+        if "meta_json" not in lr or not isinstance(lr["meta_json"], dict):
+            errors.append(f"{lr.get('level_type', 'unknown')}:invalid_meta_json")
+    return errors
+
+
+def _row_from_map(key: str, fmap: Dict[str, Optional[float]], mmap: Dict[str, Dict[str, Any]]) -> FeatureRow:
+    return {
+        "feature_key": key,
+        "feature_value": fmap.get(key),
+        "meta_json": copy.deepcopy(mmap.get(key, {})),
+    }
+
+
+def combine_feature_maps(fmaps: List[Dict[str, Optional[float]]], mmaps: List[Dict[str, Dict[str, Any]]]) -> List[FeatureRow]:
+    keys: List[str] = []
+    for fmap in fmaps:
+        for k in fmap.keys():
+            if k not in keys:
+                keys.append(k)
+
+    rows: List[FeatureRow] = []
+    for k in keys:
+        value = None
+        meta: Dict[str, Any] = {}
+        for fmap, mmap in zip(fmaps, mmaps):
+            if k in fmap and value is None:
+                value = fmap.get(k)
+                meta = copy.deepcopy(mmap.get(k, {}))
+        rows.append({"feature_key": k, "feature_value": value, "meta_json": meta})
+    return rows
+
+
+def _level_from_map(level_type: str, price: Optional[float], magnitude: Optional[float], meta: Dict[str, Any]) -> LevelRow:
+    return {
+        "level_type": level_type,
+        "price": price,
+        "magnitude": magnitude,
+        "meta_json": copy.deepcopy(meta),
+    }
+
+
+def is_valid_feature_value(value: Optional[float]) -> bool:
+    if value is None:
+        return False
+    return math.isfinite(float(value))
+
+
+def is_valid_price(value: Optional[float]) -> bool:
+    if value is None:
+        return False
+    v = float(value)
+    return math.isfinite(v) and v > 0
+
+
+def coerce_feature_value(value: Any) -> Optional[float]:
+    return safe_float(value)
+
+
+def feature_keys_sorted(feature_rows: List[FeatureRow]) -> List[str]:
+    return sorted(feature_keys(feature_rows))
+
+
+def level_types_sorted(level_rows: List[LevelRow]) -> List[str]:
+    return sorted({lr["level_type"] for lr in level_rows})
+
+
+def select_feature_rows(feature_rows: List[FeatureRow], predicate) -> List[FeatureRow]:
+    return [fr for fr in feature_rows if predicate(fr)]
+
+
+def select_level_rows(level_rows: List[LevelRow], predicate) -> List[LevelRow]:
+    return [lr for lr in level_rows if predicate(lr)]
+
+
+def map_feature_rows(feature_rows: List[FeatureRow], mapper) -> List[FeatureRow]:
+    return [mapper(fr) for fr in feature_rows]
+
+
+def map_level_rows(level_rows: List[LevelRow], mapper) -> List[LevelRow]:
+    return [mapper(lr) for lr in level_rows]
+
+
+def any_missing_decision_relevant(feature_rows: List[FeatureRow]) -> bool:
+    return len(decision_relevant_missing(feature_rows)) > 0
+
+
+def any_stale_decision_relevant(feature_rows: List[FeatureRow]) -> bool:
+    return len(decision_relevant_stale(feature_rows)) > 0
+
+
+def count_decision_relevant(feature_rows: List[FeatureRow]) -> int:
+    return sum(1 for fr in feature_rows if _feature_decision_relevant(fr))
+
+
+def count_decision_relevant_missing(feature_rows: List[FeatureRow]) -> int:
+    return len(decision_relevant_missing(feature_rows))
+
+
+def count_decision_relevant_stale(feature_rows: List[FeatureRow]) -> int:
+    return len(decision_relevant_stale(feature_rows))
+
+
+def feature_row_by_key(feature_rows: List[FeatureRow], key: str) -> Optional[FeatureRow]:
+    for fr in feature_rows:
+        if fr["feature_key"] == key:
+            return fr
+    return None
+
+
+def level_rows_by_type(level_rows: List[LevelRow], level_type: str) -> List[LevelRow]:
+    return [lr for lr in level_rows if lr["level_type"] == level_type]
+
+
+def ensure_feature_use_contract(feature_rows: List[FeatureRow]) -> List[FeatureRow]:
+    rows = _copy_rows(feature_rows)
+    for fr in rows:
+        _resolve_feature_use_role(fr["meta_json"], path=fr["meta_json"].get("source_endpoints", [{}])[0].get("path") if isinstance(fr["meta_json"].get("source_endpoints"), list) and fr["meta_json"].get("source_endpoints") else None)
+    return rows
+
+
+def ensure_metric_lineage(feature_rows: List[FeatureRow], ctx: Optional[EndpointContext] = None) -> List[FeatureRow]:
+    rows = _copy_rows(feature_rows)
+    for fr in rows:
+        meta = fr["meta_json"]
+        lineage = meta.get("metric_lineage")
+        if not isinstance(lineage, dict):
+            meta["metric_lineage"] = {}
+        if ctx is not None:
+            _propagate_metric_lineage(meta, ctx)
+    return rows
+
+
+def add_feature_use_role(feature_rows: List[FeatureRow], role: str) -> List[FeatureRow]:
+    rows = _copy_rows(feature_rows)
+    for fr in rows:
+        _resolve_feature_use_role(fr["meta_json"], role_override=role)
+    return rows
+
+
+def feature_row_to_dict(fr: FeatureRow) -> Dict[str, Any]:
+    return {
+        "feature_key": fr["feature_key"],
+        "feature_value": fr["feature_value"],
+        "meta_json": copy.deepcopy(fr["meta_json"]),
+    }
+
+
+def level_row_to_dict(lr: LevelRow) -> Dict[str, Any]:
+    return {
+        "level_type": lr["level_type"],
+        "price": lr["price"],
+        "magnitude": lr["magnitude"],
+        "meta_json": copy.deepcopy(lr["meta_json"]),
+    }
+
+
+def feature_rows_to_dicts(feature_rows: List[FeatureRow]) -> List[Dict[str, Any]]:
+    return [feature_row_to_dict(fr) for fr in feature_rows]
+
+
+def level_rows_to_dicts(level_rows: List[LevelRow]) -> List[Dict[str, Any]]:
+    return [level_row_to_dict(lr) for lr in level_rows]
+
+
+def dicts_to_feature_rows(items: List[Dict[str, Any]]) -> List[FeatureRow]:
+    return deserialize_feature_rows(items)
+
+
+def dicts_to_level_rows(items: List[Dict[str, Any]]) -> List[LevelRow]:
+    return deserialize_level_rows(items)
+
+
+def update_feature_meta(feature_rows: List[FeatureRow], key: str, updates: Dict[str, Any]) -> List[FeatureRow]:
+    rows = _copy_rows(feature_rows)
+    for fr in rows:
+        if fr["feature_key"] == key:
+            fr["meta_json"].update(copy.deepcopy(updates))
+            break
+    return rows
+
+
+def update_level_meta(level_rows: List[LevelRow], level_type: str, updates: Dict[str, Any]) -> List[LevelRow]:
+    rows = _copy_levels(level_rows)
+    for lr in rows:
+        if lr["level_type"] == level_type:
+            lr["meta_json"].update(copy.deepcopy(updates))
+    return rows
+
+
+def feature_values_vector(feature_rows: List[FeatureRow], ordered_keys: List[str]) -> List[Optional[float]]:
+    fmap = feature_map(feature_rows)
+    return [fmap.get(k) for k in ordered_keys]
+
+
+def assert_feature_keys(feature_rows: List[FeatureRow], expected_keys: Iterable[str]) -> None:
+    present = set(feature_keys(feature_rows))
+    expected = set(expected_keys)
+    missing = expected - present
+    if missing:
+        raise AssertionError(f"missing_feature_keys={sorted(missing)}")
+
+
+def assert_level_types(level_rows: List[LevelRow], expected_types: Iterable[str]) -> None:
+    present = {lr["level_type"] for lr in level_rows}
+    expected = set(expected_types)
+    missing = expected - present
+    if missing:
+        raise AssertionError(f"missing_level_types={sorted(missing)}")
+
+
+def extract_features(
+    ohlc_payload: Any = None,
+    flow_payload: Any = None,
+    greek_payload: Any = None,
+    oi_payload: Any = None,
+    iv_payload: Any = None,
+    ts_payload: Any = None,
+    skew_payload: Any = None,
+    darkpool_payload: Any = None,
+    litflow_payload: Any = None,
+    *,
+    ohlc_ctx: Optional[EndpointContext] = None,
+    flow_ctx: Optional[EndpointContext] = None,
+    greek_ctx: Optional[EndpointContext] = None,
+    oi_ctx: Optional[EndpointContext] = None,
+    iv_ctx: Optional[EndpointContext] = None,
+    ts_ctx: Optional[EndpointContext] = None,
+    skew_ctx: Optional[EndpointContext] = None,
+    darkpool_ctx: Optional[EndpointContext] = None,
+    litflow_ctx: Optional[EndpointContext] = None,
+) -> Tuple[List[FeatureRow], List[LevelRow]]:
+    payloads: Dict[str, Tuple[Any, EndpointContext]] = {}
+
+    def _default_ctx(path: str) -> EndpointContext:
+        return EndpointContext(path=path, method="GET", freshness_state="FRESH", stale_age_min=0, na_reason=None)
+
+    if ohlc_payload is not None:
+        payloads["/api/stock/{ticker}/ohlc/{candle_size}"] = (ohlc_payload, ohlc_ctx or _default_ctx("/api/stock/{ticker}/ohlc/{candle_size}"))
+    if flow_payload is not None:
+        payloads["/api/stock/{ticker}/flow-recent"] = (flow_payload, flow_ctx or _default_ctx("/api/stock/{ticker}/flow-recent"))
+    if greek_payload is not None:
+        payloads["/api/stock/{ticker}/greek-exposure"] = (greek_payload, greek_ctx or _default_ctx("/api/stock/{ticker}/greek-exposure"))
+    if oi_payload is not None:
+        payloads["/api/stock/{ticker}/oi-per-strike"] = (oi_payload, oi_ctx or _default_ctx("/api/stock/{ticker}/oi-per-strike"))
+    if iv_payload is not None:
+        payloads["/api/stock/{ticker}/iv-rank"] = (iv_payload, iv_ctx or _default_ctx("/api/stock/{ticker}/iv-rank"))
+    if ts_payload is not None:
+        payloads["/api/stock/{ticker}/volatility/term-structure"] = (ts_payload, ts_ctx or _default_ctx("/api/stock/{ticker}/volatility/term-structure"))
+    if skew_payload is not None:
+        payloads["/api/stock/{ticker}/historical-risk-reversal-skew"] = (skew_payload, skew_ctx or _default_ctx("/api/stock/{ticker}/historical-risk-reversal-skew"))
+    if darkpool_payload is not None:
+        payloads["/api/darkpool/{ticker}"] = (darkpool_payload, darkpool_ctx or _default_ctx("/api/darkpool/{ticker}"))
+    if litflow_payload is not None:
+        payloads["/api/lit-flow/{ticker}"] = (litflow_payload, litflow_ctx or _default_ctx("/api/lit-flow/{ticker}"))
+
+    return extract_features_from_payloads(payloads)
